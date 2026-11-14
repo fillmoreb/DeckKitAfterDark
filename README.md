@@ -10,6 +10,7 @@ Every addon here needs the DeckKit core (`## Dependencies: DeckKit`).
 | Addon | What it does |
 |---|---|
 | **DeckLink** | A two-way data link between a program on the Deck and addons: key taps in, colored cells on screen out. `/deckkit link` shows how it's going. |
+| **DeckDictation** | Decktation's exact state (recording, transcribing, done, error) for DeckKit's dictation indicator, from Decktation's status hook (`deck-setup/decktation-hook.sh`, installed as `decklink-decktation-hook`). |
 | **DeckTelemetry** | The Deck's battery, charging, power, temperatures, fan and CPU/GPU/memory load, for other addons to show (it draws nothing itself). `/deckkit telemetry` prints the latest. |
 
 ## DeckLink
@@ -56,7 +57,11 @@ Keys go in through Decktation's ydotool daemon when the program runs as root, el
 Xwayland `:1` as the desktop user. Reading the strip needs Game Mode (gamescope's PipeWire stream).
 
 Install on the Deck: `deck-setup/install.sh` (from a Mac or PC with `deploy.local` set up) copies the
-package to `/home/deck/.local/lib/decklink` and puts `decklink` in `/home/deck/.local/bin`.
+package to `/home/deck/.local/lib/decklink`, puts `decklink` and `decklink-decktation-hook` in
+`/home/deck/.local/bin`, and enables the `decklink-cover` and `decklink-telemetry` user services. For
+DeckDictation, set Decktation's `statusHookCommand` (in
+`/home/deck/homebrew/settings/decktation/button_config.json`, root's) to
+`/home/deck/.local/bin/decklink-decktation-hook`.
 
 ## DeckTelemetry
 
@@ -82,11 +87,12 @@ Every key the setup binds, across DeckKit, DeckKitAfterDark, Decktation and the 
 | F5 / F6 / F7 / F8 | the Steam layout, once L4 / R4 / L5 / R5 has been held 0.4 s | DeckKit grip chord holds |
 | F9 / F10 | a DeckLink program (ydotool or xdotool) | DeckLink bits 0 / 1 (free without DeckLink) |
 | F11, F12 | | spare |
-| Insert / Home / End / Delete | Decktation's status hook (DeckKit `deck-setup/decktation-hook.sh`, xdotool) | DeckKit's dictation indicator: recording / transcribing / done or aborted / error |
 | Ctrl+Shift+F1-F5, F11, F12 | `deckctl` (AddonTools, dev only, while DeckDev is installed) | receive, commit, cancel, export, load inbox slot, strip on, reload |
 
-Reload UI has no key: it's on a grip slot. Decktation itself sends no keys of its own besides typing
-its text (ydotool) and the hook above; it reads the controller directly.
+Reload UI has no key: it's on a grip slot. Decktation reads the controller directly and types its text
+with ydotool; its status hook goes through DeckLink (F9/F10, channel 2), so it needs no keys of its own.
+
+DeckLink channels: 1 telemetry (DeckTelemetry), 2 Decktation's state (DeckDictation).
 
 ## The cover
 

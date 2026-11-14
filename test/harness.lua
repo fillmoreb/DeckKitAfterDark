@@ -67,6 +67,7 @@ function DeckKit.NewModule(ns)
     ns.AddCommand = function(name, fn) COMMANDS = COMMANDS or {}; COMMANDS[name] = fn end
     return ns
 end
+DeckKit.Dictation = { SetState = function(state) print("DICTATION " .. state) end }
 local function fire(event, ...) for _, fn in ipairs(events[event] or {}) do fn(...) end end
 
 local ns = {}
@@ -74,11 +75,13 @@ for line in io.lines(ADDON .. "DeckLink.toc") do
     if line:match("%.lua$") then assert(loadfile(ADDON .. line))("DeckLink", ns) end
 end
 
--- DeckTelemetry too, after DeckLink (it registers channel 1).
-local TELEMETRY = DIR .. "/../addons/DeckTelemetry/"
-local tns = {}
-for line in io.lines(TELEMETRY .. "DeckTelemetry.toc") do
-    if line:match("%.lua$") then assert(loadfile(TELEMETRY .. line))("DeckTelemetry", tns) end
+-- The addons on top of DeckLink, after it (they register their channels).
+for _, name in ipairs({ "DeckTelemetry", "DeckDictation" }) do
+    local dir = DIR .. "/../addons/" .. name .. "/"
+    local addonNS = {}
+    for line in io.lines(dir .. name .. ".toc") do
+        if line:match("%.lua$") then assert(loadfile(dir .. line))(name, addonNS) end
+    end
 end
 
 CODEC = ns.Codec

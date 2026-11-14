@@ -1,0 +1,8 @@
+## Interface: 16001
+## Title: DeckDictation
+## Notes: DeckKitAfterDark: Decktation's exact state (recording, transcribing, done, error) for DeckKit's dictation indicator, from Decktation's status hook through DeckLink.
+## Version: @project-version@
+## Author: Ben Fillmore
+## Dependencies: DeckKit, DeckLink
+
+Dictation.lua

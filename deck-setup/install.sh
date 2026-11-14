@@ -1,11 +1,13 @@
 #!/bin/bash
-# Installs DeckLink's program side on the Deck: the decklink package into /home/deck/.local/lib and a
-# `decklink` command into /home/deck/.local/bin, owned by deck. Uses DECK from ../deploy.local.
+# Installs DeckLink's program side on the Deck, owned by deck: the decklink package into
+# /home/deck/.local/lib; `decklink` and `decklink-decktation-hook` (Decktation's statusHookCommand) into
+# /home/deck/.local/bin; and the decklink-cover and decklink-telemetry systemd user services, enabled.
+# Uses DECK from ../deploy.local.
 set -euo pipefail
 cd "$(dirname "$0")"
 [ -f ../deploy.local ] && . ../deploy.local
 : "${DECK:?set DECK in deploy.local}"
-COPYFILE_DISABLE=1 tar --no-xattrs --exclude __pycache__ -cf - decklink | ssh "$DECK" 'sudo -u deck bash -c "
+COPYFILE_DISABLE=1 tar --no-xattrs --exclude __pycache__ -cf - decklink decktation-hook.sh | ssh "$DECK" 'sudo -u deck bash -c "
 set -e
 mkdir -p ~/.local/lib ~/.local/bin
 rm -rf ~/.local/lib/decklink
@@ -15,6 +17,8 @@ cat > ~/.local/bin/decklink <<EOF
 PYTHONPATH=/home/deck/.local/lib exec python3 -m decklink \"\\\$@\"
 EOF
 chmod +x ~/.local/bin/decklink
+mv ~/.local/lib/decktation-hook.sh ~/.local/bin/decklink-decktation-hook
+chmod +x ~/.local/bin/decklink-decktation-hook
 mkdir -p ~/.config/systemd/user
 cat > ~/.config/systemd/user/decklink-cover.service <<EOF
 [Unit]

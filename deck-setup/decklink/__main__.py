@@ -4,13 +4,15 @@
     decklink ping [--size N]          open the link and time a round trip (N bytes, echoed back)
     decklink send CHANNEL [TEXT]      send TEXT (or stdin) to an addon's channel (1-255)
     decklink recv [--count N] [--timeout S]   print frames the game sends (channel<TAB>payload)
+    decklink post CHANNEL [TEXT]      fire and forget: one frame by keys, no hello, no strip, no ack
+                                      (lost if chat is open; for state that's sent again anyway)
 
 Keys are paced (--gap, 1 ms) so the game doesn't freeze: about 55 bytes/s in.
 --tool ydotool|xdotool picks how keys go in (default: ydotool when its socket is usable, which
 needs root; else xdotool on :1). Reading the strip needs the desktop user's PipeWire session; as
 root, use sudo -E or run the reader side as deck.
 """
-import argparse, os, sys
+import argparse, os, sys, time
 
 from . import codec, keys, link, strip
 
@@ -28,6 +30,9 @@ def main(argv=None):
     sd = sub.add_parser("send")
     sd.add_argument("channel", type=int)
     sd.add_argument("text", nargs="?")
+    po = sub.add_parser("post")
+    po.add_argument("channel", type=int)
+    po.add_argument("text", nargs="?")
     rv = sub.add_parser("recv")
     rv.add_argument("--count", type=int, default=0, help="stop after N frames (0: keep going)")
     rv.add_argument("--timeout", type=float, default=30)
@@ -42,6 +47,13 @@ def main(argv=None):
                                     ("bound", strip.FLAG_BOUND), ("text-focus", strip.FLAG_FOCUS)) if s.flags & f]
             print("flags=%s hb=%d rx_seq=%d rx=%d bad=%d out=%s" % (",".join(flags) or "-", s.heartbeat, s.rx_seq,
                   s.rx_count, s.bad, "%d bytes" % len(s.out) if s.out else "-"))
+            return 0
+        if a.cmd == "post":
+            if not 1 <= a.channel <= 255:
+                p.error("channel is 1-255")
+            data = a.text.encode() if a.text is not None else sys.stdin.buffer.read()
+            seq = int(time.time() * 10) % 255 + 1
+            keys.Keys(a.tool, gap_ms=a.gap).send(list(codec.bits(codec.build(a.channel, seq, data))))
             return 0
         with link.Link(sender=keys.Keys(a.tool, gap_ms=a.gap)) as lk:
             if a.cmd == "ping":

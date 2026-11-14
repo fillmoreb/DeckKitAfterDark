@@ -203,6 +203,23 @@ class Telemetry(unittest.TestCase):
         self.assertIn("NONE\tnil\tnil", lines)
 
 
+class Dictation(unittest.TestCase):
+    def test_states_reach_deckkit(self):
+        taps = " ".join('taps("%s")' % bitstr(codec.build(2, i + 1, state.encode()))
+                        for i, state in enumerate(["recording", "transcribing", "bogus", "done"]))
+        lines, s = Game.run("login() " + taps)
+        self.assertEqual([l for l in lines if l.startswith("DICTATION")],
+                         ["DICTATION recording", "DICTATION transcribing", "DICTATION done"])
+        self.assertIsNone(s)  # fire and forget: no strip
+
+    def test_hook_maps_decktation_events(self):
+        hook = os.path.join(HERE, "..", "deck-setup", "decktation-hook.sh")
+        text = open(hook).read()
+        for event, state in (("record_start", "recording"), ("record_stop", "transcribing"),
+                             ("transcription_done|record_abort", "done"), ("error", "error")):
+            self.assertIn("%s) state=%s ;;" % (event, state), text)
+
+
 class FakeGame:
     """The game, simulated for Link: keys go to a bit decoder, the strip is a Status."""
 
