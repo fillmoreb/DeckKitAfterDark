@@ -13,7 +13,7 @@
 -- (channel 1 is Deck telemetry this way, for DeckTelemetry).
 --
 -- For other addons:
---   DeckLink.On(channel, fn(payload))   frames from the host on a channel (1-255)
+--   DeckLink.On(channel, fn(payload, seq))   frames from the host on a channel (1-255), with the frame's seq
 --   DeckLink.Send(channel, payload)     queue a frame for the host; false if it's too long
 --   DeckLink.IsOpen()                   is a host listening?
 local ADDON, ns = ...
@@ -89,7 +89,7 @@ local function Deliver(channel, seq, payload)
         -- stays off and nothing has to read the screen.
         local fn = handlers[channel]
         if fn then
-            local ok, err = pcall(fn, payload)
+            local ok, err = pcall(fn, payload, seq)
             if not ok then
                 lastError = ("channel %d: %s"):format(channel, tostring(err))
                 geterrorhandler()(err)

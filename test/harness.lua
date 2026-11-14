@@ -65,6 +65,7 @@ function DeckKit.NewModule(ns)
     ns.On = function(event, fn) events[event] = events[event] or {}; table.insert(events[event], fn) end
     ns.Print = function(msg) print("PRINT " .. msg) end
     ns.AddCommand = function(name, fn) COMMANDS = COMMANDS or {}; COMMANDS[name] = fn end
+    ns.Debug = function() end
     return ns
 end
 DeckKit.Dictation = { SetState = function(state) print("DICTATION " .. state) end }
@@ -75,8 +76,27 @@ for line in io.lines(ADDON .. "DeckLink.toc") do
     if line:match("%.lua$") then assert(loadfile(ADDON .. line))("DeckLink", ns) end
 end
 
+-- The game as DeckAgent sees it: the player in Undercity (scenarios can change PLAYER or set WayPad_Add).
+PLAYER = { map = 1458, x = 0.49, y = 0.183, cont = 0, wx = 1636.25, wy = 239.62, zone = "Undercity",
+           faction = "Horde", level = 20, class = "PRIEST" }
+local function vector(x, y) return { GetXY = function() return x, y end } end
+CreateVector2D = vector
+C_Map = {
+    GetBestMapForUnit = function() return PLAYER.map end,
+    GetPlayerMapPosition = function() return PLAYER.x and vector(PLAYER.x, PLAYER.y) end,
+    GetWorldPosFromMapPos = function() return PLAYER.cont, vector(PLAYER.wx, PLAYER.wy) end,
+    GetMapInfo = function(id) return { name = id == PLAYER.map and PLAYER.zone or "Map " .. id } end,
+    CanSetUserWaypointOnMap = function(id) return id ~= 0 end,
+    SetUserWaypoint = function(point) print("MAPPIN", point.map, point.x, point.y) end,
+}
+UiMapPoint = { CreateFromCoordinates = function(map, x, y) return { map = map, x = x, y = y } end }
+C_SuperTrack = { SetSuperTrackedUserWaypoint = function(on) print("TRACKED", tostring(on)) end }
+UnitFactionGroup = function() return PLAYER.faction end
+UnitClass = function() return "Priest", PLAYER.class, 5 end
+UnitLevel = function() return PLAYER.level end
+
 -- The addons on top of DeckLink, after it (they register their channels).
-for _, name in ipairs({ "DeckTelemetry", "DeckDictation" }) do
+for _, name in ipairs({ "DeckTelemetry", "DeckDictation", "DeckAgent" }) do
     local dir = DIR .. "/../addons/" .. name .. "/"
     local addonNS = {}
     for line in io.lines(dir .. name .. ".toc") do

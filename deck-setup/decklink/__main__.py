@@ -6,6 +6,7 @@
     decklink recv [--count N] [--timeout S]   print frames the game sends (channel<TAB>payload)
     decklink post CHANNEL [TEXT]      fire and forget: one frame by keys, no hello, no strip, no ack
                                       (lost if chat is open; for state that's sent again anyway)
+    decklink agent state | way MAP X Y [LABEL]   ask DeckAgent in the game (agent.py), JSON out
 
 Keys are paced (--gap, 1 ms) so the game doesn't freeze: about 55 bytes/s in.
 --tool ydotool|xdotool picks how keys go in (default: ydotool when its socket is usable, which
@@ -14,7 +15,7 @@ root, use sudo -E or run the reader side as deck.
 """
 import argparse, os, sys, time
 
-from . import codec, keys, link, strip
+from . import agent, codec, keys, link, strip
 
 
 def main(argv=None):
@@ -36,6 +37,8 @@ def main(argv=None):
     rv = sub.add_parser("recv")
     rv.add_argument("--count", type=int, default=0, help="stop after N frames (0: keep going)")
     rv.add_argument("--timeout", type=float, default=30)
+    ag = sub.add_parser("agent")
+    ag.add_argument("args", nargs=argparse.REMAINDER)
     a = p.parse_args(argv)
     try:
         if a.cmd == "status":
@@ -63,6 +66,11 @@ def main(argv=None):
                     p.error("channel is 1-255")
                 data = a.text.encode() if a.text is not None else sys.stdin.buffer.read()
                 lk.send(a.channel, data)
+            elif a.cmd == "agent":
+                try:
+                    return agent.main(lk, a.args)
+                except ValueError as e:
+                    p.error(str(e))
             elif a.cmd == "recv":
                 n = 0
                 while not a.count or n < a.count:

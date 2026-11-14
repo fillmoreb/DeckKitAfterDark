@@ -105,7 +105,8 @@ class Link:
         raise LinkError("the game didn't answer (DeckLink loaded? in the world? chat closed?)")
 
     def send(self, channel, payload, timeout=10, tries=3):
-        """Sends one frame and waits until the strip shows it arrived (its seq as the last good one)."""
+        """Sends one frame and waits until the strip shows it arrived (its seq as the last good one).
+        Returns the frame's seq (replies can name it)."""
         seq, frame = self._frame(channel, bytes(payload))
         for _ in range(tries):
             s = self.wait(lambda s: s.flags & strip.FLAG_READY, timeout, "the game to be ready (chat open?)")
@@ -116,7 +117,7 @@ class Link:
             except LinkError:
                 continue
             if self.status.rx_seq == seq:
-                return
+                return seq
         raise LinkError("frame not received after %d tries" % tries)
 
     # Receiving ------------------------------------------------------------------------------------------

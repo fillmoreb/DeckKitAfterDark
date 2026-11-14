@@ -14,6 +14,7 @@ Every addon here needs the DeckKit core (`## Dependencies: DeckKit`).
 | **DeckLink** | A two-way data link between a program on the Deck and addons: key taps in, colored cells on screen out. `/deckkit link` shows how it's going. |
 | **DeckDictation** | Decktation's exact state (recording, transcribing, done, error) for DeckKit's dictation indicator, from Decktation's status hook (`deck-setup/decktation-hook.sh`, installed as `decklink-decktation-hook`). |
 | **DeckTelemetry** | The Deck's battery, charging, power, temperatures, fan and CPU/GPU/memory load, for other addons to show (it draws nothing itself). `/deckkit telemetry` prints the latest. |
+| **DeckAgent** | The game side of DeckAgent, a gaming assistant you ask things ("give me a waypoint to the nearest priest trainer"). It answers where you are and sets waypoints (through WayPad), nothing else. `/deckkit agent`. Early: see [DeckAgent](#deckagent). |
 
 ## DeckLink
 
@@ -34,7 +35,7 @@ shows. A lost or extra tap fails the CRC: that frame is dropped and counted, nev
 Channel 0 is the link's own (hello, ack, bye, ping); addons use 1-255:
 
 ```lua
-DeckLink.On(5, function(payload) ... end)   -- frames from the program on channel 5
+DeckLink.On(5, function(payload, seq) ... end)   -- frames from the program on channel 5 (seq: the frame's)
 DeckLink.Send(5, "text")                     -- false if the link is closed or it's too long
 DeckLink.MaxPayload()                        -- about 545 bytes (one strip row); inbound up to 4096
 ```
@@ -75,6 +76,45 @@ DeckTelemetry.OnUpdate(function(t) ... end)   -- after each update; returns a ha
 DeckTelemetry.Age()                     -- seconds since the last update: tells fresh from stale
 ```
 
+## DeckAgent
+
+A gaming assistant, the way Claude Code is a coding assistant: you ask, it looks things up and acts in
+the game through a short, fixed list of requests. **Early (slice 1): text questions from a computer,
+NPC lookups and waypoints.** Voice, info popups, addon installs and memory are planned.
+
+```
+agent/deckagent "give me a waypoint to the nearest priest trainer"
+# -> I set a waypoint to X'yera, a priest trainer in Orgrimmar about 202 yards away.
+```
+
+- **The brain** is `claude -p` (Claude Code, signed in with your own Claude plan, so it draws on your
+  plan's limits, not an API bill), run from the agent's own folder (`~/.deckagent`) with
+  `--strict-mcp-config` and only web search and fetch as built-in tools. A `codex exec` engine is planned.
+- **The only way into the game** is `agent/mcp_server.py` (MCP, standard library only), with three
+  tools:
+  - `get_player_state`
+  - `find_npc`: nearest first, from the agent's database only (it never asks the game)
+  - `set_waypoint`
+
+  It reaches the game with `decklink agent state [FIELD…] | way MAP X Y` (`deck-setup/decklink/agent.py`,
+  DeckLink channel 3), answered by the DeckAgent addon. There is no way to run Lua, send slash
+  commands, or touch combat, movement, targeting or casting.
+- **Packets** are binary, with fields at fixed places, because keys into the game carry only about 55
+  bytes a second:
+  - asking for your location is 2 bytes (op byte, field mask), 64 key taps
+  - a waypoint is 7 bytes (op byte, map, x, y)
+  - the reply comes back on the strip: status, then only the fields asked for, or the WayPad
+    waypoint id
+
+  The full layout is at the top of `addons/DeckAgent/Agent.lua`.
+- **The database** (`~/.deckagent/deckagent.db`, SQLite) is built by `python3 -m agent.update_data`. It
+  draws on QuestieDB's Forever NPCs (spawn coordinates converted for 1.60) and wago.tools' Forever map
+  tables. Those are downloaded to `~/.deckagent/data`, never committed: they aren't ours to
+  redistribute.
+- **Setup on a Mac** (the brain on the Mac, the game on the Deck): install Claude Code and sign in, then
+  set `DECKAGENT_DECK=claude@<deck>` (an SSH target that can `sudo -u deck`; `DECK` in deploy.local works too) and run
+  `python3 -m agent.update_data`. On the Deck itself, leave `DECKAGENT_DECK` unset.
+
 ## Keys (Ben's setup)
 
 Every key the setup binds, across DeckKit, DeckKitAfterDark, Decktation and the dev tools:
@@ -90,7 +130,7 @@ Every key the setup binds, across DeckKit, DeckKitAfterDark, Decktation and the 
 Reload UI has no key: it's on a grip slot. Decktation reads the controller directly and types its text
 with ydotool; its status hook goes through DeckLink (F9/F10, channel 2), so it needs no keys of its own.
 
-DeckLink channels: 1 telemetry (DeckTelemetry), 2 Decktation's state (DeckDictation).
+DeckLink channels: 1 telemetry (DeckTelemetry), 2 Decktation's state (DeckDictation), 3 DeckAgent's requests.
 
 ## The cover
 

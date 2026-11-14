@@ -1,0 +1,5 @@
+# From the required dependencies, deployed alongside.
+DeckKit
+DeckLink
+# Optional: WayPad's waypoint API (DeckKit's WayPad addon).
+WayPad_Add

@@ -14,3 +14,11 @@ exchanging data with the game). Read `~/Projects/DeckKit/CLAUDE.md` for the game
 - Key facts measured on the Deck (AddonTools lab/RESULTS.md E6): every tap arrives, in order, however
   fast; two keys held at once lose a release; a focused text box swallows the keys (deckctl run leaves
   its export box focused until Escape).
+- DeckAgent (the gaming assistant): `agent/` (launcher `deckagent`, MCP server, SQLite game database,
+  `SYSTEM.md`), `deck-setup/decklink/agent.py` (host side) and `addons/DeckAgent` (game side, channel 3).
+  The game is reachable only through the MCP server's named tools, and the addon only accepts named ops
+  with data fields, never code. Packets are binary with fixed field positions (layout in `Agent.lua`'s
+  header); `Agent.lua` and `agent.py` must stay in step, and `test/test_agent.py` checks exact bytes.
+  New ops take new numbers, new state fields the next mask bit; nothing existing moves. Keep it that way: no Lua or slash passthrough. Downloaded reference data
+  (QuestieDB, wago.tools) lives in `~/.deckagent`, never in the repo. Brainstorm and plans: Ben's DeckKit
+  memory `wow-agent-brainstorm`.

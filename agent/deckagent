@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""DeckAgent: ask your gaming assistant something.
+
+    deckagent "give me a waypoint to the nearest priest trainer"
+    deckagent --engine claude|codex --model M --verbose "question"
+
+Runs the brain (claude -p today; codex exec is planned) from the agent's own folder ($DECKAGENT_HOME,
+default ~/.deckagent) with only DeckAgent's MCP server (agent/mcp_server.py) as its way into the game,
+plus web search and fetch. Signed in with your Claude plan, it draws from the same limits as your
+interactive Claude Code (never --bare, which would need an API key).
+
+Environment:
+  DECKAGENT_DECK   SSH target that reaches the game (e.g. claude@192.168.4.129); empty on the Deck itself
+  DECKAGENT_HOME   the agent's folder (database, notes)
+"""
+import argparse, json, os, shutil, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+from agent import common  # noqa: E402
+
+TOOLS = ["mcp__deckagent__get_player_state", "mcp__deckagent__find_npc", "mcp__deckagent__set_waypoint"]
+BUILTIN = "WebSearch,WebFetch"
+
+
+def workspace():
+    os.makedirs(common.HOME, exist_ok=True)
+    notes = os.path.join(common.HOME, "CLAUDE.md")
+    if not os.path.exists(notes):
+        shutil.copy(os.path.join(HERE, "workspace-CLAUDE.md"), notes)
+    cfg = {"mcpServers": {"deckagent": {
+        "command": sys.executable, "args": [os.path.join(HERE, "mcp_server.py")],
+        "env": {k: v for k, v in (("DECKAGENT_DECK", common.DECK), ("DECKAGENT_HOME", common.HOME),
+                                  ("DECKAGENT_DECKLINK", common.DECKLINK)) if v}}}}
+    path = os.path.join(common.HOME, "mcp.json")
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2)
+    return path
+
+
+def run_claude(question, mcp, model, verbose):
+    cmd = ["claude", "-p", question, "--output-format", "stream-json", "--verbose",
+           "--strict-mcp-config", "--mcp-config", mcp, "--tools", BUILTIN,
+           "--allowedTools", ",".join(TOOLS + BUILTIN.split(",")),
+           "--setting-sources", "project", "--no-session-persistence",
+           "--append-system-prompt-file", os.path.join(HERE, "SYSTEM.md")]
+    if model:
+        cmd += ["--model", model]
+    start = time.monotonic()
+    proc = subprocess.Popen(cmd, cwd=common.HOME, stdout=subprocess.PIPE, text=True)
+    answer, auth = None, None
+    for line in proc.stdout:
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if ev.get("type") == "system" and ev.get("subtype") == "init":
+            auth = ev.get("apiKeySource")
+            if verbose:
+                print("[init] model=%s auth=%s mcp=%s" % (ev.get("model"), auth,
+                      [(s["name"], s["status"]) for s in ev.get("mcp_servers", [])]), file=sys.stderr)
+        elif ev.get("type") == "assistant" and verbose:
+            for block in ev.get("message", {}).get("content", []):
+                if block.get("type") == "tool_use":
+                    print("[tool] %s %s" % (block["name"], json.dumps(block.get("input"))), file=sys.stderr)
+        elif ev.get("type") == "user" and verbose:
+            for block in ev.get("message", {}).get("content", []):
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    text = block.get("content")
+                    text = text if isinstance(text, str) else json.dumps(text)
+                    print("[result] %s" % text[:300], file=sys.stderr)
+        elif ev.get("type") == "result":
+            answer = ev.get("result")
+            if verbose:
+                print("[done] %.1f s, %s turns, cost estimate $%s" % (time.monotonic() - start, ev.get("num_turns"),
+                      ev.get("total_cost_usd")), file=sys.stderr)
+    proc.wait()
+    if auth not in (None, "none"):
+        print("deckagent: note: this ran on an API key (%s), not your Claude plan" % auth, file=sys.stderr)
+    return answer, proc.returncode
+
+
+def main():
+    p = argparse.ArgumentParser(prog="deckagent", description="Ask your gaming assistant.")
+    p.add_argument("question", nargs="+")
+    p.add_argument("--engine", choices=["claude", "codex"], default=os.environ.get("DECKAGENT_ENGINE", "claude"))
+    p.add_argument("--model", default=os.environ.get("DECKAGENT_MODEL"))
+    p.add_argument("-v", "--verbose", action="store_true")
+    a = p.parse_args()
+    if a.engine == "codex":
+        sys.exit("deckagent: the codex engine isn't built yet")
+    answer, rc = run_claude(" ".join(a.question), workspace(), a.model, a.verbose)
+    print(answer or "(no answer)")
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())
