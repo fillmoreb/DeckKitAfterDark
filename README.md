@@ -7,6 +7,8 @@ it does let outside programs feed addons and read what addons show. Install at y
 
 Every addon here needs the DeckKit core (`## Dependencies: DeckKit`).
 
+**Installing:** see [INSTALL.md](INSTALL.md).
+
 | Addon | What it does |
 |---|---|
 | **DeckLink** | A two-way data link between a program on the Deck and addons: key taps in, colored cells on screen out. `/deckkit link` shows how it's going. |
@@ -56,12 +58,8 @@ with Link() as link:
 Keys go in through Decktation's ydotool daemon when the program runs as root, else xdotool on
 Xwayland `:1` as the desktop user. Reading the strip needs Game Mode (gamescope's PipeWire stream).
 
-Install on the Deck: `deck-setup/install.sh` (from a Mac or PC with `deploy.local` set up) copies the
-package to `/home/deck/.local/lib/decklink`, puts `decklink` and `decklink-decktation-hook` in
-`/home/deck/.local/bin`, and enables the `decklink-cover` and `decklink-telemetry` user services. For
-DeckDictation, set Decktation's `statusHookCommand` (in
-`/home/deck/homebrew/settings/decktation/button_config.json`, root's) to
-`/home/deck/.local/bin/decklink-decktation-hook`.
+Installing it on the Deck (on the Deck itself, or over SSH from a Mac, Linux or Windows PC), the services it
+runs, and Decktation's status hook: [INSTALL.md](INSTALL.md).
 
 ## DeckTelemetry
 
