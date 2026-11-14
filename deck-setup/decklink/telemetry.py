@@ -7,28 +7,35 @@ Fire and forget: one frame on channel 1 every few seconds, by keys only. No hell
 so nothing reads the screen and it costs next to nothing. An update that's lost (chat open, a tap
 swallowed) fails the CRC or never arrives, and the next one replaces it.
 
-The payload is text, "key=value" pairs joined by ";" (v first, the format version). Numbers are
-plain; a field the Deck doesn't have is left out:
-    v     1
-    bat   battery charge, %
-    st    battery state: c charging, d discharging, n plugged in but not charging, f full
-    ac    1 plugged in, 0 not
-    bw    battery power, W: positive draining, negative charging
-    apu   APU power (CPU + GPU), W
-    cpu   CPU busy since the last update, %
-    gpu   GPU busy, %
-    mem   memory in use, %
-    tapu  APU temperature, C
-    tbat  battery temperature, C
-    tssd  SSD temperature, C
-    fan   fan speed, rpm
+The payload is binary, fields at fixed places, big-endian (addons/DeckTelemetry/Telemetry.lua reads it;
+keep the two in step). 17 bytes:
+    0      format version (2)
+    1-2    field mask: which readings below are real (bit set) rather than unknown (zero)
+             bit 0 bat, 1 st, 2 ac, 3 bw, 4 apu, 5 cpu, 6 gpu, 7 mem, 8 tapu, 9 tbat, 10 tssd, 11 fan
+    3      bat    battery charge, %
+    4      bits 0-1 st (0 discharging, 1 charging, 2 plugged in but not charging, 3 full), bit 2 ac
+    5-6    bw     battery power, W x 10, signed: positive draining, negative charging
+    7-8    apu    APU power (CPU + GPU), W x 10
+    9      cpu    CPU busy since the last update, %
+    10     gpu    GPU busy, %
+    11     mem    memory in use, %
+    12     tapu   APU temperature, C
+    13     tbat   battery temperature, C
+    14     tssd   SSD temperature, C
+    15-16  fan    fan speed, rpm
 """
-import argparse, glob, os, sys, time
+import argparse, glob, os, struct, sys, time
 
-from . import codec, keys
+from . import codec, keys, link
+
+# Telemetry waits while another program has the link open (DeckAgent's link keeper marks it every
+# second): its frame takes >1 s of taps and holds the key lock, so a question would wait behind it.
+PAUSE_IF_OPEN_WITHIN_S = 3
 
 CHANNEL = 1
-FORMAT = 1
+FORMAT = 2
+FIELDS = ["bat", "st", "ac", "bw", "apu", "cpu", "gpu", "mem", "tapu", "tbat", "tssd", "fan"]  # mask bit order
+ST_CODES = {"d": 0, "c": 1, "n": 2, "f": 3}
 
 
 def _read(path):
@@ -115,12 +122,17 @@ def collect(cpu):
 
 
 def encode(readings):
-    """The payload: "k=v;k=v". Whole numbers stay whole, others get one decimal."""
-    def fmt(v):
-        if isinstance(v, float):
-            return str(int(round(v))) if abs(v - round(v)) < 0.05 else "%.1f" % v
-        return str(v)
-    return ";".join("%s=%s" % (k, fmt(v)) for k, v in readings).encode()
+    """The binary payload (layout above) for collect()'s readings."""
+    r = dict(readings)
+    mask = sum(1 << b for b, f in enumerate(FIELDS) if r.get(f) is not None)
+    u8 = lambda v: max(0, min(255, int(round(v or 0))))
+    power = ST_CODES.get(r.get("st"), 0) | (4 if r.get("ac") else 0)
+    bw = max(-32768, min(32767, int(round((r.get("bw") or 0) * 10))))
+    apu = max(0, min(65535, int(round((r.get("apu") or 0) * 10))))
+    fan = max(0, min(65535, int(round(r.get("fan") or 0))))
+    return struct.pack(">BHBBhHBBBBBBH", FORMAT, mask, u8(r.get("bat")), power, bw, apu, u8(r.get("cpu")),
+                       u8(r.get("gpu")), u8(r.get("mem")), u8(r.get("tapu")), u8(r.get("tbat")),
+                       u8(r.get("tssd")), fan)
 
 
 def main(argv=None):
@@ -135,10 +147,14 @@ def main(argv=None):
     time.sleep(0.5)  # a first CPU sample interval
     seq = int(time.time()) % 255 + 1
     while True:
-        payload = encode(collect(cpu))
+        if not a.once and (time.time() - link.open_since() < PAUSE_IF_OPEN_WITHIN_S or link.held()):
+            time.sleep(1)
+            continue
+        readings = collect(cpu)
+        payload = encode(readings)
         seq = seq % 255 + 1
         if a.print:
-            print(payload.decode(), flush=True)
+            print(dict(readings), payload.hex(), flush=True)
         try:
             sender.send(list(codec.bits(codec.build(CHANNEL, seq, payload))))
         except keys.SendError as e:

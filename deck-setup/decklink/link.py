@@ -30,6 +30,36 @@ def mark_open(when):
         pass  # the cover is a nicety; the link works without it
 
 
+# While a dictation is under way (dictation.py), its states shouldn't wait behind telemetry's taps:
+# this file says so, and telemetry holds off while it's fresh. A hold older than HOLD_FOR is stale
+# (a hook that never said done), so it can't stop telemetry for good.
+HOLD_FILE = "/tmp/decklink-hold"
+HOLD_FOR = 60
+
+
+def hold(on):
+    try:
+        if on:
+            try:
+                fd = os.open(HOLD_FILE, os.O_WRONLY | os.O_TRUNC)
+            except FileNotFoundError:
+                fd = os.open(HOLD_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+                os.fchmod(fd, 0o666)
+            os.write(fd, b"%.1f" % time.time())
+            os.close(fd)
+        elif os.path.exists(HOLD_FILE):
+            os.remove(HOLD_FILE)
+    except OSError:
+        pass
+
+
+def held():
+    try:
+        return time.time() - os.path.getmtime(HOLD_FILE) < HOLD_FOR
+    except OSError:
+        return False
+
+
 def open_since():
     """When the link was last seen open, per OPEN_FILE (0: closed or unknown)."""
     try:
@@ -37,6 +67,13 @@ def open_since():
             return float(f.read().strip() or 0)
     except (OSError, ValueError):
         return 0
+
+
+# How long after its taps a frame has to show as arrived before it's sent again. The taps are all in
+# when keys.send returns, and the strip shows the frame within a few game frames (measured ~0.25 s
+# round trip on the Deck, 2026-11-14); an occasional frame is lost outright, and waiting 2 s for it
+# cost every such request 2 s.
+ARRIVE_S = 0.8
 
 
 class LinkError(Exception):
@@ -113,7 +150,7 @@ class Link:
             bad = s.bad
             self.keys.send(list(codec.bits(frame)))
             try:
-                self.wait(lambda s: s.rx_seq == seq or s.bad != bad, 2.0, "the frame to arrive")
+                self.wait(lambda s: s.rx_seq == seq or s.bad != bad, ARRIVE_S, "the frame to arrive")
             except LinkError:
                 continue
             if self.status.rx_seq == seq:
@@ -149,9 +186,11 @@ class Link:
                 return self.clock() - start
 
     def close(self):
+        """Says bye and doesn't wait: the game takes the strip down as it closes, so there's no ack to see."""
         try:
-            self.send(0, bytes([codec.OP_BYE]), timeout=2, tries=1)
-        except LinkError:
+            _, frame = self._frame(0, bytes([codec.OP_BYE]))
+            self.keys.send(list(codec.bits(frame)))
+        except Exception:
             pass
         mark_open(0)
 

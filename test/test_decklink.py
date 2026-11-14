@@ -2,11 +2,11 @@
 
     python3 -m unittest discover -s test     (needs lua5.1, or lua with LUA=...)
 """
-import os, random, shutil, subprocess, sys, tempfile, unittest
+import os, random, shutil, struct, subprocess, sys, tempfile, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "deck-setup"))
-from decklink import codec, keys, link, strip, telemetry  # noqa: E402
+from decklink import codec, dictation, keys, link, strip, telemetry  # noqa: E402
 
 LUA = os.environ.get("LUA") or shutil.which("lua5.1") or shutil.which("lua")
 
@@ -177,25 +177,35 @@ class Out(unittest.TestCase):
 
 
 class Telemetry(unittest.TestCase):
-    READINGS = [("v", 1), ("bat", 87.0), ("st", "d"), ("ac", 0), ("bw", 9.43), ("apu", 7.118), ("cpu", 23.96),
+    READINGS = [("v", 2), ("bat", 87.0), ("st", "d"), ("ac", 0), ("bw", 9.43), ("apu", 7.118), ("cpu", 23.96),
                 ("tapu", 66.0), ("fan", 3223.0)]
 
-    def test_encode(self):
-        self.assertEqual(telemetry.encode(self.READINGS),
-                         b"v=1;bat=87;st=d;ac=0;bw=9.4;apu=7.1;cpu=24;tapu=66;fan=3223")
+    def test_encode_is_17_bytes_at_fixed_places(self):
+        data = telemetry.encode(self.READINGS)
+        self.assertEqual(len(data), 17)
+        mask = 1 << 0 | 1 << 1 | 1 << 2 | 1 << 3 | 1 << 4 | 1 << 5 | 1 << 8 | 1 << 11
+        self.assertEqual(data, struct.pack(">BHBBhHBBBBBBH", 2, mask, 87, 0, 94, 71, 24, 0, 0, 66, 0, 0, 3223))
+
+    def test_charging_and_plugged_in(self):
+        data = telemetry.encode([("st", "c"), ("ac", 1), ("bw", -12.04)])
+        self.assertEqual(data[4], 1 | 4)
+        self.assertEqual(struct.unpack(">h", data[5:7])[0], -120)
 
     def test_arrives_without_hello_and_parses(self):
         frame = codec.build(telemetry.CHANNEL, 9, telemetry.encode(self.READINGS))
         lines, s = Game.run('login() taps("%s") later(2) frame() local t = DeckTelemetry.Get()'
-                            ' print("T", t.bat, t.st, tostring(t.ac), t.bw, t.fan, t.age, DeckTelemetry.Get("cpu"))' % bitstr(frame))
+                            ' print("T", t.bat, t.st, tostring(t.ac), t.bw, t.apu, t.fan, t.age, DeckTelemetry.Get("cpu"),'
+                            ' tostring(t.gpu))' % bitstr(frame))
         self.assertIsNone(s)  # no strip: nothing was opened
-        self.assertIn("T\t87\tdischarging\tfalse\t9.4\t3223\t2\t24", lines)
+        self.assertIn("T\t87\tdischarging\tfalse\t9.4\t7.1\t3223\t2\t24\tnil", lines)  # gpu wasn't sent
 
     def test_listeners_and_unknown_format(self):
-        good = codec.build(1, 2, b"v=1;bat=50")
-        future = codec.build(1, 3, b"v=2;bat=10")
+        good = codec.build(1, 2, telemetry.encode([("bat", 50)]))
+        future = codec.build(1, 3, bytes([3]) + telemetry.encode([("bat", 10)])[1:])
+        short = codec.build(1, 4, b"v=1;bat=10")
         lines, _ = Game.run('login() local h = DeckTelemetry.OnUpdate(function(t) print("UPDATE", t.bat) end)'
-                            ' taps("%s") taps("%s") print("BAT", DeckTelemetry.Get("bat"))' % (bitstr(good), bitstr(future)))
+                            ' taps("%s") taps("%s") taps("%s") print("BAT", DeckTelemetry.Get("bat"))'
+                            % (bitstr(good), bitstr(future), bitstr(short)))
         self.assertEqual([l for l in lines if l.startswith(("UPDATE", "BAT"))], ["UPDATE\t50", "BAT\t50"])
 
     def test_nothing_before_the_first_update(self):
@@ -205,19 +215,59 @@ class Telemetry(unittest.TestCase):
 
 class Dictation(unittest.TestCase):
     def test_states_reach_deckkit(self):
-        taps = " ".join('taps("%s")' % bitstr(codec.build(2, i + 1, state.encode()))
-                        for i, state in enumerate(["recording", "transcribing", "bogus", "done"]))
+        packets = [dictation.encode("recording"), dictation.encode("transcribing", "agent"), bytes([9, 0]),
+                   b"done", dictation.encode("thinking", "agent"), dictation.encode("done", "agent")]
+        taps = " ".join('taps("%s")' % bitstr(codec.build(2, i + 1, p)) for i, p in enumerate(packets))
         lines, s = Game.run("login() " + taps)
         self.assertEqual([l for l in lines if l.startswith("DICTATION")],
-                         ["DICTATION recording", "DICTATION transcribing", "DICTATION done"])
+                         ["DICTATION claimed",  # at load: the grips never drive the indicator
+                          "DICTATION recording chat", "DICTATION transcribing agent", "DICTATION thinking agent",
+                          "DICTATION done agent"])
         self.assertIsNone(s)  # fire and forget: no strip
 
+    def test_dictation_holds_the_keys_until_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = link.HOLD_FILE
+            link.HOLD_FILE = os.path.join(tmp, "hold")
+            try:
+                sent = []
+                sender = type("S", (), {"send": lambda self, bits: sent.append(bits)})()
+                dictation.post("recording", sender=sender)
+                self.assertTrue(link.held())
+                dictation.post("transcribing", "agent", sender=sender)
+                self.assertTrue(link.held())
+                dictation.post("done", "agent", sender=sender)
+                self.assertFalse(link.held())
+                self.assertEqual(len(sent), 3)
+            finally:
+                link.HOLD_FILE = old
+
     def test_hook_maps_decktation_events(self):
-        hook = os.path.join(HERE, "..", "deck-setup", "decktation-hook.sh")
-        text = open(hook).read()
-        for event, state in (("record_start", "recording"), ("record_stop", "transcribing"),
-                             ("transcription_done|record_abort", "done"), ("error", "error")):
-            self.assertIn("%s) state=%s ;;" % (event, state), text)
+        """Runs the real hook with a stub decklink: what it posts for each event, per binding."""
+        with open(os.path.join(HERE, "..", "deck-setup", "decktation-hook.sh")) as f:
+            text = f.read()
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = os.path.join(tmp, "decklink")
+            with open(stub, "w") as f:
+                f.write('#!/bin/sh\necho "$@"\n')
+            os.chmod(stub, 0o755)
+            hook = os.path.join(tmp, "hook.sh")
+            with open(hook, "w") as f:
+                f.write(text.replace("/home/deck/.local/bin/decklink", stub).replace("runuser -u deck -- ", ""))
+
+            def run(event, binding="chat"):
+                out = subprocess.run(["sh", hook], capture_output=True, text=True,
+                                     env=dict(os.environ, DECKTATION_EVENT=event, DECKTATION_BINDING=binding))
+                words = out.stdout.split()  # e.g. --tool xdotool dictation recording --binding chat
+                return (words[words.index("dictation") + 1], words[-1]) if "dictation" in words else None
+            for event, state in (("record_start", "recording"), ("record_stop", "transcribing"),
+                                 ("transcription_done", "done"), ("record_abort", "done"), ("error", "error")):
+                self.assertEqual(run(event), (state, "chat"), event)
+            self.assertIsNone(run("something_new"))
+            # The agent binding: DeckAgent closes the box once it has answered, not the transcript.
+            self.assertIsNone(run("transcription_done", "agent"))
+            self.assertEqual(run("record_start", "agent"), ("recording", "agent"))
+            self.assertEqual(run("record_abort", "agent"), ("done", "agent"))
 
 
 class FakeGame:

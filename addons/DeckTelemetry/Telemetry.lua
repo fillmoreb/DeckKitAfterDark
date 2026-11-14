@@ -17,12 +17,17 @@
 --
 -- Updates are fire and forget: if one is lost (chat was open), the next replaces it. Check Age() to
 -- tell a fresh reading from a stale one (no sender running, or the Deck asleep).
+--
+-- On the wire: 17 bytes, fields at fixed places, big-endian (telemetry.py has the layout; keep the two
+-- in step). A field mask says which readings are real; the rest are left out of the table.
 local ADDON, ns = ...
 
 DeckKit.NewModule(ns, ADDON, "|cff5fd38dDeckTelemetry|r")
 
 local CHANNEL = 1
-local STATES = { c = "charging", d = "discharging", n = "not charging", f = "full" }
+local FORMAT = 2
+local STATES = { [0] = "discharging", [1] = "charging", [2] = "not charging", [3] = "full" }
+local FIELDS = { "bat", "st", "ac", "bw", "apu", "cpu", "gpu", "mem", "tapu", "tbat", "tssd", "fan" } -- mask bits 0..11
 
 local api = {}
 DeckTelemetry = api
@@ -30,16 +35,28 @@ DeckTelemetry = api
 local latest, at
 local listeners, nextHandle = {}, 0
 
--- "v=1;bat=87;st=d;..." into a table: numbers where they're numbers, ac as a boolean, st spelled out.
-local function Parse(payload)
+local function U16(p, i)
+    local hi, lo = p:byte(i, i + 1)
+    return hi * 256 + lo
+end
+
+local function Bit(n, b) return math.floor(n / 2 ^ b) % 2 == 1 end
+
+-- The 17-byte payload into a table of the readings the mask says are real.
+local function Parse(p)
+    if #p < 17 or p:byte(1) ~= FORMAT then return nil end
+    local mask, power = U16(p, 2), p:byte(5)
+    local bw = U16(p, 6)
+    if bw >= 32768 then bw = bw - 65536 end
+    local all = {
+        bat = p:byte(4), st = STATES[power % 4], ac = Bit(power, 2), bw = bw / 10, apu = U16(p, 8) / 10,
+        cpu = p:byte(10), gpu = p:byte(11), mem = p:byte(12), tapu = p:byte(13), tbat = p:byte(14),
+        tssd = p:byte(15), fan = U16(p, 16),
+    }
     local t = {}
-    for key, value in payload:gmatch("([%w_]+)=([^;]*)") do
-        t[key] = tonumber(value) or value
+    for b, key in ipairs(FIELDS) do
+        if Bit(mask, b - 1) then t[key] = all[key] end
     end
-    if t.v ~= 1 then return nil end
-    t.v = nil
-    if t.ac ~= nil then t.ac = t.ac == 1 end
-    if t.st then t.st = STATES[t.st] or t.st end
     return t
 end
 
