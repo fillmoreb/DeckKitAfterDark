@@ -58,7 +58,7 @@ with Link() as link:
 Keys go in through Decktation's ydotool daemon when the program runs as root, else xdotool on
 Xwayland `:1` as the desktop user. Reading the strip needs Game Mode (gamescope's PipeWire stream).
 
-Installing it on the Deck (on the Deck itself, or over SSH from a Mac, Linux or Windows PC), the services it
+Installing it on the Deck (on the Deck itself, or over SSH from a Mac or Linux computer), the services it
 runs, and Decktation's status hook: [INSTALL.md](INSTALL.md).
 
 ## DeckTelemetry
