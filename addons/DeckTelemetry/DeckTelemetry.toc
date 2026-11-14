@@ -1,0 +1,8 @@
+## Interface: 16001
+## Title: DeckTelemetry
+## Notes: DeckKitAfterDark: your Steam Deck's battery, power, temperatures, fan and load, for other addons to show (from decklink.telemetry, through DeckLink). /deckkit telemetry
+## Version: @project-version@
+## Author: Ben Fillmore
+## Dependencies: DeckKit, DeckLink
+
+Telemetry.lua

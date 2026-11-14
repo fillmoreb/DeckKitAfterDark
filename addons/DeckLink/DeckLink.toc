@@ -1,0 +1,10 @@
+## Interface: 16001
+## Title: DeckLink
+## Notes: DeckKitAfterDark: a data link between programs on your Steam Deck and addons (keys F9/F10 in, a strip of colored cells along the bottom edge out). /deckkit link
+## Version: @project-version@
+## Author: Ben Fillmore
+## Dependencies: DeckKit
+
+Codec.lua
+Strip.lua
+Link.lua
