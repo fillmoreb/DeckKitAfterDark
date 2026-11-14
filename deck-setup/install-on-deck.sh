@@ -2,8 +2,10 @@
 # Installs DeckLink's program side, run ON the Steam Deck as the desktop user (deck), from this folder
 # (Konsole in Desktop Mode: `bash install-on-deck.sh`; install.sh does the same from a Mac or PC over SSH):
 #   the decklink package into ~/.local/lib; `decklink` and `decklink-decktation-hook` (Decktation's
-#   statusHookCommand) into ~/.local/bin; and the decklink-cover and decklink-telemetry systemd user
-#   services, enabled, so they start with the Deck.
+#   statusHookCommand) into ~/.local/bin; and the decklink-cover, decklink-telemetry and decklink-agent
+#   (DeckAgent's link keeper) systemd user services, enabled, so they start with the Deck. DeckAgent
+#   itself (../agent: the assistant's launcher, MCP server and database tools) goes into
+#   ~/.local/lib/deckagent, with `deckagent` in ~/.local/bin.
 set -euo pipefail
 cd "$(dirname "$0")"
 [ "$(id -un)" = deck ] || { echo "run this as the deck user (not root)" >&2; exit 1; }
@@ -16,6 +18,25 @@ cat > ~/.local/bin/decklink <<'SH'
 PYTHONPATH=/home/deck/.local/lib exec python3 -m decklink "$@"
 SH
 chmod +x ~/.local/bin/decklink
+AGENT=agent; [ -d "$AGENT" ] || AGENT=../agent  # install.sh ships it alongside; in the repo it's one up
+if [ -d "$AGENT" ]; then
+  rm -rf ~/.local/lib/deckagent
+  mkdir -p ~/.local/lib/deckagent
+  cp -r "$AGENT" ~/.local/lib/deckagent/agent
+  rm -rf ~/.local/lib/deckagent/agent/__pycache__
+  cat > ~/.local/bin/deckagent <<'SH'
+#!/bin/sh
+exec python3 /home/deck/.local/lib/deckagent/agent/deckagent "$@"
+SH
+  chmod +x ~/.local/bin/deckagent
+fi
+cat > ~/.local/bin/decklink-agent-ask <<'SH'
+#!/bin/sh
+# Decktation's agent binding command (agentBinding.command in its button_config.json): hands the
+# transcript, its last argument, to DeckAgent's link keeper to answer out loud.
+PYTHONPATH=/home/deck/.local/lib exec python3 -m decklink.agentd --ask "$1"
+SH
+chmod +x ~/.local/bin/decklink-agent-ask
 cp decktation-hook.sh ~/.local/bin/decklink-decktation-hook
 chmod +x ~/.local/bin/decklink-decktation-hook
 cat > ~/.config/systemd/user/decklink-cover.service <<'UNIT'
@@ -40,10 +61,21 @@ RestartSec=10
 [Install]
 WantedBy=default.target
 UNIT
+cat > ~/.config/systemd/user/decklink-agent.service <<'UNIT'
+[Unit]
+Description=DeckLink agent link keeper: holds DeckLink open for DeckAgent while it's being asked things
+[Service]
+Environment=PYTHONPATH=/home/deck/.local/lib
+ExecStart=/usr/bin/python3 -m decklink.agentd --voice
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=default.target
+UNIT
 export XDG_RUNTIME_DIR=/run/user/$(id -u) DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus
 systemctl --user stop decklink-cover decklink-keepalive 2>/dev/null || true
 systemctl --user daemon-reload
-systemctl --user enable decklink-cover decklink-telemetry >/dev/null 2>&1
-systemctl --user restart decklink-cover decklink-telemetry
-systemctl --user is-active decklink-cover decklink-telemetry
-echo "decklink installed, with the decklink-cover and decklink-telemetry user services"
+systemctl --user enable decklink-cover decklink-telemetry decklink-agent >/dev/null 2>&1
+systemctl --user restart decklink-cover decklink-telemetry decklink-agent
+systemctl --user is-active decklink-cover decklink-telemetry decklink-agent
+echo "decklink installed, with the decklink-cover, decklink-telemetry and decklink-agent user services"

@@ -33,13 +33,18 @@ TOOLS = [
                     "uniqueItems": True}},
          "additionalProperties": False}},
     {"name": "find_npc",
-     "description": "Search the local game database (QuestieDB's Forever NPCs) for NPCs whose name or title "
-                    "contains all the words of `query` (e.g. 'priest trainer', 'flight master', 'Thrall'). "
-                    "This doesn't ask the game anything: for 'nearest', call get_player_state first and pass "
-                    "its map_id, x and y as `near` (results then come nearest first, with distance in yards; "
-                    "null on another continent) and its faction as `faction` (only NPCs friendly to it). "
-                    "Each result has its nearest spawn: map_id, x, y (0-100) and zone.",
+     "description": "Search the local game database (QuestieDB's Forever NPCs). Give a `role` for a kind of "
+                    "NPC (flight_master, innkeeper, banker, auctioneer, stable_master, battlemaster, repair, "
+                    "vendor, trainer, spirit_healer, guild_master: matched by the game's NPC flags, so a "
+                    "Horde 'Wind Rider Master' counts as a flight master), and/or `query` words to match in "
+                    "the name or title ('priest trainer', 'Thrall'). This doesn't ask the game anything: for "
+                    "'nearest', pass the player's map_id, x and y as `near` (results come nearest first, with "
+                    "distance in yards; null on another continent) and their faction as `faction` (only NPCs "
+                    "friendly to it). Each result has its nearest spawn: map_id, x, y (0-100) and zone.",
      "inputSchema": {"type": "object", "properties": {
+         "role": {"type": "string", "enum": ["flight_master", "innkeeper", "banker", "auctioneer", "stable_master",
+                                             "battlemaster", "repair", "vendor", "trainer", "spirit_healer",
+                                             "guild_master"]},
          "query": {"type": "string", "description": "words to match in the NPC's name or title"},
          "near": {"type": "object", "description": "a position to sort by: map_id and x, y (0-100)",
                   "properties": {"map_id": {"type": "integer"}, "x": {"type": "number"}, "y": {"type": "number"}},
@@ -47,7 +52,7 @@ TOOLS = [
          "faction": {"type": "string", "enum": ["H", "A"],
                      "description": "only NPCs friendly to this faction (leave out to include all, e.g. mobs)"},
          "limit": {"type": "integer", "minimum": 1, "maximum": 25, "default": 5}},
-         "required": ["query"], "additionalProperties": False}},
+         "additionalProperties": False}},
     {"name": "set_waypoint",
      "description": "Put a waypoint in the game (WayPad) and make it the active one. x and y are 0-100 on "
                     "map_id, like /way. Do it straight away when the player asked for it. Returns the "
@@ -90,7 +95,13 @@ def tool_find_npc(args):
     state = {"map": int(near["map_id"]), "x": float(near["x"]) / 100, "y": float(near["y"]) / 100} if near else None
     db = gamedb.connect(common.DB_PATH)
     try:
-        found = gamedb.find_npc(db, args["query"], state, args.get("faction"), int(args.get("limit") or 5))
+        if not (args.get("query") or args.get("role")):
+            raise common.GameError("find_npc needs a role or query words")
+        try:
+            found = gamedb.find_npc(db, args.get("query", ""), state, args.get("faction"), int(args.get("limit") or 5),
+                                    role=args.get("role"))
+        except ValueError as e:
+            raise common.GameError(str(e))
     finally:
         db.close()
     out = {"results": found, "source": "local database (QuestieDB Forever data)"}

@@ -15,5 +15,5 @@ DECK="${1:-${DECK:-}}"
 REMOTE='d=$(mktemp -d) && chmod 755 "$d" && cd "$d" && tar xf - && \
   if [ "$(id -un)" = deck ]; then bash install-on-deck.sh; else sudo -n -u deck bash install-on-deck.sh; fi; \
   rc=$?; cd /; rm -rf "$d"; exit $rc'
-COPYFILE_DISABLE=1 tar --no-xattrs --exclude __pycache__ -cf - decklink decktation-hook.sh install-on-deck.sh \
+COPYFILE_DISABLE=1 tar --no-xattrs --exclude __pycache__ -cf - decklink decktation-hook.sh install-on-deck.sh -C .. agent \
   | ssh "$DECK" "$REMOTE"

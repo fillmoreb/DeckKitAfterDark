@@ -131,6 +131,25 @@ def way(lk, map_id, x, y):
     return parse_reply(request(lk, build_way(map_id, x, y)))
 
 
+def via_service(argv):
+    """`decklink agent ...` through the link keeper (agentd) when it's running: (exit code, printed) or
+    None when there's no service (the caller then opens the link itself)."""
+    from . import agentd
+    if not argv or argv[0] not in ("state", "way"):
+        return None
+    if argv[0] == "state":
+        req = {"cmd": "state", "fields": argv[1:] or FIELDS}
+    elif len(argv) == 4:
+        req = {"cmd": "way", "map": int(argv[1]), "x": float(argv[2]), "y": float(argv[3])}
+    else:
+        return None
+    try:
+        reply = agentd.ask(req)
+    except OSError:
+        return None
+    return (0 if reply.get("ok") else 1), json.dumps(reply)
+
+
 def main(lk, argv):
     """`decklink agent ...` with an open Link. Returns the exit code."""
     if not argv or argv[0] not in ("state", "way"):

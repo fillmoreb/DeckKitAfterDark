@@ -263,3 +263,186 @@ class MCPServer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LinkKeeper(unittest.TestCase):
+    """deck-setup/decklink/agentd.py: one link kept open across requests, closed when idle."""
+
+    def setUp(self):
+        from decklink import agentd
+        self.agentd = agentd
+        self.now = [100.0]
+        self.opened = self.closed = 0
+        test = self
+
+        class FakeLink:
+            def open(self):
+                test.opened += 1
+                return self
+
+            def close(self):
+                test.closed += 1
+        self.FakeLink = FakeLink
+        self.keeper = agentd.Keeper(25, make_link=FakeLink, clock=lambda: self.now[0])
+        p = mock.patch.object(host, "state", lambda lk, fields: {"ok": True, "fields": fields})
+        p.start()
+        self.addCleanup(p.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        p = mock.patch.object(agentd.link, "OPEN_FILE", os.path.join(tmp.name, "open"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_one_link_for_many_requests(self):
+        for _ in range(3):
+            self.assertTrue(self.keeper.handle({"cmd": "state", "fields": ["pos"]})["ok"])
+        self.assertEqual((self.opened, self.closed), (1, 0))
+
+    def test_idle_link_closes_and_reopens(self):
+        self.keeper.handle({"cmd": "warm"})
+        self.now[0] += 24
+        self.keeper.tick()
+        self.assertEqual(self.closed, 0)
+        self.assertGreater(self.agentd.link.open_since(), 0)  # held open: marked, so telemetry waits
+        self.now[0] += 2
+        self.keeper.tick()
+        self.assertEqual(self.closed, 1)
+        self.assertFalse(self.keeper.handle({"cmd": "status"})["open"])
+        self.keeper.handle({"cmd": "state"})
+        self.assertEqual(self.opened, 2)
+
+    def test_a_failed_request_starts_clean(self):
+        def broken(lk, fields):
+            raise self.agentd.link.LinkError("frame not received")
+        with mock.patch.object(host, "state", broken):
+            reply = self.keeper.handle({"cmd": "state"})
+        self.assertEqual(reply, {"ok": False, "error": "frame not received"})
+        self.assertEqual(self.closed, 1)
+        self.keeper.handle({"cmd": "state"})
+        self.assertEqual(self.opened, 2)
+
+    def test_bad_requests(self):
+        self.assertFalse(self.keeper.handle({"cmd": "runlua"})["ok"])
+        self.assertFalse(self.keeper.handle({"cmd": "state", "fields": ["secrets"]})["ok"])
+        self.assertFalse(self.keeper.handle({"cmd": "way", "map": 1})["ok"])  # missing x, y
+
+    def test_socket_round_trip(self):
+        import threading
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "s.sock")
+            threading.Thread(target=self.agentd.serve, args=(self.keeper, path), daemon=True).start()
+            for _ in range(100):
+                if os.path.exists(path):
+                    break
+                __import__("time").sleep(0.01)
+            self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
+            self.assertEqual(self.agentd.ask({"cmd": "state", "fields": ["zone"]}, path),
+                             {"ok": True, "fields": ["zone"]})
+            with self.assertRaises(OSError):
+                self.agentd.ask({"cmd": "status"}, os.path.join(tmp, "nobody.sock"))
+
+
+class Roles(unittest.TestCase):
+    def setUp(self):
+        self.db = gamedb.connect(":memory:")
+        self.addCleanup(self.db.close)
+        gamedb.load_maps(self.db, UIMAP_CSV, UMA_CSV)
+        extra = ("[6] = {'Doras',100,100,30,30,0,{[1637]={{45.1,63.9}}},nil,1637,nil,nil,29,\"H\",\"Wind Rider Master\",11},\n"
+                 "[7] = {'Far Flyer',100,100,30,30,0,{[1637]={{90,10}}},nil,1637,nil,nil,29,\"H\",\"Flight Master\",0},\n"
+                 "[8] = {'Auctioneer Thathung',100,100,30,30,0,{[1637]={{55,62}}},nil,1637,nil,nil,29,\"H\",nil,4096},\n"
+                 "[9] = {'Horse Breeder',100,100,30,30,0,{[1637]={{50,80}}},nil,1637,nil,nil,29,\"H\",\"Horse Breeder\",132},\n"
+                 "[10] = {'Innkeeper Gryshka',100,100,30,30,0,{[1637]={{54,68}}},nil,1637,nil,nil,29,\"H\",\"Innkeeper\",135},\n")
+        gamedb.load_npcs(self.db, NPC_LUA.replace("}]]", extra + "}]]"), ZONES_LUA)
+        self.here = {"map": 1454, "x": 0.5, "y": 0.8}
+
+    def names(self, **kw):
+        return [r["name"] for r in gamedb.find_npc(self.db, state=self.here, faction="H", limit=10, **kw)]
+
+    def test_flight_master_by_flag_and_by_title(self):
+        self.assertEqual(self.names(role="flight_master"), ["Doras", "Far Flyer"])  # flag 0x8; flags 0 but titled
+
+    def test_untitled_auctioneer_found_by_flag(self):
+        self.assertEqual(self.names(role="auctioneer"), ["Auctioneer Thathung"])
+
+    def test_innkeeper_flag_alone_isnt_enough(self):
+        self.assertEqual(self.names(role="innkeeper"), ["Innkeeper Gryshka"])  # not the horse breeder
+
+    def test_role_and_words_and_filler(self):
+        self.assertEqual(self.names(role="flight_master", query="the nearest doras"), ["Doras"])
+        self.assertEqual(self.names(query="nearest"), [])
+        with self.assertRaises(ValueError):
+            self.names(role="mailbox")
+
+
+class VoiceAnswers(unittest.TestCase):
+    """voice.py: a voice question (from Decktation's agent binding) answered and spoken."""
+
+    def setUp(self):
+        from decklink import voice
+        self.voice = voice
+        self.said, self.shown, self.ran = [], [], []
+        indicator = mock.Mock(show=lambda state: self.shown.append(state))
+
+        def run(cmd, **kw):
+            self.ran.append(cmd)
+            return mock.Mock(stdout="[tool] ...\nWaypoint set: Doras, Orgrimmar.\n", stderr="", returncode=0)
+        self.v = voice.Voice(indicator=indicator, run=run, say=self.said.append)
+
+    def wait(self):
+        for _ in range(200):
+            if not self.v.busy:
+                return
+            __import__("time").sleep(0.01)
+
+    def test_answers_closes_the_box_and_speaks(self):
+        self.assertTrue(self.v.ask("  nearest flight master "))
+        self.wait()
+        self.assertEqual(self.ran, [[self.voice.DECKAGENT, "nearest flight master"]])
+        self.assertEqual(self.shown, ["thinking", "done"])
+        self.assertEqual(self.said, ["Waypoint set: Doras, Orgrimmar."])
+
+    def test_phantoms_close_the_box_and_go_nowhere(self):
+        for text in ("   ", "you", "Thank you.", " Thanks for watching! ", "...", "Um"):
+            self.assertFalse(self.v.ask(text), text)
+        self.assertEqual(self.ran, [])
+        self.assertEqual(self.shown, ["done"] * 6)
+        self.assertFalse(self.voice.is_phantom("thank you, where is Thrall"))
+
+    def test_one_question_at_a_time_and_none_empty(self):
+        self.assertFalse(self.v.ask("   "))
+        self.v.busy = True
+        self.assertFalse(self.v.ask("another"))
+        self.v.busy = False
+        self.assertEqual(self.ran, [])
+
+    def test_a_failure_says_so(self):
+        def broken(cmd, **kw):
+            raise OSError("no deckagent")
+        self.v.run = broken
+        self.v.ask("anything")
+        self.wait()
+        self.assertEqual(self.shown, ["thinking", "error"])
+        self.assertEqual(self.said, ["Sorry, that didn't work."])
+
+    def test_the_service_hands_questions_over(self):
+        from decklink import agentd
+        keeper = agentd.Keeper(25, make_link=lambda: None)
+        self.assertFalse(keeper.handle({"cmd": "ask", "text": "hi"})["ok"])  # voice off
+        keeper.voice = mock.Mock(ask=lambda text: text == "hi")
+        self.assertTrue(keeper.handle({"cmd": "ask", "text": "hi"})["ok"])
+
+
+class DictationThroughTheService(unittest.TestCase):
+    def test_the_hook_can_post_states_through_the_service(self):
+        from decklink import agentd, dictation
+        keeper = agentd.Keeper(25, make_link=lambda: None)
+        sent = []
+        keeper.dictation_keys = type("S", (), {"send": lambda self, bits: sent.append(bits)})()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(agentd.link, "HOLD_FILE", os.path.join(tmp, "h")):
+            self.assertTrue(keeper.handle({"cmd": "dictation", "state": "recording", "binding": "agent"})["ok"])
+            self.assertTrue(agentd.link.held())
+        self.assertEqual(len(sent), 1)
+        bits = "".join(map(str, sent[0]))
+        frame = bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits), 8))
+        self.assertEqual(codec.parse(frame)[2], dictation.encode("recording", "agent"))
+        self.assertFalse(keeper.handle({"cmd": "dictation", "state": "shouting"})["ok"])

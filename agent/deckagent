@@ -38,8 +38,30 @@ def workspace():
     return path
 
 
+def prefetch(verbose):
+    """Ben's position and faction, fetched before the brain starts, so "nearest X" skips a turn.
+    Returns a line for the prompt, or None if the game didn't answer (the brain can still ask)."""
+    start = time.monotonic()
+    try:
+        s = common.game("state", "pos", "world", "zone", "who", timeout=15)
+    except common.GameError as e:
+        if verbose:
+            print("[prefetch] failed: %s" % e, file=sys.stderr)
+        return None
+    if verbose:
+        print("[prefetch] %.1f s" % (time.monotonic() - start), file=sys.stderr)
+    if not s.get("ok") or "map" not in s:
+        return None
+    parts = ["map_id %s, x %s, y %s" % (s["map"], s["x"], s["y"])]
+    for key, label in (("zone", "zone"), ("faction", "faction"), ("level", "level"), ("class", "class")):
+        if s.get(key) is not None:
+            parts.append("%s %s" % (label, s[key]))
+    return "[Ben's game state when he asked: " + ", ".join(parts) + "]"
+
+
 def run_claude(question, mcp, model, verbose):
-    cmd = ["claude", "-p", question, "--output-format", "stream-json", "--verbose",
+    claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")  # services' PATH lacks ~/.local/bin
+    cmd = [claude, "-p", question, "--output-format", "stream-json", "--verbose",
            "--strict-mcp-config", "--mcp-config", mcp, "--tools", BUILTIN,
            "--allowedTools", ",".join(TOOLS + BUILTIN.split(",")),
            "--setting-sources", "project", "--no-session-persistence",
@@ -84,12 +106,19 @@ def main():
     p = argparse.ArgumentParser(prog="deckagent", description="Ask your gaming assistant.")
     p.add_argument("question", nargs="+")
     p.add_argument("--engine", choices=["claude", "codex"], default=os.environ.get("DECKAGENT_ENGINE", "claude"))
-    p.add_argument("--model", default=os.environ.get("DECKAGENT_MODEL"))
+    # Haiku by default: about 2.5 s faster per question than Opus (2026-11-14) and right on the
+    # lookups; when a question needs more judgment, say --model sonnet (or set DECKAGENT_MODEL).
+    p.add_argument("--model", default=os.environ.get("DECKAGENT_MODEL", "haiku"))
     p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--no-prefetch", action="store_true", help="don't fetch his position before asking")
     a = p.parse_args()
     if a.engine == "codex":
         sys.exit("deckagent: the codex engine isn't built yet")
-    answer, rc = run_claude(" ".join(a.question), workspace(), a.model, a.verbose)
+    question = " ".join(a.question)
+    state = None if a.no_prefetch else prefetch(a.verbose)
+    if state:
+        question = state + "\n\n" + question
+    answer, rc = run_claude(question, workspace(), a.model, a.verbose)
     print(answer or "(no answer)")
     return rc
 

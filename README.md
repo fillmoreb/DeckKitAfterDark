@@ -64,9 +64,11 @@ runs, and Decktation's status hook: [INSTALL.md](INSTALL.md).
 
 ## DeckTelemetry
 
-`python3 -m decklink.telemetry` (on the Deck; `--every 5`, `--once`, `--print`) sends one small text frame
-on channel 1 every few seconds: fire and forget, no strip, no screen reading, so it costs next to
-nothing. A lost update (chat was open) is just replaced by the next. In the game:
+`python3 -m decklink.telemetry` (on the Deck; `--every 5`, `--once`, `--print`) sends one 17-byte binary
+frame on channel 1 every few seconds (fields at fixed places, layout in `telemetry.py`): fire and
+forget, no strip, no screen reading, so it costs next to nothing. A lost update (chat was open) is
+just replaced by the next. It waits while another program has the link open or a dictation is under
+way, so its taps never delay a question or the dictation indicator. In the game:
 
 ```lua
 local t = DeckTelemetry.Get()          -- nil before the first update; t.age = seconds since it
@@ -107,11 +109,21 @@ agent/deckagent "give me a waypoint to the nearest priest trainer"
     waypoint id
 
   The full layout is at the top of `addons/DeckAgent/Agent.lua`.
+- **The link keeper** (`decklink.agentd`, the `decklink-agent` user service) holds DeckLink open for
+  the assistant:
+  - it opens on the first request and closes after 25 s idle, with no screen reading while closed
+  - `decklink agent …` goes through it over a local socket
+  - a request then takes about 0.6 s on the Deck, against about 4.4 s when each call opened the link
+  - the launcher fetches your position and faction before asking, so "nearest X" skips a model turn
 - **The database** (`~/.deckagent/deckagent.db`, SQLite) is built by `python3 -m agent.update_data`. It
   draws on QuestieDB's Forever NPCs (spawn coordinates converted for 1.60) and wago.tools' Forever map
   tables. Those are downloaded to `~/.deckagent/data`, never committed: they aren't ours to
   redistribute.
-- **Setup on a Mac** (the brain on the Mac, the game on the Deck): install Claude Code and sign in, then
+- **On the Deck** (the usual way): `deck-setup/install.sh` installs `deckagent` there too. Then, as deck:
+  - `claude auth login` (once)
+  - `cd ~/.local/lib/deckagent && python3 -m agent.update_data`
+  - `deckagent "…"`
+- **Setup on a Mac** (the brain on the Mac, the game on the Deck; each game call adds ~2 s of SSH): install Claude Code and sign in, then
   set `DECKAGENT_DECK=claude@<deck>` (an SSH target that can `sudo -u deck`; `DECK` in deploy.local works too) and run
   `python3 -m agent.update_data`. On the Deck itself, leave `DECKAGENT_DECK` unset.
 
@@ -130,7 +142,15 @@ Every key the setup binds, across DeckKit, DeckKitAfterDark, Decktation and the 
 Reload UI has no key: it's on a grip slot. Decktation reads the controller directly and types its text
 with ydotool; its status hook goes through DeckLink (F9/F10, channel 2), so it needs no keys of its own.
 
-DeckLink channels: 1 telemetry (DeckTelemetry), 2 Decktation's state (DeckDictation), 3 DeckAgent's requests.
+DeckLink channels, all binary with fields at fixed places (keys into the game carry only ~55 bytes a
+second, so every byte counts):
+
+| Channel | What | Size | Layout |
+|---|---|---|---|
+| 0 | the link's own (hello, ack, bye, ping) | 1-2 bytes | `codec.py` |
+| 1 | Deck telemetry (DeckTelemetry) | 17 bytes | `telemetry.py` |
+| 2 | dictation state + which binding (DeckDictation) | 2 bytes | `dictation.py` |
+| 3 | DeckAgent's requests and replies | 2-7 bytes in | `addons/DeckAgent/Agent.lua` |
 
 ## The cover
 

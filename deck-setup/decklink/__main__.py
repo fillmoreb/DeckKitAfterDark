@@ -6,7 +6,10 @@
     decklink recv [--count N] [--timeout S]   print frames the game sends (channel<TAB>payload)
     decklink post CHANNEL [TEXT]      fire and forget: one frame by keys, no hello, no strip, no ack
                                       (lost if chat is open; for state that's sent again anyway)
-    decklink agent state | way MAP X Y [LABEL]   ask DeckAgent in the game (agent.py), JSON out
+    decklink dictation STATE [--binding chat|agent]   a dictation state for DeckDictation (dictation.py):
+                                      recording, transcribing, done or error; fire and forget
+    decklink agent state [FIELD ...] | way MAP X Y   ask DeckAgent in the game (agent.py), JSON out;
+                                      through the link keeper (agentd.py) when it's running
 
 Keys are paced (--gap, 1 ms) so the game doesn't freeze: about 55 bytes/s in.
 --tool ydotool|xdotool picks how keys go in (default: ydotool when its socket is usable, which
@@ -15,7 +18,7 @@ root, use sudo -E or run the reader side as deck.
 """
 import argparse, os, sys, time
 
-from . import agent, codec, keys, link, strip
+from . import agent, codec, dictation, keys, link, strip
 
 
 def main(argv=None):
@@ -37,6 +40,9 @@ def main(argv=None):
     rv = sub.add_parser("recv")
     rv.add_argument("--count", type=int, default=0, help="stop after N frames (0: keep going)")
     rv.add_argument("--timeout", type=float, default=30)
+    dc = sub.add_parser("dictation")
+    dc.add_argument("state", choices=list(dictation.STATES))
+    dc.add_argument("--binding", choices=list(dictation.BINDINGS), default="chat")
     ag = sub.add_parser("agent")
     ag.add_argument("args", nargs=argparse.REMAINDER)
     a = p.parse_args(argv)
@@ -51,6 +57,9 @@ def main(argv=None):
             print("flags=%s hb=%d rx_seq=%d rx=%d bad=%d out=%s" % (",".join(flags) or "-", s.heartbeat, s.rx_seq,
                   s.rx_count, s.bad, "%d bytes" % len(s.out) if s.out else "-"))
             return 0
+        if a.cmd == "dictation":
+            dictation.post(a.state, a.binding, sender=keys.Keys(a.tool, gap_ms=a.gap))
+            return 0
         if a.cmd == "post":
             if not 1 <= a.channel <= 255:
                 p.error("channel is 1-255")
@@ -58,6 +67,11 @@ def main(argv=None):
             seq = int(time.time() * 10) % 255 + 1
             keys.Keys(a.tool, gap_ms=a.gap).send(list(codec.bits(codec.build(a.channel, seq, data))))
             return 0
+        if a.cmd == "agent":
+            served = agent.via_service(a.args)  # the link keeper has the link already, if it's running
+            if served is not None:
+                print(served[1])
+                return served[0]
         with link.Link(sender=keys.Keys(a.tool, gap_ms=a.gap)) as lk:
             if a.cmd == "ping":
                 print("round trip %.0f ms (%d bytes each way)" % (lk.ping(os.urandom(a.size)) * 1000, a.size))

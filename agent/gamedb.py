@@ -110,15 +110,59 @@ def player_world(db, state):
     return None
 
 
-def find_npc(db, query, state=None, faction=None, limit=5):
-    """NPCs whose name or title contains `query` (case-insensitive), nearest first when `state` (the
-    player's DeckAgent state reply) gives a position. faction "A"/"H": only NPCs friendly to it.
-    Each result has the nearest spawn: map, x, y (0-100), zone, distance (yards, same continent only)."""
-    words = [w for w in query.lower().split() if w]
-    if not words:
+# NPC roles: QuestieDB's npcFlags bit (classic layout) and, for the few NPCs whose flags are 0, the
+# titles that mean the same. Checked against the Forever data 2026-11-14: 0x80 also marks some mount
+# vendors, so innkeeper also needs "innkeeper" in the name or title.
+ROLES = {
+    "flight_master": (0x8, ["wind rider master", "gryphon master", "hippogryph master", "bat handler", "flight master"]),
+    "innkeeper": (0x80, ["innkeeper"]),
+    "banker": (0x100, ["banker"]),
+    "auctioneer": (0x1000, ["auctioneer"]),
+    "stable_master": (0x2000, ["stable master"]),
+    "battlemaster": (0x800, ["battlemaster"]),
+    "repair": (0x4000, []),
+    "vendor": (0x4, []),
+    "trainer": (0x10, ["trainer"]),
+    "spirit_healer": (0x20, ["spirit healer"]),
+    "guild_master": (0x200 | 0x400, ["guild master"]),
+}
+MUST_NAME = {"innkeeper": "innkeeper"}  # role -> a word the name or title has to contain as well
+
+# Words that say how to search, not what for ("the nearest innkeeper").
+FILLER = {"nearest", "closest", "near", "nearby", "the", "a", "an", "me", "my", "to", "for", "find", "where", "is",
+          "any", "some", "local"}
+
+
+def find_npc(db, query="", state=None, faction=None, limit=5, role=None):
+    """NPCs matching `query` (words in the name or title) and/or `role` (a ROLES key), nearest first."""
+    words = [w for w in (query or "").lower().split() if w not in FILLER]
+    where, args = [], []
+    for w in words:
+        where.append("(lower(n.name) LIKE ? OR lower(coalesce(n.title,'')) LIKE ?)")
+        args += ["%" + w + "%"] * 2
+    if role:
+        if role not in ROLES:
+            raise ValueError("unknown role %r (roles: %s)" % (role, ", ".join(ROLES)))
+        bit, titles = ROLES[role]
+        alts = ["(coalesce(n.flags,0) & ?) != 0"]
+        args.append(bit)
+        for t in titles:
+            alts.append("lower(coalesce(n.title,'')) = ?")
+            args.append(t)
+        where.append("(" + " OR ".join(alts) + ")")
+        if role in MUST_NAME:
+            where.append("(lower(n.name) LIKE ? OR lower(coalesce(n.title,'')) LIKE ?)")
+            args += ["%" + MUST_NAME[role] + "%"] * 2
+    if not where:
         return []
-    where = " AND ".join("(lower(n.name) LIKE ? OR lower(coalesce(n.title,'')) LIKE ?)" for _ in words)
-    args = [a for w in words for a in ("%" + w + "%",) * 2]
+    return find_npc_once(db, " AND ".join(where), args, state, faction, limit)
+
+
+def find_npc_once(db, where, args, state=None, faction=None, limit=5):
+    """The search itself: NPCs matching the SQL `where` (on npc n), friendly to `faction` ("A"/"H") if
+    given, nearest first when `state` (the player's DeckAgent state reply) gives a position.
+    Each result has the nearest spawn: map, x, y (0-100), zone, distance (yards, same continent only)."""
+    args = list(args)
     if faction in ("A", "H"):
         where += " AND n.faction LIKE ?"
         args.append("%" + faction + "%")
