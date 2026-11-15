@@ -36,6 +36,12 @@ function CreateFrame(kind, name)
     f.SetScript = function(self, k, fn) rawset(self, k, fn) end
     f.Show = function(self) rawset(self, "shown", true) end
     f.Hide = function(self) rawset(self, "shown", false) end
+    f.CreateFontString = function()
+        local fs = stub({})
+        fs.SetText = function(self, t) rawset(self, "text", t) end
+        return fs
+    end
+    f.IsShown = function(self) return rawget(self, "shown") end
     f.CreateTexture = function()
         local t = stub({ owner = f })
         t.SetPoint = function(self, _, x) self.x = x end
@@ -44,13 +50,23 @@ function CreateFrame(kind, name)
         table.insert(textures, t)
         return t
     end
+    if kind == "EditBox" then
+        f.SetText = function(self, t)
+            rawset(self, "text", t)
+            local fn = rawget(self, "OnTextChanged")
+            if fn then fn(self) end
+        end
+        f.GetText = function(self) return rawget(self, "text") end
+        f.SetFocus = function(self) FOCUSED = self end
+        f.ClearFocus = function(self) if FOCUSED == self then FOCUSED = nil end end
+    end
     if name then _G[name] = f end
     table.insert(frames, f)
     return f
 end
 GetPhysicalScreenSize = function() return W, H end
 local focused = nil
-GetCurrentKeyBoardFocus = function() return focused end
+GetCurrentKeyBoardFocus = function() return focused or FOCUSED end
 local inCombat = false
 InCombatLockdown = function() return inCombat end
 local bindings = {}
@@ -60,12 +76,14 @@ geterrorhandler = function() return function(e) table.insert(errors, tostring(e)
 
 -- The DeckKit core, only as much as DeckLink uses.
 local events = {}
+EVENTS = events
 DeckKit = {}
 function DeckKit.NewModule(ns)
     ns.On = function(event, fn) events[event] = events[event] or {}; table.insert(events[event], fn) end
     ns.Print = function(msg) print("PRINT " .. msg) end
     ns.AddCommand = function(name, fn) COMMANDS = COMMANDS or {}; COMMANDS[name] = fn end
     ns.Debug = function() end
+    ns.AddSettings = function(items) SETTINGS = items end
     return ns
 end
 DeckKit.Dictation = { SetState = function(state, binding) print("DICTATION " .. state .. " " .. tostring(binding)) end,
@@ -93,6 +111,24 @@ C_Map = {
 UiMapPoint = { CreateFromCoordinates = function(map, x, y) return { map = map, x = x, y = y } end }
 C_SuperTrack = { SetSuperTrackedUserWaypoint = function(on) print("TRACKED", tostring(on)) end }
 UnitFactionGroup = function() return PLAYER.faction end
+-- Chat and who's online, for DeckAgent's Chat.lua. Scenarios set GROUP / GUILD / BNET / FRIENDS / ROSTER.
+GROUP, RAID, GUILD = false, false, false
+BNET, FRIENDS, ROSTER = {}, {}, {}
+SendChatMessage = function(text, kind, _, target) print("CHAT", kind, tostring(target), text) end
+BNSendWhisper = function(id, text) print("BNCHAT", id, text) end
+IsInGroup = function() return GROUP end
+IsInRaid = function() return RAID end
+IsInGuild = function() return GUILD end
+BNGetNumFriends = function() return #BNET end
+C_BattleNet = { GetFriendAccountInfo = function(i) return BNET[i] end }
+C_FriendList = { GetNumFriends = function() return #FRIENDS end, GetFriendInfoByIndex = function(i) return FRIENDS[i] end }
+GetNumGuildMembers = function() return #ROSTER end
+GetGuildRosterInfo = function(i) local r = ROSTER[i]; return r[1], "", 0, r[2], r[3], r[4], "", "", r[5] end
+TIMERS = {}
+C_Timer = { NewTimer = function(s, fn) local t = { fn = fn, Cancel = function(self) self.cancelled = true end }
+    table.insert(TIMERS, t); return t end, After = function(s, fn) end }
+function fireTimers() for _, t in ipairs(TIMERS) do if not t.cancelled then t.fn() end end TIMERS = {} end
+function fireEvent(event, ...) for _, fn in ipairs(EVENTS[event] or {}) do fn(...) end end
 UnitClass = function() return "Priest", PLAYER.class, 5 end
 UnitLevel = function() return PLAYER.level end
 
@@ -106,6 +142,7 @@ for _, name in ipairs({ "DeckTelemetry", "DeckDictation", "DeckAgent" }) do
 end
 
 CODEC = ns.Codec
+CODEC_FROM_B64 = ns.FromBase64
 function login() fire("PLAYER_LOGIN") end
 function combat(on)
     inCombat = on

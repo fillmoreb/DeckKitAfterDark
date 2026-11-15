@@ -13,6 +13,8 @@
 --                    bit 2 ZONE    length uint8, zone name (UTF-8)
 --                    bit 3 WHO     faction uint8 (0 none, 1 Alliance, 2 Horde), level uint8, class ID uint8
 --                    bit 4 COMBAT  uint8 (1 in combat)
+--                    bit 5 BRAIN   uint8, the model picked in the DeckKit menu (Tools > DeckAgent):
+--                                  0 the default, 1 Haiku, 2 Sonnet, 3 Opus
 --   WAY (op 2):    bytes 1-2 map uint16, 3-4 x uint16, 5-6 y uint16: a WayPad waypoint, made active
 --                  (the game's own map pin when WayPad is missing)
 --
@@ -25,7 +27,11 @@
 --               zeroed, and its bit is cleared in the echoed mask at byte 3)
 --               WAY: byte 3 how it was set (1 WayPad, 2 map pin), bytes 4-5 WayPad's id for the
 --               waypoint, uint16 (stable, for later requests about it; 0 for the map pin)
+--               CHAT, FRIENDS: see Chat.lua
 --               any failure: length uint8, a short reason (UTF-8)
+--
+-- CHAT (op 3) and FRIENDS (op 4) are in Chat.lua, ASK (op 5) in Ask.lua; they use the helpers shared
+-- below (ns.Bytes, ns.OPS). Ops get (payload, seq).
 --
 -- Replies need the link open (the host says hello first): DeckLink.Send refuses otherwise.
 local ADDON, ns = ...
@@ -35,7 +41,9 @@ DeckKit.NewModule(ns, ADDON, "|cffe8b04bDeckAgent|r")
 local CHANNEL = 3
 local VERSION = 1
 local OP_STATE, OP_WAY = 1, 2
-local POS, WORLD, ZONE, WHO, COMBAT = 1, 2, 4, 8, 16
+local POS, WORLD, ZONE, WHO, COMBAT, BRAIN = 1, 2, 4, 8, 16, 32
+local MODELS = { haiku = 1, sonnet = 2, opus = 3 }
+ns.MODELS = MODELS
 local OK, UNKNOWN_OP, BAD_ARGS, REFUSED, FAILED, UNKNOWN_VERSION = 0, 1, 2, 3, 4, 5
 local VIA_WAYPAD, VIA_MAPPIN = 1, 2
 local FACTION = { Alliance = 1, Horde = 2 }
@@ -128,6 +136,10 @@ local function State(p)
         sent = sent + COMBAT
         parts[#parts + 1] = U8(InCombatLockdown() and 1 or 0)
     end
+    if mask % 64 >= 32 then -- BRAIN
+        sent = sent + BRAIN
+        parts[#parts + 1] = U8(MODELS[DeckAgentDB and DeckAgentDB.model or ""] or 0)
+    end
     return OK, U8(sent) .. table.concat(parts)
 end
 
@@ -149,6 +161,12 @@ end
 
 local OPS = { [OP_STATE] = State, [OP_WAY] = Way }
 
+-- For Chat.lua (loaded after this file).
+ns.OPS = OPS
+ns.Bytes = { U8 = U8, U16 = U16, Str = Str, ReadU16 = ReadU16 }
+ns.VERSION, ns.CHANNEL = VERSION, CHANNEL
+ns.Status = { OK = OK, BAD_ARGS = BAD_ARGS, REFUSED = REFUSED, FAILED = FAILED }
+
 ------------------------------------------------------------------------
 -- The channel
 ------------------------------------------------------------------------
@@ -164,7 +182,7 @@ local function Handle(payload, seq)
     elseif not OPS[op] then
         status, body = UNKNOWN_OP, Str("unknown op " .. op)
     else
-        local ok, s, b = pcall(OPS[op], payload)
+        local ok, s, b = pcall(OPS[op], payload, seq)
         if ok then
             status, body = s, b
         else

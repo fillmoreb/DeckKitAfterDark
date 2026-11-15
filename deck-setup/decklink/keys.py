@@ -59,7 +59,18 @@ class Keys:
             out.append(cmd)
         return out
 
+    def paste(self):
+        """Ctrl+V (for frames by paste: link.py), under the same lock as the bit taps."""
+        if self.tool == "ydotool":
+            cmd = [YDOTOOL, "key", "29:1", "47:1", "47:0", "29:0"]  # KEY_LEFTCTRL, KEY_V
+        else:
+            cmd = ["xdotool", "key", "ctrl+v"]
+        self._run([cmd])
+
     def send(self, bits):
+        self._run(self.commands(list(bits)))
+
+    def _run(self, commands):
         env = dict(os.environ)
         if self.tool == "ydotool":
             env["YDOTOOL_SOCKET"] = YDOTOOL_SOCKET
@@ -75,7 +86,7 @@ class Keys:
             except OSError:
                 pass  # someone else's file; it was made writable when it was created
             fcntl.flock(fd, fcntl.LOCK_EX)
-            for cmd in self.commands(list(bits)):
+            for cmd in commands:
                 r = subprocess.run(cmd, env=env, capture_output=True, timeout=30)
                 if r.returncode != 0:
                     raise SendError("%s failed: %s" % (self.tool, r.stderr.decode(errors="replace").strip()))

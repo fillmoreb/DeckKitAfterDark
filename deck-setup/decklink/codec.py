@@ -11,7 +11,7 @@ HEADER = 4
 OVERHEAD = HEADER + 2
 MAX_IN = 4096  # longest payload the game accepts by keys
 
-OP_HELLO, OP_ACK, OP_BYE, OP_PING = 1, 2, 3, 4
+OP_HELLO, OP_ACK, OP_BYE, OP_PING, OP_PASTE = 1, 2, 3, 4, 5
 
 
 def crc16(data, crc=0xFFFF):

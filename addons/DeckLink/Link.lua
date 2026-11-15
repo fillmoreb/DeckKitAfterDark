@@ -5,6 +5,12 @@
 -- nothing needs focus, and nothing is saved to the player's keybinds. Only downs count. Taps arrive as
 -- fast as they're sent, all in order, even thousands in one frame (AddonTools lab/RESULTS.md E6).
 -- Out: the strip (Strip.lua), which the host reads off the screen.
+-- Bigger frames can come in by paste instead of keys (the clipboard): a PASTE control frame (by keys)
+-- focuses a hidden edit box, the host presses Ctrl+V, and the box reads one line
+--   "DLP1 <seq> <channel> <length> <crc16 hex> <base64 payload>"
+-- checks it and delivers it like a frame that came by keys (the strip acks its seq the same way). The
+-- box drops focus as soon as the line is in, or after PASTE_WAIT. Base64, because edit boxes rewrite
+-- "|" (escape codes).
 --
 -- Both ways carry frames (Codec.lua). Stop-and-wait: the strip shows the last good inbound seq, which
 -- is the host's ack; the strip shows one outbound frame at a time, which the host acks on channel 0.
@@ -63,6 +69,8 @@ local function Close()
     Changed()
 end
 
+local ExpectPaste -- below
+
 local function Control(payload)
     local op = payload:byte(1)
     if op == Codec.OP_HELLO then
@@ -74,6 +82,8 @@ local function Control(payload)
         Close()
     elseif op == Codec.OP_PING then
         api.Send(0, payload)
+    elseif op == Codec.OP_PASTE then
+        ExpectPaste()
     end
 end
 
@@ -97,6 +107,83 @@ local function Deliver(channel, seq, payload)
         end
     end
     Changed()
+end
+
+------------------------------------------------------------------------
+-- Frames by paste
+------------------------------------------------------------------------
+
+local PASTE_WAIT = 3 -- seconds the box waits for the paste before giving its focus back
+local B64 = {}
+do
+    local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    for i = 1, 64 do B64[chars:byte(i)] = i - 1 end
+end
+
+-- Base64 text into bytes; nil if it isn't base64.
+local function FromBase64(text)
+    text = text:gsub("=+$", "")
+    local out, acc, nbits = {}, 0, 0
+    for i = 1, #text do
+        local v = B64[text:byte(i)]
+        if not v then return nil end
+        acc = acc * 64 + v
+        nbits = nbits + 6
+        if nbits >= 8 then
+            nbits = nbits - 8
+            local byte = math.floor(acc / 2 ^ nbits)
+            out[#out + 1] = string.char(byte)
+            acc = acc - byte * 2 ^ nbits
+        end
+    end
+    return table.concat(out)
+end
+ns.FromBase64 = FromBase64
+
+local pasteBox, pasteUntil
+
+local function EndPaste()
+    pasteUntil = nil
+    if pasteBox then
+        pasteBox:SetText("")
+        pasteBox:ClearFocus()
+        pasteBox:Hide()
+    end
+end
+
+local function ReadPaste(line)
+    local seq, channel, length, crc, data = line:match("^DLP1 (%d+) (%d+) (%d+) (%x+) (%S*)")
+    EndPaste()
+    seq, channel, length = tonumber(seq), tonumber(channel), tonumber(length)
+    local payload = data and FromBase64(data)
+    if not (payload and seq and channel and #payload == length and channel <= 255
+            and Codec.CRC(payload) == tonumber(crc, 16)) then
+        bad = bad + 1
+        lastError = "a pasted frame didn't check out"
+        Changed()
+        return
+    end
+    Deliver(channel, seq, payload)
+end
+
+function ExpectPaste()
+    if not pasteBox then
+        pasteBox = CreateFrame("EditBox", "DeckLinkPaste", UIParent)
+        pasteBox:SetSize(1, 1)
+        pasteBox:SetPoint("BOTTOMLEFT", 0, 0)
+        pasteBox:SetAlpha(0)
+        pasteBox:SetAutoFocus(false)
+        pasteBox:SetMaxLetters(0)
+        pasteBox:SetScript("OnTextChanged", function(self)
+            local line = self:GetText() or ""
+            if line:find("^DLP1 ") then ReadPaste(line) end
+        end)
+        pasteBox:SetScript("OnEscapePressed", EndPaste)
+    end
+    pasteBox:Show()
+    pasteBox:SetText("")
+    pasteBox:SetFocus()
+    pasteUntil = GetTime() + PASTE_WAIT
 end
 
 -- The frame being received, a bit at a time.
@@ -204,6 +291,7 @@ local nextBeat, wasFocus = 0, false
 ticker:SetScript("OnUpdate", function()
     local now = GetTime()
     if open and now - lastHeard > OPEN_FOR then Close() end
+    if pasteUntil and now > pasteUntil then EndPaste() end
     local focus = GetCurrentKeyBoardFocus() ~= nil
     if focus ~= wasFocus then wasFocus = focus; dirty = true end
     if open and now >= nextBeat then

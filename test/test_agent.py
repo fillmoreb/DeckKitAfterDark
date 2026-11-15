@@ -27,15 +27,21 @@ def ask(packet, setup="", seq=7):
 class GameSide(unittest.TestCase):
     def test_state_request_is_two_bytes(self):
         self.assertEqual(host.build_state(["pos", "world"]), b"\x41\x03")
-        self.assertEqual(host.build_state(), b"\x41\x1f")
+        self.assertEqual(host.build_state(), b"\x41\x3f")
 
     def test_state_all_fields(self):
         data, _ = ask(host.build_state())
-        self.assertEqual(data[:4], b"\x41\x07\x00\x1f")  # op, seq, ok, every field given
+        self.assertEqual(data[:4], b"\x41\x07\x00\x3f")  # op, seq, ok, every field given
         self.assertEqual(host.parse_reply(data), {
             "op": 1, "seq": 7, "ok": True, "status": "ok", "fields": host.FIELDS, "map": 1458, "x": 49.0, "y": 18.3, "cont": 0,
             "wx": 1636, "wy": 240, "zone": "Undercity", "faction": "H", "level": 20, "class": "PRIEST",
-            "in_combat": False})
+            "in_combat": False, "model": None})
+
+    def test_state_brain_is_the_menu_model(self):
+        for setup, model in (("", None), ('DeckAgentDB = { model = "sonnet" }', "sonnet"),
+                             ('DeckAgentDB = { model = "opus" }', "opus")):
+            data, _ = ask(host.build_state(["brain"]), setup)
+            self.assertEqual(host.parse_reply(data, ["brain"])["model"], model, setup)
 
     def test_state_only_what_was_asked(self):
         data, _ = ask(host.build_state(["pos", "world"]))
@@ -75,7 +81,7 @@ class GameSide(unittest.TestCase):
         self.assertIn("TRACKED\ttrue", lines)
 
     def test_bad_requests_are_refused(self):
-        for packet, status in ((b"\x45", "unknown op"), (b"\x81\x01", "unknown version"), (b"", "unknown version"),
+        for packet, status in ((b"\x4f", "unknown op"), (b"\x81\x01", "unknown version"), (b"", "unknown version"),
                                (b"\x42\x05\x8e", "bad arguments"), (b"\x41", "bad arguments")):
             data, _ = ask(packet)
             reply = host.parse_reply(data)
@@ -206,6 +212,13 @@ class MCPServer(unittest.TestCase):
                 body += {"pos": struct.pack(">HHH", 1458, 32112, 11796), "world": struct.pack(">Bhh", 0, 1636, 240),
                          "zone": b"\x09Undercity", "who": b"\x02\x14\x05", "combat": b"\x00"}[f]
             return host.parse_reply(b"\x41\x01\x00" + body, asked)
+        if args[0] == "prompt":
+            options = list(args[args.index("--seconds") + 3:])
+            return {"ok": True, "shown": "shown", "choice": 2, "answer": options[1]}
+        if args[0] == "chat":
+            return host.parse_reply(b"\x43\x01\x00\x01")
+        if args[0] == "friends":
+            return host.parse_reply(b"\x44\x01\x00\x00\x01\x02\x05Grunt\x14\x07Warrior\x07Durotar")
         return host.parse_reply(b"\x42\x01\x00\x01\x00\x03")
 
     def call(self, name, args):
@@ -221,7 +234,8 @@ class MCPServer(unittest.TestCase):
         self.assertEqual(r["result"]["protocolVersion"], "2025-03-26")
         self.assertIsNone(mcp_server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
         names = [t["name"] for t in mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]]
-        self.assertEqual(names, ["get_player_state", "find_npc", "set_waypoint"])
+        self.assertEqual(names, ["get_player_state", "find_npc", "set_waypoint", "send_chat", "get_online",
+                                 "ask_player", "remember", "remember_fact", "recall", "forget_fact"])
         self.assertEqual(mcp_server.handle({"jsonrpc": "2.0", "id": 3, "method": "nope"})["error"]["code"], -32601)
 
     def test_player_state_asks_only_for_its_fields(self):
@@ -249,6 +263,40 @@ class MCPServer(unittest.TestCase):
         out, err = self.call("set_waypoint", {"map_id": 1454, "x": 36, "y": 87.7})
         self.assertEqual(out, {"done": True, "waypoint_id": 3, "via": "waypad"})
         self.assertEqual(self.calls[-1], ("way", 1454, "36.00", "87.70"))
+
+    def test_send_chat(self):
+        out, err = self.call("send_chat", {"channel": "whisper", "to": "Ednalyn", "text": "SFK?"})
+        self.assertEqual((err, out["result"]), (False, "sent"))
+        self.assertEqual(self.calls[-1], ("chat", "whisper", "Ednalyn", "SFK?"))
+        self.call("send_chat", {"channel": "say", "to": "ignored", "text": "hello"})
+        self.assertEqual(self.calls[-1], ("chat", "say", "", "hello"))
+        out, err = self.call("send_chat", {"channel": "whisper", "text": "who?"})
+        self.assertTrue(err)
+        out, err = self.call("send_chat", {"channel": "say", "text": "x" * 256})
+        self.assertTrue(err)
+
+    def test_ask_player(self):
+        out, err = self.call("ask_player", {"question": "Which?", "options": ["Ednalyn", "Ednabelle"], "list": True})
+        self.assertEqual((err, out), (False, {"answer": "Ednabelle"}))
+        self.assertEqual(self.calls[-1], ("prompt", "--list", "--seconds", "45", "Which?", "Ednalyn", "Ednabelle"))
+
+    def test_remember_adds_lines_under_their_section(self):
+        notes = os.path.join(self.tmp.name, "CLAUDE.md")
+        with open(notes, "w") as f:
+            f.write("# Notes\n\n## Ben's rules\n\n## People\n- Bob: Bob#1\n\n")
+        with mock.patch.object(common, "HOME", self.tmp.name):
+            self.call("remember", {"section": "people", "note": "Edna: AMI#1362; Heatherjr  Locklear"})
+            self.call("remember", {"section": "rules", "note": "never yell"})
+        with open(notes) as f:
+            text = f.read()
+        self.assertEqual(text, "# Notes\n\n## Ben's rules\n- never yell\n\n## People\n- Bob: Bob#1\n"
+                               "- Edna: AMI#1362; Heatherjr Locklear\n\n")
+
+    def test_get_online(self):
+        out, err = self.call("get_online", {"lists": ["friends"]})
+        self.assertEqual(out["people"], [{"list": "friends", "name": "Grunt", "level": 20, "class": "Warrior",
+                                          "zone": "Durotar"}])
+        self.assertEqual(self.calls[-1], ("friends", "friends"))
 
     def test_game_errors_are_tool_errors(self):
         def broken(*a, **k):
@@ -424,6 +472,39 @@ class VoiceAnswers(unittest.TestCase):
         self.assertEqual(self.shown, ["thinking", "error"])
         self.assertEqual(self.said, ["Sorry, that didn't work."])
 
+    def test_a_new_recording_cuts_off_the_answer(self):
+        import threading
+        release = threading.Event()
+
+        def slow(cmd, **kw):
+            self.ran.append(cmd)
+            release.wait(2)
+            return mock.Mock(stdout="Old answer.\n", stderr="", returncode=0)
+        self.v.run = slow
+        stops = []
+        self.v.say = mock.Mock(side_effect=self.said.append, stop=lambda: stops.append(1) or True)
+        self.assertTrue(self.v.ask("first question"))
+        self.v.interrupt()  # L5+R5 again, even a tap: stop talking, drop the question
+        self.assertFalse(self.v.busy)
+        self.assertTrue(self.v.ask("second question"))  # not turned away
+        release.set()
+        self.wait()
+        __import__("time").sleep(0.05)
+        self.assertEqual(stops, [1])
+        self.assertEqual(self.said, ["Old answer."])  # one answer: the second question's, not both
+        self.assertEqual(self.shown.count("done"), 1)
+
+    def test_dictation_recording_interrupts_the_voice(self):
+        from decklink import agentd
+        keeper = agentd.Keeper(25, make_link=lambda: None)
+        calls = []
+        keeper.voice = mock.Mock(interrupt=lambda drop_question: calls.append(drop_question))
+        with mock.patch.object(agentd.dictation, "post"):
+            keeper.handle({"cmd": "dictation", "state": "recording", "binding": "agent"})
+            keeper.handle({"cmd": "dictation", "state": "recording", "binding": "chat"})
+            keeper.handle({"cmd": "dictation", "state": "done", "binding": "agent"})
+        self.assertEqual(calls, [True, False])  # chat dictation only stops the speech
+
     def test_the_service_hands_questions_over(self):
         from decklink import agentd
         keeper = agentd.Keeper(25, make_link=lambda: None)
@@ -446,3 +527,336 @@ class DictationThroughTheService(unittest.TestCase):
         frame = bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits), 8))
         self.assertEqual(codec.parse(frame)[2], dictation.encode("recording", "agent"))
         self.assertFalse(keeper.handle({"cmd": "dictation", "state": "shouting"})["ok"])
+
+
+class ChatOps(unittest.TestCase):
+    """CHAT and FRIENDS (addons/DeckAgent/Chat.lua <-> decklink/agent.py), and the preview window."""
+
+    def send(self, packet, setup="", after=""):
+        frame = codec.build(host.CHANNEL, 7, packet)
+        lines, s = Game.run("login() " + setup + " " + hello() + ' taps("%s") frame() ' % bitstr(frame) + after)
+        reply = host.parse_reply(codec.parse(s.out)[2]) if s and s.out else None
+        return reply, lines
+
+    def test_chat_packet(self):
+        self.assertEqual(host.build_chat("whisper", "Lucien", "hi"), b"\x43\x06\x06Lucien\x02hi")
+        with self.assertRaises(ValueError):
+            host.build_chat("trade", "", "wts")
+        with self.assertRaises(ValueError):
+            host.build_chat("say", "", "x" * 256)
+        with self.assertRaises(ValueError):
+            host.build_chat("say", "", "   ")
+
+    def test_whisper_goes_out_at_once_when_preview_is_off(self):
+        reply, lines = self.send(host.build_chat("whisper", "Lucien", "hello there"))
+        self.assertEqual((reply["ok"], reply["result"]), (True, "sent"))
+        self.assertIn("CHAT\tWHISPER\tLucien\thello there", lines)
+
+    def test_say_and_escapes_cleaned(self):
+        _, lines = self.send(host.build_chat("say", "", "a|cff b\nc"))
+        self.assertIn("CHAT\tSAY\tnil\ta/cff b c", lines)
+
+    def test_refusals(self):
+        for packet, why in ((host.build_chat("party", "", "inc"), "you're not in a group"),
+                            (host.build_chat("guild", "", "hi"), "you're not in a guild"),
+                            (host.build_chat("bnet", "Nobody", "hi"), "no online Battle.net friend Nobody"),
+                            (b"\x43\x09\x00\x02hi", None)):
+            reply, lines = self.send(packet)
+            self.assertFalse(reply["ok"], packet)
+            if why:
+                self.assertEqual(reply["reason"], why)
+            self.assertFalse(any(l.startswith(("CHAT", "BNCHAT")) for l in lines))
+
+    def test_battle_net_whisper_by_name_or_tag(self):
+        bnet = ('BNET = {{bnetAccountID = 77, battleTag = "Edna#1234", gameAccountInfo = {isOnline = true}},'
+                ' {bnetAccountID = 78, battleTag = "Gone#1", gameAccountInfo = {isOnline = false}}}')
+        for target in ("edna", "Edna#1234", "77"):
+            _, lines = self.send(host.build_chat("bnet", target, "SFK?"), bnet)
+            self.assertIn("BNCHAT\t77\tSFK?", lines, target)
+        reply, _ = self.send(host.build_chat("bnet", "Gone", "hi"), bnet)
+        self.assertFalse(reply["ok"])  # offline
+
+    def test_preview_waits_for_a(self):
+        pv = 'DeckAgentDB.previewChat = true'
+        press = lambda key: ('local f = DeckAgentPrompt; f.OnGamePadButtonDown(f, "%s") f.OnGamePadButtonUp(f, "%s")'
+                             ' print("SHOWN", tostring(f.shown))' % (key, key))
+        reply, lines = self.send(host.build_chat("whisper", "Lucien", "hi"), pv)
+        self.assertEqual(reply["result"], "previewed")
+        self.assertFalse(any(l.startswith("CHAT") for l in lines))
+        _, lines = self.send(host.build_chat("whisper", "Lucien", "hi"), pv, press("PAD1"))
+        self.assertIn("CHAT\tWHISPER\tLucien\thi", lines)
+        self.assertIn("SHOWN\tfalse", lines)
+        _, lines = self.send(host.build_chat("whisper", "Lucien", "hi"), pv, press("PAD2"))
+        self.assertFalse(any(l.startswith("CHAT") for l in lines))
+        _, lines = self.send(host.build_chat("whisper", "Lucien", "hi"), pv, 'fireTimers()' + press("PAD1"))
+        self.assertFalse(any(l.startswith("CHAT") for l in lines))  # timed out: A does nothing then
+        enter = ('local f = DeckAgentPrompt; if f.OnKeyDown then f.OnKeyDown(f, "ENTER") end'
+                 ' print("SHOWN", tostring(f.shown))')
+        _, lines = self.send(host.build_chat("whisper", "Lucien", "hi"), pv, enter)
+        self.assertFalse(any(l.startswith("CHAT") for l in lines))  # the keyboard (Decktation's Enter) never sends
+        self.assertIn("SHOWN\ttrue", lines)
+
+    def test_preview_in_combat_shows_afterwards(self):
+        setup = 'DeckAgentDB.previewChat = true combat(true)'
+        reply, _ = self.send(host.build_chat("say", "", "gg"), setup,
+                             'print("BEFORE", tostring(DeckAgentPrompt and DeckAgentPrompt.shown))'
+                             ' combat(false) print("AFTER", tostring(DeckAgentPrompt.shown))')
+        self.assertEqual(reply["result"], "previewed after combat")
+
+    def test_friends(self):
+        setup = ('GUILD = true'
+                 ' BNET = {{bnetAccountID = 77, battleTag = "Edna#1234", gameAccountInfo = {isOnline = true,'
+                 '   clientProgram = "WoW", characterName = "Ednalyn", realmName = "Forever", characterLevel = 15,'
+                 '   className = "Mage", areaName = "Undercity"}},'
+                 '  {bnetAccountID = 78, battleTag = "Bob#2", gameAccountInfo = {isOnline = true, clientProgram = "App"}},'
+                 '  {bnetAccountID = 79, battleTag = "Off#3", gameAccountInfo = {isOnline = false}}}'
+                 ' FRIENDS = {{connected = true, name = "Grunt", level = 20, className = "Warrior", area = "Durotar"},'
+                 '  {connected = false, name = "Away"}}'
+                 ' ROSTER = {{"Guildie", 30, "Priest", "Orgrimmar", true}, {"Asleep", 10, "Rogue", "?", false}}')
+        reply, _ = self.send(host.build_friends(), setup)
+        self.assertEqual(reply["people"], [
+            {"list": "bnet", "account_id": 77, "battletag": "Edna#1234", "in_wow": True, "character": "Ednalyn",
+             "realm": "Forever", "level": 15, "class": "Mage", "zone": "Undercity"},
+            {"list": "bnet", "account_id": 78, "battletag": "Bob#2", "in_wow": False},
+            {"list": "friends", "name": "Grunt", "level": 20, "class": "Warrior", "zone": "Durotar"},
+            {"list": "guild", "name": "Guildie", "level": 30, "class": "Priest", "zone": "Orgrimmar"}])
+        self.assertFalse(reply["more"])
+        reply, _ = self.send(host.build_friends(["guild"]), setup)
+        self.assertEqual([p["name"] for p in reply["people"]], ["Guildie"])
+
+    def test_too_many_friends_says_more(self):
+        setup = ('GUILD = true ROSTER = {} for i = 1, 60 do ROSTER[i] = {"Member" .. i .. string.rep("x", 10),'
+                 ' 60, "Warrior", "Orgrimmar", true} end')
+        reply, _ = self.send(host.build_friends(["guild"]), setup)
+        self.assertTrue(reply["more"])
+        self.assertLess(len(reply["people"]), 60)
+
+
+class Conversation(unittest.TestCase):
+    """agent/deckagent: questions close together continue one Claude session."""
+
+    def setUp(self):
+        import importlib.machinery, importlib.util
+        path = os.path.join(HERE, "..", "agent", "deckagent")
+        loader = importlib.machinery.SourceFileLoader("deckagent_launcher", path)
+        spec = importlib.util.spec_from_loader("deckagent_launcher", loader)
+        self.la = importlib.util.module_from_spec(spec)
+        loader.exec_module(self.la)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "session.json")
+
+    def test_continues_within_the_window_then_starts_fresh(self):
+        la = self.la
+        self.assertIsNone(la.last_session(1000, self.path))  # nothing yet
+        la.save_session("abc", 1000, self.path)
+        self.assertEqual(la.last_session(1000 + la.CONTINUE_S - 1, self.path), "abc")
+        self.assertIsNone(la.last_session(1000 + la.CONTINUE_S + 1, self.path))
+        la.save_session(None, 2000, self.path)  # no session id: keeps the old record
+        self.assertEqual(la.last_session(1001, self.path), "abc")
+
+    def test_start_over_phrases(self):
+        for text in ("start over", "Start over, where's Thrall", "new topic: flight master", "forget that",
+                     "never mind"):
+            self.assertTrue(self.la.FRESH.match(text), text)
+        for text in ("where's the nearest innkeeper", "AMI#1362", "whisper Edna"):
+            self.assertFalse(self.la.FRESH.match(text), text)
+
+
+    def test_name_hints_for_misheard_people(self):
+        la = self.la
+        notes = ("# notes\n## People\nWho Ben means, e.g.\n- Edna: BattleTag Edna#1234; characters Ednalyn\n"
+                 "- Edna: BattleTag Sylunne#1513 (bnet account_id 5).\n- Moneygrip (Ace#11886): warrior\n"
+                 "## Ben's rules\n- Thrall: never whisper\n")
+        self.assertEqual(la.people(notes), {"Edna": "Sylunne#1513", "Moneygrip": "Ace#11886"})
+        names = ["Edna"]
+        self.assertIn('"Edmunds" is probably Edna',
+                      la.name_hints("Whisper Edmunds' character. See if she wants to play.", names))
+        self.assertIn('"Adna" is probably Edna', la.name_hints("Her name is Adna, my friend.", names))
+        for text in ("Whisper Edna's character", "Need a waypoint to the bank", "and the flight master",
+                     "Where is Undercity", "whisper edmunds"):
+            self.assertIsNone(la.name_hints(text, names), text)
+        self.assertIsNone(la.name_hints("Whisper Edmunds", []))
+
+
+class Memory(unittest.TestCase):
+    """agent/memory.py: characters seen through get_online, and the launcher's hints from them."""
+
+    def setUp(self):
+        from agent import memory
+        self.memory = memory
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = memory.connect(os.path.join(self.tmp.name, "memory.db"))
+        self.addCleanup(self.db.close)
+
+    def test_records_characters_and_finds_them_by_battletag(self):
+        m, day = self.memory, 86400
+        people = [
+            {"list": "bnet", "account_id": 5, "battletag": "Sylunne#1513", "in_wow": True, "character": "Ednalyn",
+             "realm": "R4", "level": 20, "class": "Mage", "zone": "Barrens"},
+            {"list": "bnet", "account_id": 7, "battletag": "Ace#11886", "in_wow": False},
+            {"list": "guild", "name": "Guildie", "level": 30, "class": "Rogue", "zone": "Orgrimmar"},
+        ]
+        self.assertEqual(m.record_online(self.db, people, now=1000), 2)
+        people[0].update(character="Ednabelle", level=12, **{"class": "Priest"})
+        m.record_online(self.db, people, now=1000 + 2 * day)
+        people[0].update(character="Ednalyn", level=21, **{"class": "Mage"})
+        m.record_online(self.db, people, now=1000 + 3 * day)  # updates, doesn't duplicate
+        chars = m.characters_of(self.db, "sylunne#1513")
+        self.assertEqual([(c["name"], c["level"]) for c in chars], [("Ednalyn", 21), ("Ednabelle", 12)])
+        self.assertEqual(chars[0]["first_seen"], 1000)
+
+        import importlib.machinery, importlib.util
+        path = os.path.join(HERE, "..", "agent", "deckagent")
+        loader = importlib.machinery.SourceFileLoader("deckagent_launcher2", path)
+        spec = importlib.util.spec_from_loader("deckagent_launcher2", loader)
+        la = importlib.util.module_from_spec(spec)
+        loader.exec_module(la)
+        tags = {"Edna": "Sylunne#1513", "Bob": None}
+        hint = la.character_hints("Whisper Edmunds' character", tags, self.db, now=1000 + 4 * day)
+        self.assertEqual(hint, "[Characters you've seen them on: Edna (Sylunne#1513): Ednalyn, level 21 Mage, "
+                               "last seen online yesterday; Ednabelle, level 12 Priest, last seen online 2 days ago]")
+        self.assertIsNone(la.character_hints("Whisper Bob", tags, self.db))
+        self.assertIsNone(la.character_hints("where is Thrall", tags, self.db))
+
+
+class Facts(unittest.TestCase):
+    """agent/memory.py facts: remember_fact / recall / forget_fact, and the launcher's [From your memory]."""
+
+    def setUp(self):
+        from agent import memory, mcp_server
+        self.memory, self.mcp = memory, mcp_server
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        path = os.path.join(self.tmp.name, "memory.db")
+        patcher = mock.patch.object(memory, "PATH", path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def call(self, name, args):
+        return self.mcp.HANDLERS[name](args)
+
+    def test_words_drop_filler_and_possessives(self):
+        self.assertEqual(self.memory.words("Does Edna's guild want to run Stratholme? Tell me, Decky."),
+                         ["edna", "guild", "run", "stratholme"])
+
+    def test_remember_recall_replace_forget(self):
+        a = self.call("remember_fact", {"about": "Edna", "fact": "Hates  Stratholme; prefers healing."})["id"]
+        self.call("remember_fact", {"about": "Ben", "fact": "Wants the Robes of Arcana from Scarlet Monastery."})
+        found = self.call("recall", {"query": "would Edna come to Stratholme"})["facts"]
+        self.assertEqual([(f["id"], f["fact"]) for f in found], [(a, "Hates Stratholme; prefers healing.")])
+        self.assertEqual(self.call("recall", {"query": "robes"})["facts"][0]["about"], "Ben")  # prefix match
+        b = self.call("remember_fact", {"about": "Edna", "fact": "Tanks now.", "replaces": a})["id"]
+        self.assertEqual([f["id"] for f in self.call("recall", {"about": "edna"})["facts"]], [b])
+        self.call("forget_fact", {"id": b})
+        self.assertEqual(self.call("recall", {"about": "Edna"})["facts"], [])
+        with self.assertRaises(ValueError):
+            self.call("forget_fact", {"id": 999})
+        with self.assertRaises(ValueError):
+            self.call("remember_fact", {"about": "x", "fact": "y z", "replaces": 999})
+        with self.assertRaises(ValueError):
+            self.call("recall", {"query": "  "})
+
+    def test_the_launcher_brings_related_facts(self):
+        import importlib.machinery, importlib.util
+        path = os.path.join(HERE, "..", "agent", "deckagent")
+        loader = importlib.machinery.SourceFileLoader("deckagent_launcher3", path)
+        spec = importlib.util.spec_from_loader("deckagent_launcher3", loader)
+        la = importlib.util.module_from_spec(spec)
+        loader.exec_module(la)
+        m = self.memory
+        with m.connect() as db:
+            m.add_fact(db, "Edna", "Hates Stratholme.", now=1000)
+            m.add_fact(db, "Ben", "Saving gold for his mount.", now=1000)
+            tags = {"Edna": "Sylunne#1513"}
+            hint = la.fact_hints("Whisper Edmunds, see if she wants to do Shadowfang Keep", tags, db)
+            self.assertTrue(hint.startswith("[From your memory (recall for more): #1 Edna: Hates Stratholme. ("), hint)
+            self.assertNotIn("mount", hint)
+            self.assertIsNone(la.fact_hints("where is the nearest flight master", tags, db))
+            self.assertIn("mount", la.fact_hints("how much is my mount going to cost", tags, db))
+
+
+class Asking(unittest.TestCase):
+    """ASK / ANSWER (addons/DeckAgent/Ask.lua + Prompt.lua <-> decklink/agent.py) and the ask_player tool."""
+
+    def run_ask(self, packet, after, setup=""):
+        """Sends ASK, acks its "shown" reply, runs `after` (button presses...), returns (shown, answer)."""
+        frame = codec.build(host.CHANNEL, 7, packet)
+        base = "login() " + setup + " " + hello() + ' taps("%s") frame()' % bitstr(frame)
+        _, s = Game.run(base)
+        shown = host.parse_reply(codec.parse(s.out)[2])
+        ack = bitstr(codec.build(0, 8, bytes([codec.OP_ACK, codec.parse(s.out)[1]])))
+        _, s = Game.run(base + ' taps("%s") frame() ' % ack + after + " frame()")
+        answer = host.parse_reply(codec.parse(s.out)[2]) if s and s.out else None
+        return shown, answer
+
+    PRESS = 'local f = DeckAgentPrompt; f.OnGamePadButtonDown(f, "%s") f.OnGamePadButtonUp(f, "%s") '
+
+    def press(self, *keys):
+        return "".join(self.PRESS % (k, k) for k in keys)
+
+    def test_packet(self):
+        self.assertEqual(host.build_ask("Go?", ["Yes", "No"], seconds=20), b"\x45\x00\x14\x03Go?\x02\x03Yes\x02No")
+        with self.assertRaises(ValueError):
+            host.build_ask("Go?", ["Only one"])
+        with self.assertRaises(ValueError):
+            host.build_ask("x" * 161, ["a", "b"])
+
+    def test_dialog_a_and_b(self):
+        shown, answer = self.run_ask(host.build_ask("Invite Edna?", ["Yes", "No"]), self.press("PAD1"))
+        self.assertEqual((shown["result"], answer["op"], answer["seq"], answer["choice"]), ("shown", 6, 7, 1))
+        _, answer = self.run_ask(host.build_ask("Invite Edna?", ["Yes", "No"]), self.press("PAD2"))
+        self.assertEqual(answer["choice"], 2)
+
+    def test_list_moves_and_picks_or_cancels(self):
+        packet = host.build_ask("Which one?", ["Ednalyn", "Ednabelle", "Edgar"])
+        # 1 -> down 2 -> down 3 -> down wraps to 1 -> up wraps to 3
+        _, answer = self.run_ask(packet, self.press("PADDDOWN", "PADDDOWN", "PADDDOWN", "PADDUP", "PAD1"))
+        self.assertEqual(answer["choice"], 3)
+        _, answer = self.run_ask(packet, self.press("PAD2"))
+        self.assertEqual(answer["choice"], 0)
+
+    def test_timeout_and_replaced_say_no_answer(self):
+        _, answer = self.run_ask(host.build_ask("Q?", ["Yes", "No"]), "fireTimers()")
+        self.assertIsNone(answer["choice"])
+
+    def test_other_buttons_pass_through(self):
+        _, answer = self.run_ask(host.build_ask("Q?", ["Yes", "No"]), self.press("PADDDOWN", "PAD3"))
+        self.assertIsNone(answer)  # a dialog ignores the d-pad and X: no answer yet
+
+    def test_ask_waits_for_its_answer_and_keeps_the_link_alive(self):
+        class FakeLink:
+            def __init__(self):
+                self.sent, self.queue, self.t = [], [], 0.0
+
+            def clock(self):
+                return self.t
+
+            def send(self, ch, payload):
+                self.sent.append((ch, bytes(payload)))
+                if ch == 3:
+                    self.queue = [(3, b"\x45\x21\x00\x01")] + [None] * 30 + [(3, b"\x46\x21\x00\x02")]
+                return 0x21
+
+            def recv(self, timeout):
+                self.t += 1.0
+                return self.queue.pop(0) if self.queue else None
+        lk = FakeLink()
+        out = host.ask(lk, "Which?", ["Ednalyn", "Ednabelle"], clock=lk.clock)
+        self.assertEqual(out, {"ok": True, "shown": "shown", "choice": 2, "answer": "Ednabelle"})
+        pings = [p for ch, p in lk.sent if ch == 0]
+        self.assertGreaterEqual(len(pings), 2)
+        self.assertTrue(all(p == bytes([codec.OP_PING]) for p in pings))
+
+
+class Transcripts(Conversation):
+    def test_one_line_per_question(self):
+        la = self.la
+        la.TRANSCRIPTS = os.path.join(self.tmp.name, "transcripts")
+        la.write_transcript({"question": "nearest innkeeper", "steps": [{"tool": "find_npc"}], "answer": "Gryshka"})
+        la.write_transcript({"question": "thanks", "answer": "ok"})
+        (name,) = os.listdir(la.TRANSCRIPTS)
+        with open(os.path.join(la.TRANSCRIPTS, name)) as f:
+            records = [json.loads(line) for line in f]
+        self.assertEqual([r["question"] for r in records], ["nearest innkeeper", "thanks"])

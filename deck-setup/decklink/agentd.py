@@ -72,6 +72,8 @@ class Keeper:
             state, binding = req.get("state"), req.get("binding", "chat")
             if state not in dictation.STATES or binding not in dictation.BINDINGS:
                 return {"ok": False, "error": "bad state or binding"}
+            if state == "recording" and self.voice is not None:  # talking again: stop the spoken answer
+                self.voice.interrupt(drop_question=binding == "agent")
             dictation.post(state, binding, sender=self.dictation_keys)
             return {"ok": True}
         if cmd == "ask":  # a question by voice (Decktation's agent binding, via decklink-agent-ask)
@@ -86,13 +88,15 @@ class Keeper:
                 if cmd == "warm":
                     self._ensure()
                     return {"ok": True, "open": True}
-                if cmd == "state":
-                    fields = req.get("fields") or agent.FIELDS
-                    if any(f not in agent.FIELDS for f in fields):
+                if cmd in ("state", "way", "chat", "friends", "prompt"):
+                    if cmd == "state" and any(f not in agent.FIELDS for f in req.get("fields") or agent.FIELDS):
                         return {"ok": False, "error": "unknown field"}
-                    return agent.state(self._ensure(), fields)
-                if cmd == "way":
-                    return agent.way(self._ensure(), req["map"], req["x"], req["y"])
+                    # Packets are built (and checked) before the link opens: a bad request shouldn't cost one.
+                    {"chat": lambda: agent.build_chat(req["channel"], req.get("target", ""), req["text"]),
+                     "friends": lambda: agent.build_friends(req.get("lists") or agent.LISTS),
+                     "prompt": lambda: agent.build_ask(req["question"], req["options"], req.get("list", False),
+                                                       req.get("seconds", 30))}.get(cmd, lambda: None)()
+                    return agent.handle(self._ensure(), req)
                 return {"ok": False, "error": "unknown cmd %r" % cmd}
             except (link.LinkError, keys.SendError, strip.NoStrip, agent.Malformed, KeyError, ValueError) as e:
                 # A link that failed mid-request may be in any state: start clean next time.

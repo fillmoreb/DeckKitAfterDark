@@ -2,7 +2,7 @@
 
     python3 -m unittest discover -s test     (needs lua5.1, or lua with LUA=...)
 """
-import os, random, shutil, struct, subprocess, sys, tempfile, unittest
+import base64, os, random, shutil, struct, subprocess, sys, tempfile, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "deck-setup"))
@@ -176,6 +176,45 @@ class Out(unittest.TestCase):
         self.assertEqual(codec.parse(s.out)[0::2], (0, ping))
 
 
+class Paste(unittest.TestCase):
+    """Frames by paste: a PASTE control frame, then the line in DeckLink's hidden edit box."""
+
+    def line(self, seq, channel, payload, crc=None):
+        crc = codec.crc16(payload) if crc is None else crc
+        return "DLP1 %d %d %d %04x %s" % (seq, channel, len(payload), crc, base64.b64encode(payload).decode())
+
+    def test_base64_matches_python(self):
+        data = bytes(random.Random(5).randrange(256) for _ in range(300))
+        lines, _ = Game.run('local s = CODEC_FROM_B64("%s") local t = {} for i = 1, #s do t[i] = s:byte(i) end'
+                            ' print("B", table.concat(t, ","))' % base64.b64encode(data).decode())
+        self.assertIn("B\t" + ",".join(map(str, data)), lines)
+
+    def test_pasted_frame_is_delivered_and_acked(self):
+        payload = b"a long payload, " * 20
+        paste = bitstr(codec.build(0, 2, bytes([codec.OP_PASTE])))
+        code = (ECHO + hello() + ' taps("%s") frame() print("FOCUS", tostring(GetCurrentKeyBoardFocus() ~= nil))'
+                ' DeckLinkPaste:SetText("%s") frame() print("FOCUS", tostring(GetCurrentKeyBoardFocus() ~= nil))'
+                % (paste, self.line(9, 5, payload)))
+        lines, s = Game.run(code)
+        self.assertEqual([l for l in lines if l.startswith("FOCUS")], ["FOCUS\ttrue", "FOCUS\tfalse"])
+        self.assertIn("GOT " + payload.decode(), lines)
+        self.assertEqual(s.rx_seq, 9)
+
+    def test_a_bad_paste_is_counted_not_delivered(self):
+        paste = bitstr(codec.build(0, 2, bytes([codec.OP_PASTE])))
+        lines, s = Game.run(ECHO + hello() + ' taps("%s") frame() DeckLinkPaste:SetText("%s") frame()'
+                            % (paste, self.line(9, 5, b"x" * 50, crc=1)))
+        self.assertFalse(any(l.startswith("GOT") for l in lines))
+        self.assertEqual(s.bad, 1)
+        self.assertNotEqual(s.rx_seq, 9)
+
+    def test_the_box_gives_focus_back_if_nothing_comes(self):
+        paste = bitstr(codec.build(0, 2, bytes([codec.OP_PASTE])))
+        lines, _ = Game.run(ECHO + hello() + ' taps("%s") frame() later(4) frame()'
+                            ' print("FOCUS", tostring(GetCurrentKeyBoardFocus() ~= nil))' % paste)
+        self.assertIn("FOCUS\tfalse", lines)
+
+
 class Telemetry(unittest.TestCase):
     READINGS = [("v", 2), ("bat", 87.0), ("st", "d"), ("ac", 0), ("bw", 9.43), ("apu", 7.118), ("cpu", 23.96),
                 ("tapu", 66.0), ("fan", 3223.0)]
@@ -270,6 +309,18 @@ class Dictation(unittest.TestCase):
             self.assertEqual(run("record_abort", "agent"), ("done", "agent"))
 
 
+class FakeClipboard:
+    def __init__(self, data):
+        self.data = data
+        self.available = True
+
+    def get(self):
+        return self.data
+
+    def set(self, data):
+        self.data = data
+
+
 class FakeGame:
     """The game, simulated for Link: keys go to a bit decoder, the strip is a Status."""
 
@@ -279,6 +330,19 @@ class FakeGame:
         self.queue = []
         self.drop_first = drop_first
         self.received = []
+        self.focus, self.pastes, self.clipboard, self.paste_broken = False, 0, None, False
+
+    def paste(self):
+        """Ctrl+V into DeckLink's box: the line on the clipboard, read as Link.lua's ReadPaste does."""
+        if not self.focus or self.paste_broken:
+            return
+        self.focus = False
+        _, seq, ch, length, crc, data = self.clipboard.data.decode().split(" ")
+        payload = base64.b64decode(data)
+        if len(payload) == int(length) and codec.crc16(payload) == int(crc, 16):
+            self.pastes += 1
+            self.rx_seq = int(seq)
+            self.received.append((int(ch), payload))
 
     def send(self, bits):
         data = bytes(int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8))
@@ -296,6 +360,8 @@ class FakeGame:
         elif ch == 0 and payload[0] == codec.OP_ACK:
             if self.queue and self.queue[0][1] == payload[1]:
                 self.queue.pop(0)
+        elif ch == 0 and payload[0] == codec.OP_PASTE:
+            self.focus = True
         elif ch == 0 and payload[0] == codec.OP_PING:
             self.queue.append(codec.parse(codec.build(0, len(self.queue) + 50, payload)))
         else:
@@ -304,8 +370,12 @@ class FakeGame:
     def read(self):
         if not self.open:
             raise strip.NoStrip("closed")
+        if self.focus and self.paste_broken:  # Link.lua's box gives its focus back when nothing comes
+            self.unfocus_in = getattr(self, "unfocus_in", 5) - 1
+            if self.unfocus_in <= 0:
+                self.focus, self.unfocus_in = False, 5
         out = codec.build(*self.queue[0]) if self.queue else None
-        flags = strip.FLAG_OPEN | strip.FLAG_READY | strip.FLAG_BOUND
+        flags = strip.FLAG_OPEN | strip.FLAG_BOUND | (strip.FLAG_FOCUS if self.focus else strip.FLAG_READY)
         return strip.Status(flags, 1, self.rx_seq, self.rx_count, self.bad, out)
 
 
@@ -355,6 +425,32 @@ class Host(unittest.TestCase):
         game = FakeGame()
         lk = self.make(game).open()
         self.assertGreaterEqual(lk.ping(b"xyz"), 0)
+
+    def test_big_frames_go_by_paste_and_the_clipboard_is_given_back(self):
+        game = FakeGame()
+        clip = FakeClipboard(b"Ben's own clipboard")
+        game.clipboard = clip
+        lk = link.Link(sender=game, reader=None, sleep=lambda s: None, clipboard=clip)
+        lk.read = lambda: setattr(lk, "status", self._read(game)) or lk.status
+        lk.open()
+        big = bytes(range(200))
+        lk.send(5, big)
+        lk.send(5, b"small")
+        self.assertEqual(game.received, [(5, big), (5, b"small")])
+        self.assertEqual(game.pastes, 1)  # only the big one
+        self.assertEqual(clip.data, b"Ben's own clipboard")
+
+    def test_paste_falls_back_to_keys(self):
+        game = FakeGame()
+        game.clipboard = FakeClipboard(None)
+        game.paste_broken = True
+        tick = iter(range(1000000))
+        lk = link.Link(sender=game, reader=None, sleep=lambda s: None, clipboard=game.clipboard,
+                       clock=lambda: next(tick) * 0.05)
+        lk.read = lambda: setattr(lk, "status", self._read(game)) or lk.status
+        lk.open()
+        lk.send(5, bytes(100))
+        self.assertEqual(game.received, [(5, bytes(100))])
 
     def test_key_commands(self):
         k = keys.Keys.__new__(keys.Keys)

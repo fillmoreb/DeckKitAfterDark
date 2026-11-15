@@ -29,6 +29,13 @@ game loses the first key's release then.
 of the screen (it's gone otherwise; the cover below hides it from you). The program reads it from gamescope's video stream: whether the
 game is ready for keys (no chat box open), which frame arrived last, and one frame from the game.
 
+**Bigger frames by paste:** frames of 40 bytes or more go through the clipboard instead, when a
+clipboard tool is there (`xclip`; Decktation ships one). A PASTE control frame, sent by keys, has
+DeckLink focus a hidden edit box. The program presses Ctrl+V, and the box checks the one-line paste:
+`DLP1 <seq> <channel> <length> <crc> <base64>`. It then delivers the frame as if it came by keys and
+gives focus back at once (or after 3 s if nothing comes). About 0.3 s whatever the size. Your
+clipboard is put back afterwards, and if a paste fails, the frame goes by keys.
+
 **Frames** both ways: `len (2) | channel (1) | seq (1) | payload | CRC-16 (2)`. Stop-and-wait: the
 program waits until the strip shows its frame's seq (resending if not), and acks each frame the game
 shows. A lost or extra tap fails the CRC: that frame is dropped and counted, never delivered wrong.

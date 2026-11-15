@@ -37,6 +37,25 @@ cat > ~/.local/bin/decklink-agent-ask <<'SH'
 PYTHONPATH=/home/deck/.local/lib exec python3 -m decklink.agentd --ask "$1"
 SH
 chmod +x ~/.local/bin/decklink-agent-ask
+# Decktation's WoW profile gets the WoW words (wow-vocabulary.txt) as hotwords, the hint Whisper gets
+# before every recording. profiles.json may hold other things of yours: only wow.hotwords is replaced.
+# Decktation reads it when it starts (restart Decky, or the Deck).
+if [ -f wow-vocabulary.txt ] && [ -d /home/deck/homebrew/settings/decktation ]; then
+  python3 - wow-vocabulary.txt /home/deck/homebrew/settings/decktation/profiles.json <<'PY'
+import json, os, sys
+words = [l.strip() for l in open(sys.argv[1]) if l.strip() and not l.lstrip().startswith("#")]
+path = sys.argv[2]
+try:
+    profiles = json.load(open(path))
+except (OSError, ValueError):
+    profiles = {}
+profiles.setdefault("wow", {})["hotwords"] = words
+with open(path + ".tmp", "w") as f:
+    json.dump(profiles, f, indent=2)
+os.replace(path + ".tmp", path)
+print("Decktation WoW hotwords: %d words" % len(words))
+PY
+fi
 cp decktation-hook.sh ~/.local/bin/decklink-decktation-hook
 chmod +x ~/.local/bin/decklink-decktation-hook
 cat > ~/.config/systemd/user/decklink-cover.service <<'UNIT'

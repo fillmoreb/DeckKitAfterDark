@@ -1,9 +1,13 @@
 ## Interface: 16001
 ## Title: DeckAgent
-## Notes: DeckKitAfterDark: the game side of DeckAgent, your gaming assistant. It answers what the assistant asks (where you are) and does what you asked it for (waypoints), through DeckLink. /deckkit agent
+## Notes: DeckKitAfterDark: the game side of DeckAgent, your gaming assistant. It answers what the assistant asks (where you are, who's online) and does what you asked it for (waypoints, chat), through DeckLink. /deckkit agent
 ## Version: @project-version@
 ## Author: Ben Fillmore
 ## Dependencies: DeckKit, DeckLink
 ## OptionalDeps: WayPad
+## SavedVariables: DeckAgentDB
 
 Agent.lua
+Prompt.lua
+Chat.lua
+Ask.lua

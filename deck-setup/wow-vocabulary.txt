@@ -1,0 +1,88 @@
+# Words Whisper should expect (Decktation's hotwords for its WoW profile; install-on-deck.sh writes them
+# into Decktation's profiles.json). One per line; # starts a comment. Whisper only takes ~220 tokens
+# of hint and keeps the END when there's more, so the most important words go last.
+Durotar
+Mulgore
+Tirisfal Glades
+Silverpine Forest
+The Barrens
+Stonetalon Mountains
+Ashenvale
+Thousand Needles
+Desolace
+Dustwallow Marsh
+Feralas
+Tanaris
+Hillsbrad Foothills
+Arathi Highlands
+Stranglethorn Vale
+Hinterlands
+Plaguelands
+Winterspring
+Felwood
+Un'Goro Crater
+Silithus
+Elwynn Forest
+Westfall
+Duskwood
+Redridge
+Teldrassil
+Booty Bay
+Ratchet
+Gadgetzan
+Thunder Bluff
+Stormwind
+Ironforge
+Darnassus
+Orgrimmar
+Undercity
+Thrall
+Sylvanas
+Tauren
+Forsaken
+Troll
+Paladin
+Shaman
+Warlock
+Druid
+LFG
+LFM
+LF2M
+WTS
+WTB
+inc
+AoE
+DPS
+aggro
+Ragefire Chasm
+Wailing Caverns
+Deadmines
+Shadowfang Keep
+Blackfathom Deeps
+Stockade
+Gnomeregan
+Razorfen Kraul
+Scarlet Monastery
+Razorfen Downs
+Uldaman
+Zul'Farrak
+Maraudon
+Sunken Temple
+Blackrock Depths
+Blackrock Spire
+Dire Maul
+Stratholme
+Scholomance
+Molten Core
+RFC
+WC
+VC
+SFK
+BFD
+SM
+RFK
+RFD
+ZF
+BRD
+UBRS
+LBRS

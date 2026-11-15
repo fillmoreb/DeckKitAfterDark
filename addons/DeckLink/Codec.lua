@@ -9,7 +9,7 @@ local Codec = {}
 ns.Codec = Codec
 
 Codec.HEADER, Codec.OVERHEAD = 4, 6
-Codec.OP_HELLO, Codec.OP_ACK, Codec.OP_BYE, Codec.OP_PING = 1, 2, 3, 4
+Codec.OP_HELLO, Codec.OP_ACK, Codec.OP_BYE, Codec.OP_PING, Codec.OP_PASTE = 1, 2, 3, 4, 5
 
 -- CRC-16 of bytes (a string, or a table of byte values) i..j.
 function Codec.CRC(data, i, j)

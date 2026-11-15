@@ -13,14 +13,20 @@ Environment:
   DECKAGENT_DECK   SSH target that reaches the game (e.g. claude@192.168.4.129); empty on the Deck itself
   DECKAGENT_HOME   the agent's folder (database, notes)
 """
-import argparse, json, os, shutil, subprocess, sys, time
+import argparse, difflib, json, os, re, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
-from agent import common  # noqa: E402
+from agent import common, memory  # noqa: E402
 
-TOOLS = ["mcp__deckagent__get_player_state", "mcp__deckagent__find_npc", "mcp__deckagent__set_waypoint"]
-BUILTIN = "WebSearch,WebFetch"
+TOOLS = ["mcp__deckagent__get_player_state", "mcp__deckagent__find_npc", "mcp__deckagent__set_waypoint",
+         "mcp__deckagent__send_chat", "mcp__deckagent__get_online", "mcp__deckagent__ask_player",
+         "mcp__deckagent__remember", "mcp__deckagent__remember_fact", "mcp__deckagent__recall",
+         "mcp__deckagent__forget_fact"]
+# Built-in tools: the web, and its own notes. Read/Edit/Write are allowed only inside its folder (the
+# working directory, ~/.deckagent): anything elsewhere would need an approval -p can't give, so it's denied.
+BUILTIN = "WebSearch,WebFetch,Read,Edit,Write"
+OWN_FILES = ["Read(./**)", "Edit(./**)", "Write(./**)"]
 
 
 def workspace():
@@ -28,6 +34,13 @@ def workspace():
     notes = os.path.join(common.HOME, "CLAUDE.md")
     if not os.path.exists(notes):
         shutil.copy(os.path.join(HERE, "workspace-CLAUDE.md"), notes)
+    else:  # notes from an older version: add the sections it's missing, keep everything written so far
+        with open(notes) as f:
+            text = f.read()
+        for heading in ("## People", "## Ben's rules"):
+            if heading not in text:
+                with open(notes, "a") as f:
+                    f.write("\n%s\n" % heading)
     cfg = {"mcpServers": {"deckagent": {
         "command": sys.executable, "args": [os.path.join(HERE, "mcp_server.py")],
         "env": {k: v for k, v in (("DECKAGENT_DECK", common.DECK), ("DECKAGENT_HOME", common.HOME),
@@ -38,12 +51,15 @@ def workspace():
     return path
 
 
+PICKED = {}  # the model picked in the game's menu (DeckKit > Tools > DeckAgent), from prefetch
+
+
 def prefetch(verbose):
     """Ben's position and faction, fetched before the brain starts, so "nearest X" skips a turn.
     Returns a line for the prompt, or None if the game didn't answer (the brain can still ask)."""
     start = time.monotonic()
     try:
-        s = common.game("state", "pos", "world", "zone", "who", timeout=15)
+        s = common.game("state", "pos", "world", "zone", "who", "brain", timeout=15)
     except common.GameError as e:
         if verbose:
             print("[prefetch] failed: %s" % e, file=sys.stderr)
@@ -52,6 +68,8 @@ def prefetch(verbose):
         print("[prefetch] %.1f s" % (time.monotonic() - start), file=sys.stderr)
     if not s.get("ok") or "map" not in s:
         return None
+    if s.get("model"):
+        PICKED["model"] = s["model"]
     parts = ["map_id %s, x %s, y %s" % (s["map"], s["x"], s["y"])]
     for key, label in (("zone", "zone"), ("faction", "faction"), ("level", "level"), ("class", "class")):
         if s.get(key) is not None:
@@ -59,44 +77,201 @@ def prefetch(verbose):
     return "[Ben's game state when he asked: " + ", ".join(parts) + "]"
 
 
-def run_claude(question, mcp, model, verbose):
+# Speech-to-text garbles names it doesn't know ("Edna's" came out "Edmunds'", then "Adna"), and the model
+# doesn't always connect them. So the launcher does: a capitalized word that sounds like someone under
+# People in the notes gets a hint line. Close enough: difflib ratio over SOUNDS_LIKE (edmunds/edna 0.55,
+# adna/edna 0.75; need/edna 0.5 and and/edna 0.29 stay out).
+SOUNDS_LIKE = 0.52
+
+
+def people(notes_text):
+    """The People in the notes: {name: BattleTag or None}, in order ("- Edna: BattleTag Sylunne#1513 ...").
+    Skips the template's example."""
+    found, inside = {}, False
+    for line in notes_text.splitlines():
+        if line.startswith("## "):
+            inside = line.strip() == "## People"
+        elif inside:
+            m = re.match(r"-\s*([^:#(]+?)\s*[:(]", line)
+            if m and "Edna#1234" not in line:
+                tag = re.search(r"[^\s:(),;]+#\d{3,}", line)
+                found[m.group(1)] = tag.group(0) if tag else None
+    return found
+
+
+def mentioned(question, names):
+    """The People the question names: [(word as heard, name)], sound-alikes included."""
+    by_lower = {n.lower(): n for n in names}
+    found = []
+    for word in re.findall(r"\b[A-Z][a-z]{2,}(?:'s|s')?", question):
+        bare = re.sub(r"('s|s')$", "", word)
+        if bare.lower() in by_lower:
+            found.append((bare, by_lower[bare.lower()]))
+            continue
+        score = lambda n: difflib.SequenceMatcher(None, bare.lower(), n.lower()).ratio()
+        best = max(names, key=score, default=None)
+        if best and score(best) >= SOUNDS_LIKE:
+            found.append((bare, best))
+    return found
+
+
+def name_hints(question, names):
+    """A hint line for names the question probably meant, or None."""
+    found = ['"%s" is probably %s' % (heard, name) for heard, name in mentioned(question, names) if heard != name]
+    if not found:
+        return None
+    return "[Speech-to-text, sounds like your People notes: " + "; ".join(found) + "]"
+
+
+def character_hints(question, tags, db, now=None):
+    """What the memory knows about the characters of the People the question names, or None."""
+    lines = []
+    for name in dict.fromkeys(n for _, n in mentioned(question, list(tags))):
+        if not tags.get(name):
+            continue
+        chars = memory.characters_of(db, tags[name])
+        if chars:
+            lines.append("%s (%s): " % (name, tags[name]) + "; ".join(
+                "%s, level %s %s, last seen online %s" % (c["name"], c["level"], c["class"], memory.ago(c["last_seen"], now))
+                for c in chars[:6]))
+    if not lines:
+        return None
+    return "[Characters you've seen them on: " + " | ".join(lines) + "]"
+
+
+FACT_HINTS = 4
+
+
+def fact_hints(question, tags, db):
+    """The facts most related to the question (its words, plus the People it names), or None."""
+    names = [n for _, n in mentioned(question, list(tags))]
+    found = memory.recall(db, question + " " + " ".join(names), limit=FACT_HINTS)
+    if not found:
+        return None
+    return "[From your memory (recall for more): " + "; ".join(
+        "#%d %s: %s (%s)" % (f["id"], f["about"], f["fact"], memory.day(f["created"])) for f in found) + "]"
+
+
+def notes_people():
+    try:
+        with open(os.path.join(common.HOME, "CLAUDE.md")) as f:
+            return people(f.read())
+    except OSError:
+        return {}
+
+
+def memory_hints(question, tags):
+    """The lines the memory adds before the question: facts, then characters (either may be missing)."""
+    try:
+        with memory.connect() as db:
+            lines = [fact_hints(question, tags, db), character_hints(question, tags, db)]
+    except Exception as e:
+        print("[memory] %s" % e, file=sys.stderr)
+        return None
+    return "\n".join(l for l in lines if l) or None
+
+
+# Questions close together are one conversation, so an answer to the agent's own question lands where
+# it asked it. After CONTINUE_S quiet seconds, or "start over", the next question starts fresh.
+SESSION_FILE = os.path.join(common.HOME, "session.json")
+CONTINUE_S = float(os.environ.get("DECKAGENT_CONTINUE_S", "600"))
+FRESH = re.compile(r"^\W*(start over|new (topic|conversation|question)|forget (that|it)|never ?mind)\b", re.I)
+
+
+def last_session(now=None, path=None):
+    """The session to continue, or None when it's been quiet too long (or there's none)."""
+    try:
+        with open(path or SESSION_FILE) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if (now or time.time()) - saved.get("at", 0) > CONTINUE_S or not saved.get("id"):
+        return None
+    return saved["id"]
+
+
+def save_session(session_id, now=None, path=None):
+    if not session_id:
+        return
+    tmp = (path or SESSION_FILE) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"id": session_id, "at": now or time.time()}, f)
+    os.replace(tmp, path or SESSION_FILE)
+
+
+TRANSCRIPTS = os.path.join(common.HOME, "transcripts")
+
+
+def write_transcript(record):
+    """One JSON line per question in transcripts/<date>.jsonl (for debugging: what it heard, every tool
+    call and result, what it answered). Never lets a logging problem break the answer."""
+    try:
+        os.makedirs(TRANSCRIPTS, exist_ok=True)
+        with open(os.path.join(TRANSCRIPTS, time.strftime("%Y-%m-%d") + ".jsonl"), "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
+
+
+def run_claude(question, mcp, model, verbose, resume=None):
     claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")  # services' PATH lacks ~/.local/bin
     cmd = [claude, "-p", question, "--output-format", "stream-json", "--verbose",
            "--strict-mcp-config", "--mcp-config", mcp, "--tools", BUILTIN,
-           "--allowedTools", ",".join(TOOLS + BUILTIN.split(",")),
-           "--setting-sources", "project", "--no-session-persistence",
+           "--allowedTools", ",".join(TOOLS + ["WebSearch", "WebFetch"] + OWN_FILES),
+           "--setting-sources", "project",
            "--append-system-prompt-file", os.path.join(HERE, "SYSTEM.md")]
     if model:
         cmd += ["--model", model]
+    if resume:
+        cmd += ["--resume", resume]
     start = time.monotonic()
-    proc = subprocess.Popen(cmd, cwd=common.HOME, stdout=subprocess.PIPE, text=True)
-    answer, auth = None, None
+    # ask_player waits for Ben (up to a couple of minutes): give MCP tool calls room for that.
+    env = dict(os.environ, MCP_TOOL_TIMEOUT=os.environ.get("MCP_TOOL_TIMEOUT", "330000"))
+    proc = subprocess.Popen(cmd, cwd=common.HOME, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, env=env)
+    answer, auth, session, cost, turns = None, None, None, None, None
+    steps = []  # for the transcript: tool calls and their results, in order
     for line in proc.stdout:
         try:
             ev = json.loads(line)
         except ValueError:
             continue
+        session = ev.get("session_id") or session
         if ev.get("type") == "system" and ev.get("subtype") == "init":
             auth = ev.get("apiKeySource")
             if verbose:
-                print("[init] model=%s auth=%s mcp=%s" % (ev.get("model"), auth,
+                print("[init] model=%s auth=%s session=%s mcp=%s" % (ev.get("model"), auth, "resumed" if resume else "new",
                       [(s["name"], s["status"]) for s in ev.get("mcp_servers", [])]), file=sys.stderr)
-        elif ev.get("type") == "assistant" and verbose:
+        elif ev.get("type") == "assistant":
             for block in ev.get("message", {}).get("content", []):
                 if block.get("type") == "tool_use":
-                    print("[tool] %s %s" % (block["name"], json.dumps(block.get("input"))), file=sys.stderr)
-        elif ev.get("type") == "user" and verbose:
+                    steps.append({"t": round(time.monotonic() - start, 2), "tool": block["name"].split("__")[-1],
+                                  "input": block.get("input")})
+                    if verbose:
+                        print("[tool] %s %s" % (block["name"], json.dumps(block.get("input"))), file=sys.stderr)
+                elif block.get("type") == "text" and block.get("text", "").strip():
+                    steps.append({"t": round(time.monotonic() - start, 2), "said": block["text"].strip()})
+        elif ev.get("type") == "user":
             for block in ev.get("message", {}).get("content", []):
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     text = block.get("content")
                     text = text if isinstance(text, str) else json.dumps(text)
-                    print("[result] %s" % text[:300], file=sys.stderr)
+                    steps.append({"t": round(time.monotonic() - start, 2), "result": text[:2000],
+                                  "error": bool(block.get("is_error"))})
+                    if verbose:
+                        print("[result] %s" % text[:300], file=sys.stderr)
         elif ev.get("type") == "result":
             answer = ev.get("result")
+            cost, turns = ev.get("total_cost_usd"), ev.get("num_turns")
             if verbose:
                 print("[done] %.1f s, %s turns, cost estimate $%s" % (time.monotonic() - start, ev.get("num_turns"),
                       ev.get("total_cost_usd")), file=sys.stderr)
     proc.wait()
+    if proc.returncode == 0:
+        save_session(session)
+    write_transcript({"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "question": question, "model": model,
+                      "session": session, "resumed": bool(resume), "auth": auth, "steps": steps,
+                      "answer": answer, "exit": proc.returncode, "seconds": round(time.monotonic() - start, 1),
+                      "turns": turns, "cost_estimate": cost})
     if auth not in (None, "none"):
         print("deckagent: note: this ran on an API key (%s), not your Claude plan" % auth, file=sys.stderr)
     return answer, proc.returncode
@@ -108,17 +283,27 @@ def main():
     p.add_argument("--engine", choices=["claude", "codex"], default=os.environ.get("DECKAGENT_ENGINE", "claude"))
     # Haiku by default: about 2.5 s faster per question than Opus (2026-11-14) and right on the
     # lookups; when a question needs more judgment, say --model sonnet (or set DECKAGENT_MODEL).
-    p.add_argument("--model", default=os.environ.get("DECKAGENT_MODEL", "haiku"))
+    p.add_argument("--model", help="haiku, sonnet, opus... (default: the game menu's pick, else "
+                   "$DECKAGENT_MODEL, else haiku)")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--no-prefetch", action="store_true", help="don't fetch his position before asking")
     a = p.parse_args()
     if a.engine == "codex":
         sys.exit("deckagent: the codex engine isn't built yet")
     question = " ".join(a.question)
+    mcp = workspace()  # makes the folder and notes, before the session file is read
+    tags = notes_people()
+    for hint in (memory_hints(question, tags), name_hints(question, list(tags))):
+        if hint:
+            question = hint + "\n" + question
     state = None if a.no_prefetch else prefetch(a.verbose)
     if state:
         question = state + "\n\n" + question
-    answer, rc = run_claude(question, workspace(), a.model, a.verbose)
+    resume = None if FRESH.match(" ".join(a.question)) else last_session()
+    model = a.model or PICKED.get("model") or os.environ.get("DECKAGENT_MODEL") or "haiku"
+    answer, rc = run_claude(question, mcp, model, a.verbose, resume)
+    if rc and resume:  # the old session couldn't be resumed (cleaned up?): ask again, fresh
+        answer, rc = run_claude(question, mcp, model, a.verbose)
     print(answer or "(no answer)")
     return rc
 

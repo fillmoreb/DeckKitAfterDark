@@ -27,3 +27,8 @@ exchanging data with the game). Read `~/Projects/DeckKit/CLAUDE.md` for the game
 - Every DeckLink channel's payload is binary with fixed field positions (README table): keys into the
   game carry ~55 bytes a second. Keep it that way for new channels: no text formats. Telemetry waits
   while the link is open or a dictation holds the keys (`link.hold`), so it never delays anything.
+- DeckLink sends frames of 40+ bytes by paste (`link.py` send_by_paste, `Link.lua` ExpectPaste/ReadPaste,
+  `clipboard.py`): keep the line format `DLP1 seq channel length crc base64` in step on both sides.
+  Anything that shows a window answering to the pad must read only `OnGamePadButtonDown` (no polling,
+  no keyboard): Decktation's dictation presses Enter, and only a real press may /say (DeckAgent's
+  Prompt.lua).
