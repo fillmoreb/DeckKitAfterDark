@@ -19,6 +19,7 @@ from . import codec
 FORMAT = 1
 SYNC = [(1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 1, 1)]
 STATUS_BYTES = 11
+ROWS = 16  # the bottom rows the Grabber keeps: decode reads at most 16 (a cell is 1-16 px)
 FLAG_OPEN, FLAG_READY, FLAG_BOUND, FLAG_FOCUS = 1, 2, 4, 8
 
 Status = collections.namedtuple("Status", "flags heartbeat rx_seq rx_count bad out")
@@ -40,7 +41,9 @@ class Frame:
 
 
 class Grabber:
-    """gamescope's PipeWire stream, decoded by GStreamer into RGB; frame() returns the newest."""
+    """gamescope's PipeWire stream, decoded by GStreamer into RGB; frame() returns the newest, cut to its
+    bottom ROWS rows before converting (measured on the Deck: about 9% of a core above idle instead of
+    26% for whole frames). The crop is learned from the first frame (and again when the screen size changes)."""
 
     def __init__(self):
         import gi
@@ -53,10 +56,23 @@ class Grabber:
                      and ((o.get("info") or {}).get("props") or {}).get("node.name") == "gamescope"), None)
         if node is None:
             raise NoStrip("no gamescope PipeWire stream (Game Mode only)")
-        self.Gst = Gst
+        self.Gst, self.node = Gst, node
+        self._start(0)
+
+    def _start(self, top):
+        """(Re)build the pipeline cropping `top` rows off. Changing videocrop's size on a playing pipeline
+        stalls pipewiresrc's renegotiation (seen on the Deck: no frames after it), so it's rebuilt.
+        gamescope offers BGRx and NV12. Straight into videoconvert it picks BGRx (exact colors), but with
+        videocrop in between it falls to NV12, whose YUV round trip shifts the strip's colors enough to
+        fail its checksum most of the time: so BGRx is asked for by name."""
+        Gst = self.Gst
+        if getattr(self, "pipeline", None) is not None:
+            self.pipeline.set_state(Gst.State.NULL)
+        self.top = top
         self.pipeline = Gst.parse_launch(
-            "pipewiresrc path=%d always-copy=true ! videoconvert ! video/x-raw,format=RGB ! "
-            "appsink name=sink max-buffers=1 drop=true sync=false" % node)
+            "pipewiresrc path=%d always-copy=true ! video/x-raw,format=BGRx ! videocrop top=%d ! "
+            "videoconvert ! video/x-raw,format=RGB ! "
+            "appsink name=sink max-buffers=1 drop=true sync=false" % (self.node, top))
         self.sink = self.pipeline.get_by_name("sink")
         self.pipeline.set_state(Gst.State.PLAYING)
 
@@ -67,6 +83,8 @@ class Grabber:
             raise NoStrip("no frame from PipeWire")
         caps = sample.get_caps().get_structure(0)
         width, height = caps.get_value("width"), caps.get_value("height")
+        if height != ROWS and height + self.top > ROWS:  # uncropped yet, or the stream changed size
+            self._start(height + self.top - ROWS)
         buf = sample.get_buffer()
         data = buf.extract_dup(0, buf.get_size())
         return Frame(width, height, len(data) // height, data)
