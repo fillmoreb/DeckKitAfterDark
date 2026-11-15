@@ -20,7 +20,8 @@ under Blizzard's terms.
 Copy the folders in `addons/` (**DeckLink**, **DeckTelemetry**, **DeckDictation**, **DeckAgent**) into
 WoW: Forever's `_forever_/Interface/AddOns` folder, next to DeckKit's. The others all need DeckLink;
 install only the ones you want. DeckAgent also uses DeckKit's WayPad (waypoints), MarketDeck (prices)
-and PackPad (item flags) when they're installed.
+and PackPad (item flags) when they're installed. DeckAgent needs a DeckKit with layouts (`DeckKit.JSON`,
+`UI.ShowLayout`, `DeckKit.Conditions`: DeckKit 1.3 or later): update DeckKit along with it.
 
 ## 2. The program side
 
@@ -137,6 +138,12 @@ notes, memory, hooks and transcripts: all personal), stays until you delete it: 
 
 What the steps above set up for DeckAgent, and why, kept current as it's built. "Done by the installer"
 means `install-on-deck.sh` (or `install.sh`) already does it (step 2); "by hand" is steps 3 and 4.
+
+**What it needs from DeckKit**
+- Layouts (`addons/DeckKit/Layout.lua`, `JSON.lua`, `Conditions.lua`): Decky's `show_layout` windows,
+  and the checklist's and hooks' game conditions. An older DeckKit loads DeckAgent with errors.
+- Layouts are 1-4 KB of JSON, so they need the paste route (a clipboard tool on the Deck, which the
+  installer sets up for the link): by keys alone a frame over 500 bytes is refused, not shown.
 
 **Done by the installer**
 - `~/.local/lib/deckagent` (launcher, MCP server, database tools), `~/.local/bin/deckagent`,

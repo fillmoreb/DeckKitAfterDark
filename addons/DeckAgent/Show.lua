@@ -4,7 +4,7 @@
 -- SHOW (op 7) request:
 --   byte 1      kind: 1 chat echo, 2 card, 3 reading view
 --   byte 2      card: seconds on screen, 0 until you close it (other kinds ignore it)
---   bytes 3-6   card: an item ID whose icon goes by the title, uint32 (0 none)
+--   bytes 3-6   card: an item ID, shown first (its icon and name, its tooltip on Y), uint32 (0 none)
 --   then        title: length uint8 + UTF-8 (chat echo: the gray line above the answer, as it should
 --               read, e.g. "You asked: ..." or "Hook: ..."; may be empty)
 --   then        text: length uint16 + UTF-8 (chat echo: the answer)
@@ -13,9 +13,9 @@
 --
 --   chat echo   the title line in gray, then "Decky: ..." in the chat frame (local only, nobody
 --               else sees it), so answers can be read again in the chat peek and chat history.
---   card        a small panel at the top left: title, a few lines (lists as below). It goes after its
---               seconds, or on {B}. In combat it still shows, but without {B} (a window can't take buttons
---               mid-fight): it waits out its time.
+--   card        DeckKit's card (UI.ShowCard: top left, right of a tracker), the text's markup as layout
+--               pieces: title, a few lines (lists as below). It goes after its seconds, or on {B}. In
+--               combat it still shows, but without {B} (B is the game's mid-fight): it waits out its time.
 --   reading     a bigger window for long text: the d-pad scrolls, LB/RB turn pages, {B} closes. It
 --               takes those buttons only, never the sticks. In combat it waits for the fight to end.
 --   Both: "# " starts a heading, "- " a bullet, "[ ] " a checklist item to do, "[x] " one done (a
@@ -146,70 +146,42 @@ local function Echo(question, answer)
 end
 
 ------------------------------------------------------------------------
--- Card
+-- Card: DeckKit's (DeckKit/Displays.lua, UI.ShowCard), with the text's markup as layout pieces
 ------------------------------------------------------------------------
 
-local card, cardCatch, cardTimer
-
-local function HideCard()
-    if cardTimer then cardTimer:Cancel(); cardTimer = nil end
-    if card then card:Hide() end
-    if cardCatch then cardCatch:Take(false) end
-end
-
--- The card sits at the top left, or to the right of Decky's checklist while that's up (Checklist.lua).
-local function Reanchor()
-    if not card then return end
-    card:ClearAllPoints()
-    local list = ns.Checklist and ns.Checklist.Anchor()
-    if list then
-        card:SetPoint("TOPLEFT", list, "TOPRIGHT", 10, 0)
-    else
-        card:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 24, -70)
+-- "# Heading", "- bullet", "[ ] to do" / "[x] done" and plain lines -> a layout (after Clean). Plain
+-- lines in a row stay one paragraph.
+local function CardSpec(title, text, itemID)
+    local items, para = {}, {}
+    local function Flush()
+        if #para > 0 then items[#items + 1] = { type = "text", text = table.concat(para, "\n") } end
+        para = {}
     end
-end
-ns.Card = { Reanchor = Reanchor }
-
-local function BuildCard()
-    card = Panel("DeckAgentCard", 400, "HIGH")
-    Reanchor()
-    card.icon = card:CreateTexture(nil, "ARTWORK")
-    card.icon:SetSize(28, 28)
-    card.icon:SetPoint("TOPLEFT", 14, -12)
-    card.title = Font(card, "title", GameFontNormalLarge)
-    card.title:SetJustifyH("LEFT")
-    card.text = Font(card, "body", GameFontHighlight)
-    card.text:SetJustifyH("LEFT")
-    card.text:SetWordWrap(true)
-    card.text:SetSpacing(3)
-    card.hint = Font(card, "body", GameFontHighlight)
-    card.hint:SetPoint("BOTTOMRIGHT", -14, 10)
-    cardCatch = Catcher("DeckAgentCardButtons", { PAD2 = HideCard })
+    if itemID and itemID > 0 then items[1] = { type = "item", id = itemID } end
+    for line in (text .. "\n"):gmatch("(.-)\n") do
+        local h = line:match("^#+%s+(.*)")
+        local mark, rest = line:match("^%s*%[([ xX]?)%]%s*(.*)")
+        if h then
+            Flush()
+            items[#items + 1] = { type = "heading", text = h }
+        elseif mark then
+            Flush()
+            items[#items + 1] = { type = "row", items = { { type = "check", done = mark == "x" or mark == "X" },
+                { type = "text", text = rest } } }
+        elseif line:match("^%s*[-*]%s+") then
+            para[#para + 1] = (line:gsub("^%s*[-*]%s+", "  \226\128\162 "))
+        else
+            para[#para + 1] = line
+        end
+    end
+    Flush()
+    return { type = "list", title = title, width = 400, items = items }
 end
 
 local function ShowCard(title, text, seconds, itemID)
-    if not card then BuildCard() end
-    local icon = itemID > 0 and C_Item and C_Item.GetItemIconByID and C_Item.GetItemIconByID(itemID)
-    card.icon:SetShown(icon and true or false)
-    if icon then card.icon:SetTexture(icon) end
-    local left = icon and 50 or 16
-    card.title:ClearAllPoints()
-    card.title:SetPoint("TOPLEFT", left, icon and -18 or -14)
-    card.title:SetPoint("RIGHT", card, "RIGHT", -16, 0)
-    card.title:SetText(Clean(title))
-    local y = (icon and -48) or (title ~= "" and -40) or -14
-    card.text:ClearAllPoints()
-    card.text:SetPoint("TOPLEFT", 16, y)
-    card.text:SetPoint("TOPRIGHT", -16, y)
-    card.text:SetText(Markup(Clean(text, true)))
-    card.hint:SetText(Glyph("B") .. " Close")
-    card.hint:SetShown(not InCombatLockdown())
-    card:SetHeight(-y + (card.text:GetStringHeight() or 16) + 44)
-    card:Show()
-    cardCatch:Take(true)
-    if cardTimer then cardTimer:Cancel(); cardTimer = nil end
-    if seconds > 0 then cardTimer = C_Timer.NewTimer(seconds, HideCard) end
+    DeckKit.UI.ShowCard(CardSpec(Clean(title), Clean(text, true), itemID), { seconds = seconds })
 end
+ns.CardSpec = CardSpec -- (for the tests)
 
 ------------------------------------------------------------------------
 -- Reading view
@@ -292,10 +264,6 @@ local function ShowReader(title, text)
 end
 
 ns.On("PLAYER_REGEN_DISABLED", function()
-    if card and card:IsShown() then
-        cardCatch:Take(false)
-        card.hint:Hide()
-    end
     if reader and reader:IsShown() then -- it comes back after the fight, at the top
         readQueued = reader.spec
         reader:Hide()
@@ -304,10 +272,6 @@ ns.On("PLAYER_REGEN_DISABLED", function()
 end)
 
 ns.On("PLAYER_REGEN_ENABLED", function()
-    if card and card:IsShown() then
-        cardCatch:Take(true)
-        card.hint:Show()
-    end
     if readQueued then
         local spec = readQueued
         readQueued = nil

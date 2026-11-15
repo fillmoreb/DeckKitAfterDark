@@ -1221,17 +1221,12 @@ class Showing(unittest.TestCase):
         data, _ = ask(host.build_state(["voice"]), "DeckAgentDB.quiet = true")
         self.assertEqual(host.parse_reply(data, ["voice"])["quiet"], True)
 
-    def test_card_shows_and_b_or_time_closes_it(self):
+    def test_card_shows_as_deckkits_card(self):
         packet = host.build_show("card", "SFK", "Missing 2 quests", seconds=10, item=6948)
-        show = 'print("CARD", tostring(DeckAgentCard.shown), DeckAgentCard.title.text, DeckAgentCard.text.text) '
-        press = 'local c = DeckAgentCardButtons; c.OnGamePadButtonDown(c, "PAD2") c.OnGamePadButtonUp(c, "PAD2") '
-        lines, _ = Game.run("login() " + hello() + ' taps("%s") frame() ' % bitstr(codec.build(host.CHANNEL, 7, packet))
-                            + show + press + show)
-        self.assertIn("CARD\ttrue\tSFK\tMissing 2 quests", lines)
-        self.assertIn("CARD\tfalse\tSFK\tMissing 2 quests", lines)
-        lines, _ = Game.run("login() " + hello() + ' taps("%s") frame() ' % bitstr(codec.build(host.CHANNEL, 7, packet))
-                            + "fireTimers() " + show)
-        self.assertIn("CARD\tfalse\tSFK\tMissing 2 quests", lines)
+        show = ('print("CARD", tostring(CARD.shown), CARD.spec.title, CARD.spec.items[1].type, CARD.spec.items[1].id, '
+                'CARD.spec.items[2].text, CARD.opts.seconds) ')
+        lines, _ = Game.run("login() " + hello() + ' taps("%s") frame() ' % bitstr(codec.build(host.CHANNEL, 7, packet)) + show)
+        self.assertIn("CARD\ttrue\tSFK\titem\t6948\tMissing 2 quests\t10", lines)  # (B and its time: DeckKit's)
 
     def test_reading_waits_for_combat_and_takes_its_buttons(self):
         packet = host.build_show("reading", "Walkthrough", "# Step one\n- go there\nthen here")
@@ -1409,11 +1404,13 @@ class Quests(unittest.TestCase):
 
 class CardMarkup(unittest.TestCase):
     def test_checklists_and_bullets(self):
-        packet = host.build_show("card", "RFC", "[ ] Heart (Taragaman)\n[x] Satchel\n- note")
+        packet = host.build_show("card", "RFC", "# Left\n[ ] Heart (Taragaman)\n[x] Satchel\n- note\nmore")
         lines, _ = Game.run("login() " + hello() + ' taps("%s") frame() ' % bitstr(codec.build(host.CHANNEL, 7, packet))
-                            + 'print("TEXT", DeckAgentCard.text.text)')
-        i = lines.index("TEXT\t|A:checkbox-minimal:14:14|a Heart (Taragaman)")
-        self.assertEqual(lines[i + 1:i + 3], ["|A:Tracker-Check:14:14|a |cff9d9d9dSatchel|r", "  \u2022 note"])
+                            + 'for i, it in ipairs(CARD.spec.items) do local c = it.items and it.items[1] '
+                            'print("PIECE", it.type, (it.text and it.text:gsub("\\n", "/")) or (it.items[2].text .. " " .. tostring(c.done))) end')
+        self.assertEqual([l for l in lines if l.startswith("PIECE")],
+                         ["PIECE\theading\tLeft", "PIECE\trow\tHeart (Taragaman) false", "PIECE\trow\tSatchel true",
+                          "PIECE\ttext\t  \u2022 note/more"])
 
 
 DUNGEONS_LUA = """local isHorde = UnitFactionGroup("Player") == "Horde"
@@ -1562,7 +1559,7 @@ CHECK_SETUP = ('BAGS = { [6948] = 1 } C_Item.GetItemCount = function(id) return 
                'UnitXPMax = function() return 1000 end '
                'C_QuestLog.IsOnQuest = function(id) return id == 5728 or id == 5725 end '
                'C_QuestLog.IsQuestFlaggedCompleted = function(id) return id == 1 end ')
-SHOWN = ('print("PANEL", tostring(DeckAgentChecklist and DeckAgentChecklist.shown)) '
+SHOWN = ('print("PANEL", tostring(DeckKit.UI.TrackerShown())) '
          'for i, it in ipairs(DeckAgentDB.checklist and DeckAgentDB.checklist.items or {}) do '
          'print("ITEM", i, tostring(it.state)) end ')
 

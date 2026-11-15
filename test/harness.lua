@@ -109,6 +109,11 @@ DeckKit.UI = {
         print("LAYOUT " .. tostring(spec.type) .. " " .. tostring(opts.title))
         return true
     end,
+    ShowTracker = function(spec) TRACKER = { spec = spec, shown = true } end,
+    ShowCard = function(spec, opts) CARD = { spec = spec, opts = opts, shown = true } end,
+    HideCard = function() if CARD then CARD.shown = false end end,
+    HideTracker = function() if TRACKER then TRACKER.shown = false end end,
+    TrackerShown = function() return TRACKER ~= nil and TRACKER.shown end,
     HideLayout = function()
         if LAYOUT and LAYOUT.shown then
             LAYOUT.shown = false

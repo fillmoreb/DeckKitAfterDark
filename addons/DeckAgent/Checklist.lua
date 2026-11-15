@@ -9,8 +9,8 @@
 --               only kind 0, manual, keeps it), label (length uint8 + UTF-8)
 -- reply body:   byte 3 count, then one byte per item: 1 done now, 0 not
 --
--- The panel sits at the top left in the quest tracker's look (DeckAgent's card moves to its right
--- while it's up). It takes no buttons. A newly done item ticks with the quest-complete sound; once
+-- It shows in DeckKit's tracker (UI.ShowTracker: top left, the quest tracker's marks; DeckAgent's card
+-- moves to its right while it's up). It takes no buttons. A newly done item ticks with the quest-complete sound; once
 -- all are done it fades out after a minute. It survives a reload (DeckAgentDB.checklist). Cleared by
 -- the assistant, the DeckKit menu (Tools > DeckAgent) or a grip chord ("Clear Decky's checklist").
 local _, ns = ...
@@ -23,7 +23,6 @@ local SET, CLEAR = 1, 2
 local MAX_ITEMS = 12
 local DONE_FADE = 60 -- seconds the finished list stays up
 local TICK_SOUND = 878 -- SOUNDKIT.IG_QUEST_LIST_COMPLETE
-local TODO, CHECK = "|A:checkbox-minimal:14:14|a", "|A:Tracker-Check:14:14|a"
 
 DeckAgentDB = DeckAgentDB or {}
 local Checklist = {}
@@ -37,83 +36,49 @@ local function Check(item, list)
 end
 
 ------------------------------------------------------------------------
--- The panel
+-- The panel: DeckKit's tracker (DeckKit/Displays.lua, UI.ShowTracker), one row per item: a check in
+-- the quest tracker's marks and the label, done ones grayed. DeckAgent keeps the items' state and the
+-- fade itself (XP and manual items are its own), so the tracker gets fixed checks and no fade.
 ------------------------------------------------------------------------
 
-local panel, rows, fadeTimer = nil, {}, nil
+local fadeTimer
 
-local function Build()
-    local UI = DeckKit.UI
-    local font = UI and UI.Font or {}
-    panel = CreateFrame("Frame", "DeckAgentChecklist", UIParent)
-    panel:SetSize(300, 60)
-    panel:SetPoint("TOPLEFT", 24, -70)
-    panel:SetFrameStrata("MEDIUM")
-    panel:Hide()
-    local bg = panel:CreateTexture(nil, "BACKGROUND", nil, -8)
-    bg:SetAllPoints()
-    bg:SetColorTexture(0, 0, 0, 0.45)
-    panel.title = panel:CreateFontString(nil, "OVERLAY")
-    panel.title:SetFontObject(font.heading or GameFontNormal)
-    panel.title:SetPoint("TOPLEFT", 10, -8)
-    panel.title:SetPoint("RIGHT", panel, "RIGHT", -10, 0)
-    panel.title:SetJustifyH("LEFT")
-    for i = 1, MAX_ITEMS do
-        local fs = panel:CreateFontString(nil, "OVERLAY")
-        fs:SetFontObject(font.body or GameFontHighlight)
-        fs:SetJustifyH("LEFT")
-        fs:SetWordWrap(true)
-        rows[i] = fs
+local function Spec(list)
+    local items = {}
+    for i, item in ipairs(list.items) do
+        items[i] = { type = "row", items = {
+            { type = "check", done = item.state and true or false },
+            { type = "text", text = Clean(item.label or "") } } }
     end
+    return { type = "list", title = Clean(list.title or ""), items = items }
 end
 
-local function Draw(list, flash)
-    if not panel then Build() end
-    local done, y = 0, -30
-    panel.title:SetText(Clean(list.title or ""))
-    for i, fs in ipairs(rows) do
-        local item = list.items[i]
-        fs:ClearAllPoints()
-        if item then
-            fs:SetPoint("TOPLEFT", 12, y)
-            fs:SetPoint("RIGHT", panel, "RIGHT", -10, 0)
-            local label = Clean(item.label or "")
-            fs:SetText(item.state and (CHECK .. " |cff9d9d9d" .. label .. "|r") or (TODO .. " " .. label))
-            fs:SetAlpha(flash and flash[i] and 0.35 or 1)
-            if flash and flash[i] and UIFrameFadeIn then UIFrameFadeIn(fs, 0.6, 0.35, 1) end
-            fs:Show()
-            y = y - (fs:GetStringHeight() or 16) - 4
-            if item.state then done = done + 1 end
-        else
-            fs:Hide()
-        end
-    end
-    panel:SetHeight(-y + 8)
-    panel:Show()
-    if ns.Card and ns.Card.Reanchor then ns.Card.Reanchor() end
+local function Draw(list)
+    DeckKit.UI.ShowTracker(Spec(list), { fade = false })
+    local done = 0
+    for _, item in ipairs(list.items) do if item.state then done = done + 1 end end
     return done == #list.items
 end
 
-function Checklist.Anchor() return panel and panel:IsShown() and panel or nil end
+function Checklist.Anchor() return DeckKit.UI.TrackerShown() and DeckKitTracker or nil end
 
 function Checklist.Clear()
     DeckAgentDB.checklist = nil
     if fadeTimer then fadeTimer:Cancel(); fadeTimer = nil end
-    if panel then panel:Hide() end
-    if ns.Card and ns.Card.Reanchor then ns.Card.Reanchor() end
+    DeckKit.UI.HideTracker()
 end
 
--- Re-checks every item; ticks the newly done ones (sound, a short fade in).
+-- Re-checks every item; a newly done one ticks with the quest-complete sound.
 function Checklist.Update(quiet)
     local list = DeckAgentDB.checklist
     if not list then return end
-    local flash, any = {}, false
-    for i, item in ipairs(list.items) do
+    local any = false
+    for _, item in ipairs(list.items) do
         local now = Check(item, list) and true or false
-        if now and not item.state then flash[i], any = true, true end
+        if now and not item.state then any = true end
         item.state = now
     end
-    local all = Draw(list, (not quiet) and flash or nil)
+    local all = Draw(list)
     if any and not quiet then PlaySound(TICK_SOUND, "SFX") end
     if all and not fadeTimer then
         fadeTimer = C_Timer.NewTimer(DONE_FADE, function()

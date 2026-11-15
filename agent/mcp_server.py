@@ -53,8 +53,8 @@ PROTOCOL = "2025-06-18"
 
 # A layout node (addons/DeckKit/Layout.lua's header has the full vocabulary), nested a few levels deep
 # explicitly rather than by $ref.
-LAYOUT_TYPES = ["list", "section", "row", "text", "heading", "item", "quest", "check", "progress", "waypoint",
-                "icon", "button", "space"]
+LAYOUT_TYPES = ["list", "section", "row", "pages", "text", "heading", "item", "quest", "spell", "npc", "money",
+                "check", "progress", "waypoint", "icon", "button", "space"]
 
 
 def _layout_node(depth):
@@ -311,12 +311,14 @@ TOOLS = [
                     "looking at and acting on with the pad, richer than respond's displays. Real IDs make "
                     "real pieces: the game fills in names, icons, quality colors, tooltips and live state.\n"
                     "Containers (with `items`): list (one under another), section (`title` heading, then "
-                    "items), row (side by side on one line).\n"
+                    "items), row (side by side on one line), pages (the window's tabs, LB/RB between: each "
+                    "item a list with a `title`, for more than fits one screen).\n"
                     "Pieces: text (`text`, `style`: body/dim/small/heading/good/bad/gold), heading (`text`), "
                     "item (`id`, `count`), quest (`id`, `text` = its name), check (`bind`: ticks itself from "
                     "the game; or `toggle`: true for one Ben ticks), progress (`bind` an item count, `text`), "
                     "waypoint (`map`, `x`, `y` 0-100, `label`: A sets it as his waypoint, holding Y shows "
-                    "the map), button (`text`, `buttons`: {\"a\": {\"reply\": \"value\", \"label\": "
+                    "the map), npc (`name`, `title`, and `map`/`x`/`y` when you know where: then it's a "
+                    "waypoint too), spell (`id`), money (`copper`, `text`), button (`text`, `buttons`: {\"a\": {\"reply\": \"value\", \"label\": "
                     "\"Pick\"}}), space (`width`; none: pushes the rest of a row right).\n"
                     "bind: {quest, state: taken/ready/done} | {quest, objective} | {item, count} | {level} | "
                     "{zone}.\n"
@@ -324,7 +326,7 @@ TOOLS = [
                     "reply buttons there), `title` (the tab label), `id` (a short name: Ben's own ticks are "
                     "kept per id) and `width` (360-900, default 560).\n"
                     "Typical: a list of rows [item, check bound to {item, count}] for a shopping list; "
-                    "rows [quest, check bound to the quest] for quests to pick up; waypoints for places; "
+                    "a section per quest (no title: the quest row names it) holding its row [quest, check bound to the quest] and its giver's waypoint, for quests to pick up; waypoints for places; "
                     "reply buttons when you need him to pick (then wait: seconds to wait for it, and you "
                     "get answer: the reply's value, or null if he closed it). After showing one, respond "
                     "with display none and say it's on screen. Keep it to what fits one screen.",
