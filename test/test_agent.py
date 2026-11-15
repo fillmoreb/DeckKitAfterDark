@@ -1049,12 +1049,15 @@ class Asking(unittest.TestCase):
             def recv(self, timeout):
                 self.t += 1.0
                 return self.queue.pop(0) if self.queue else None
+
+            def keepalive(self):
+                self.kept += 1
         lk = FakeLink()
+        lk.kept = 0
         out = host.ask(lk, "Which?", ["Ednalyn", "Ednabelle"], clock=lk.clock)
         self.assertEqual(out, {"ok": True, "shown": "shown", "choice": 2, "answer": "Ednabelle"})
-        pings = [p for ch, p in lk.sent if ch == 0]
-        self.assertGreaterEqual(len(pings), 2)
-        self.assertTrue(all(p == bytes([codec.OP_PING]) for p in pings))
+        self.assertGreaterEqual(lk.kept, 2)
+        self.assertEqual([ch for ch, _ in lk.sent], [3])  # nothing else went out on its own
 
 
 class Dismissing(unittest.TestCase):

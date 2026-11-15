@@ -26,7 +26,7 @@ reader costs ~16% of a core while it runs (AddonTools lab E7), so it's stopped t
 """
 import argparse, json, os, select, socket, socketserver, sys, threading, time
 
-from . import agent, dictation, hooks, keys, link, strip
+from . import agent, dictation, hooks, link
 
 GLANCE_S = 1.0  # seconds between glances at the strip while game hooks are set
 
@@ -75,11 +75,11 @@ class Keeper:
     def _grabber(self):
         """The one screen reader (two at once garble each other's colors): the link's, and the glances'."""
         if self.grabber is None:
-            self.grabber = strip.Grabber()
+            self.grabber = link.screen()
         return self.grabber
 
     def _real_link(self):
-        return link.Link(sender=keys.Keys(), reader=self._grabber().frame)
+        return link.Link(reader=self._grabber().frame)
 
     def _ensure(self):
         if self.lk is None:
@@ -167,7 +167,7 @@ class Keeper:
                 if "quiet" in reply:  # remembered for the voice: speak answers or only show them
                     self.quiet = reply["quiet"]
                 return reply
-            except (link.LinkError, keys.SendError, strip.NoStrip, agent.Malformed, KeyError, ValueError) as e:
+            except (link.LinkError, agent.Malformed, KeyError, ValueError) as e:
                 # A link that failed mid-request may be in any state: start clean next time.
                 self._drop()
                 return {"ok": False, "error": str(e) or e.__class__.__name__}
@@ -240,7 +240,7 @@ class Keeper:
                     self.hooks.clear()
                 return {"ok": True}
             return {"ok": False, "error": "hook op is add, list, remove or clear"}
-        except (link.LinkError, keys.SendError, strip.NoStrip, agent.Malformed, KeyError, ValueError) as e:
+        except (link.LinkError, agent.Malformed, KeyError, ValueError) as e:
             with self.lock:
                 self._drop()
             return {"ok": False, "error": str(e) or e.__class__.__name__}
@@ -270,12 +270,12 @@ class Keeper:
         try:
             with self.lock:
                 status = self.lk.read() if self.lk is not None else self._grabber().glance()
-                if status is None or not status.flags & strip.FLAG_ATTENTION:
+                if not link.attention(status):
                     return fired
                 self._collect_events()
                 fired.extend(self.collected)
                 self.collected = []
-        except (link.LinkError, keys.SendError, strip.NoStrip, agent.Malformed, OSError) as e:
+        except (link.LinkError, agent.Malformed, OSError) as e:
             print("hooks: glance failed: %s" % e, flush=True)
             with self.lock:
                 self._drop()
@@ -426,7 +426,7 @@ def main(argv=None):
     keeper = Keeper(a.idle)
     # A dictation state is a 64-bit frame: sent in one burst it costs the game ~20 ms (lab E6: ~0.34 ms
     # per bit), less than a frame, and arrives ~0.1 s sooner than paced taps.
-    keeper.dictation_keys = keys.Keys("xdotool", gap_ms=0)
+    keeper.dictation_keys = link.keys_sender("xdotool", gap_ms=0)
     if a.voice:
         from . import voice
         keeper.voice = voice.Voice(game=keeper)

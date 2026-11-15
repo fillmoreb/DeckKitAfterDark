@@ -3,9 +3,15 @@
     with Link() as link:              # opens: hello by keys until the strip shows up
         link.send(7, b"hello addon")  # blocks until the strip shows the game got it; resends if not
         ch, payload = link.recv(5)    # waits for the game's next frame and acks it; None on timeout
+    post(1, seq, payload)             # fire and forget (telemetry, dictation): keys only, no strip, no ack
 
 Sending waits while the game isn't ready (a text box has focus: keys would go there, E5/E6).
 Channel 0 is the link's own (codec.OP_*); addons use 1-255.
+
+This module is the one place that knows how frames travel (keys, paste, the strip). Everything above it
+(agent.py, agentd.py, telemetry.py, dictation.py) sends and receives channel + bytes, and sees one error,
+LinkError, whatever failed underneath. A new way in or out of the game (docs/blizzard-channel.md) goes in
+here and nowhere else.
 """
 import base64, os, time
 
@@ -88,12 +94,48 @@ ARRIVE_S = 0.8
 
 
 class LinkError(Exception):
-    pass
+    """Anything that went wrong moving a frame: no key tool, no screen stream, no answer in time."""
+
+
+def _tap(sender, bits):
+    try:
+        sender.send(bits)
+    except keys.SendError as e:
+        raise LinkError(str(e)) from e
+
+
+def keys_sender(tool=None, **kw):
+    """A key sender (keys.Keys), with a missing tool as a LinkError."""
+    try:
+        return keys.Keys(tool, **kw)
+    except keys.SendError as e:
+        raise LinkError(str(e)) from e
+
+
+def screen():
+    """The screen reader the strip is read through (strip.Grabber; one at a time, as two garble each
+    other's colors), with no stream as a LinkError."""
+    try:
+        return strip.Grabber()
+    except strip.NoStrip as e:
+        raise LinkError(str(e)) from e
+
+
+def attention(status):
+    """Does the game have something waiting (DeckLink.SetAttention)? `status`: Link.read() or a glance."""
+    return status is not None and bool(status.flags & strip.FLAG_ATTENTION)
+
+
+def post(channel, seq, payload, sender=None):
+    """Fire and forget: one frame by keys, delivered whether the link is open or not, with no ack (Link.lua).
+    For senders that say the same thing again soon anyway (telemetry, dictation states). `seq`: the
+    sender's own; the game drops a repeat of a channel's last seq for a while (DEDUP_FOR)."""
+    _tap(sender or keys_sender("xdotool"), list(codec.bits(codec.build(channel, seq, bytes(payload)))))
 
 
 class Link:
     def __init__(self, sender=None, reader=None, clock=time.monotonic, sleep=time.sleep, clipboard=None):
-        self.keys = sender or keys.Keys()
+        self.keys = sender or keys_sender()
         self._clip = clipboard  # clipboard.Clipboard, made when first needed; False: never paste
         self._reader = reader
         self.clock, self.sleep = clock, sleep
@@ -145,7 +187,7 @@ class Link:
         deadline = self.clock() + timeout
         while self.clock() < deadline:
             seq, frame = self._frame(0, bytes([codec.OP_HELLO]))
-            self.keys.send(list(codec.bits(frame)))
+            _tap(self.keys, list(codec.bits(frame)))
             try:
                 self.wait(lambda s: s.flags & strip.FLAG_OPEN and s.rx_seq == seq, 1.0, "hello")
                 return self
@@ -195,7 +237,10 @@ class Link:
                 self.send_by_keys(0, bytes([codec.OP_PASTE]))
                 try:
                     self.wait(lambda s: s.flags & strip.FLAG_FOCUS, 1.0, "the paste box to take focus")
-                    self.keys.paste()
+                    try:
+                        self.keys.paste()
+                    except keys.SendError as e:
+                        raise LinkError(str(e)) from e
                     self.wait(lambda s: s.rx_seq == seq, 2.0, "the pasted frame")
                     return seq
                 except LinkError:
@@ -216,7 +261,7 @@ class Link:
         for _ in range(tries):
             s = self.wait(lambda s: s.flags & strip.FLAG_READY, timeout, "the game to be ready (chat open?)")
             bad = s.bad
-            self.keys.send(list(codec.bits(frame)))
+            _tap(self.keys, list(codec.bits(frame)))
             try:
                 self.wait(lambda s: s.rx_seq == seq or s.bad != bad, ARRIVE_S, "the frame to arrive")
             except LinkError:
@@ -242,6 +287,10 @@ class Link:
                 return None
             self.sleep(0.02)
 
+    def keepalive(self):
+        """Any frame keeps the game's end open (Link.lua closes it OPEN_FOR after the last one)."""
+        self.send(0, bytes([codec.OP_PING]))
+
     def ping(self, payload=b"ping", timeout=5):
         """Round trip: the game echoes a ping on channel 0. Returns the seconds it took."""
         start = self.clock()
@@ -257,7 +306,7 @@ class Link:
         """Says bye and doesn't wait: the game takes the strip down as it closes, so there's no ack to see."""
         try:
             _, frame = self._frame(0, bytes([codec.OP_BYE]))
-            self.keys.send(list(codec.bits(frame)))
+            _tap(self.keys, list(codec.bits(frame)))
         except Exception:
             pass
         mark_open(0)

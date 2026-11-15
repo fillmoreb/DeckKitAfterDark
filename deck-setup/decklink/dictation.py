@@ -7,7 +7,9 @@ The payload is 2 bytes (keep in step with Dictation.lua):
 While a dictation is under way (recording until done or error) the keys are held for it (link.hold),
 so telemetry doesn't take them and the next state goes straight in.
 """
-from . import codec, keys, link
+import time
+
+from . import link
 
 CHANNEL = 2
 STATES = {"recording": 1, "transcribing": 2, "done": 3, "error": 4, "thinking": 5}
@@ -21,6 +23,4 @@ def encode(state, binding="chat"):
 def post(state, binding="chat", sender=None, seq=None):
     """Sends the state and holds or frees the keys to match."""
     link.hold(state in ("recording", "transcribing", "thinking"))
-    import time
-    seq = seq or int(time.time() * 10) % 255 + 1
-    (sender or keys.Keys("xdotool")).send(list(codec.bits(codec.build(CHANNEL, seq, encode(state, binding)))))
+    link.post(CHANNEL, seq or int(time.time() * 10) % 255 + 1, encode(state, binding), sender)

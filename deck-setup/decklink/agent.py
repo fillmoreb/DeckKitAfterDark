@@ -558,7 +558,7 @@ def _await_answer(lk, packet, options, clock=time.monotonic, cancelled=None):
                 pass  # it times out by itself in the game
             return {"ok": False, "cancelled": True, "error": "the question it was for was dropped"}
         if now >= keepalive:
-            lk.send(0, bytes([codec.OP_PING]))  # any frame keeps the game's end open
+            lk.keepalive()
             keepalive = now + KEEPALIVE_S
         got = lk.recv(min(1.0, deadline - now))
         if got is None:

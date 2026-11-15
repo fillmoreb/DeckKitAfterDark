@@ -26,7 +26,7 @@ keep the two in step). 17 bytes:
 """
 import argparse, glob, os, struct, sys, time
 
-from . import codec, keys, link
+from . import link
 
 # Telemetry waits while another program has the link open (DeckAgent's link keeper marks it every
 # second): its frame takes >1 s of taps and holds the key lock, so a question would wait behind it.
@@ -142,7 +142,7 @@ def main(argv=None):
     p.add_argument("--print", action="store_true", help="print each payload")
     p.add_argument("--tool", choices=["ydotool", "xdotool"])
     a = p.parse_args(argv)
-    sender = keys.Keys(a.tool)
+    sender = link.keys_sender(a.tool)
     cpu = CPU()
     time.sleep(0.5)  # a first CPU sample interval
     seq = int(time.time()) % 255 + 1
@@ -156,8 +156,8 @@ def main(argv=None):
         if a.print:
             print(dict(readings), payload.hex(), flush=True)
         try:
-            sender.send(list(codec.bits(codec.build(CHANNEL, seq, payload))))
-        except keys.SendError as e:
+            link.post(CHANNEL, seq, payload, sender)
+        except link.LinkError as e:
             print("decklink.telemetry: %s" % e, file=sys.stderr, flush=True)
         if a.once:
             return 0

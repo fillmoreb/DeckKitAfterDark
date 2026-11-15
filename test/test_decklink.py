@@ -3,6 +3,7 @@
     python3 -m unittest discover -s test     (needs lua5.1, or lua with LUA=...)
 """
 import base64, os, random, shutil, struct, subprocess, sys, tempfile, unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "deck-setup"))
@@ -531,6 +532,49 @@ class Host(unittest.TestCase):
         (cmd,) = k.commands([0, 1])
         self.assertEqual(cmd[-2:], ["F9", "F10"])
         self.assertEqual(len(k.commands([0] * (keys.CHUNK + 1))), 2)
+
+
+class OneBoundary(unittest.TestCase):
+    """Callers see channel + bytes and LinkError, never the keys or strip underneath."""
+
+    class Broken:
+        def send(self, bits):
+            raise keys.SendError("xdotool failed: no display")
+
+        def paste(self):
+            raise keys.SendError("xdotool failed: no display")
+
+    def test_post_is_one_frame_with_no_ack(self):
+        sent = []
+        link.post(5, 9, b"hi", type("S", (), {"send": lambda self, bits: sent.append(bits)})())
+        bits = "".join(map(str, sent[0]))
+        frame = bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits), 8))
+        self.assertEqual(codec.parse(frame), (5, 9, b"hi"))
+
+    def test_a_key_tool_failure_is_a_link_error(self):
+        with self.assertRaises(link.LinkError):
+            link.post(5, 9, b"hi", self.Broken())
+        with self.assertRaises(link.LinkError):
+            link.Link(sender=self.Broken(), reader=lambda: None, clipboard=False).open(timeout=0.1)
+        with mock.patch.object(keys, "Keys", side_effect=keys.SendError("no xdotool")):
+            with self.assertRaises(link.LinkError):
+                link.keys_sender()
+
+    def test_no_screen_stream_is_a_link_error(self):
+        with mock.patch.object(strip, "Grabber", side_effect=strip.NoStrip("Game Mode only")):
+            with self.assertRaises(link.LinkError):
+                link.screen()
+
+    def test_attention(self):
+        self.assertFalse(link.attention(None))
+        self.assertFalse(link.attention(strip.Status(strip.FLAG_OPEN, 1, 0, 0, 0, None)))
+        self.assertTrue(link.attention(strip.Status(strip.FLAG_ATTENTION, 1, 0, 0, 0, None)))
+
+    def test_keepalive_is_a_ping_on_channel_0(self):
+        lk = link.Link(sender=self.Broken(), reader=lambda: None, clipboard=False)
+        with mock.patch.object(lk, "send") as send:
+            lk.keepalive()
+        send.assert_called_once_with(0, bytes([codec.OP_PING]))
 
 
 if __name__ == "__main__":

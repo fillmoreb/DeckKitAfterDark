@@ -18,7 +18,7 @@ root, use sudo -E or run the reader side as deck.
 """
 import argparse, os, sys, time
 
-from . import agent, codec, dictation, keys, link, strip
+from . import agent, dictation, keys, link, strip
 
 
 def main(argv=None):
@@ -58,21 +58,21 @@ def main(argv=None):
                   s.rx_count, s.bad, "%d bytes" % len(s.out) if s.out else "-"))
             return 0
         if a.cmd == "dictation":
-            dictation.post(a.state, a.binding, sender=keys.Keys(a.tool, gap_ms=a.gap))
+            dictation.post(a.state, a.binding, sender=link.keys_sender(a.tool, gap_ms=a.gap))
             return 0
         if a.cmd == "post":
             if not 1 <= a.channel <= 255:
                 p.error("channel is 1-255")
             data = a.text.encode() if a.text is not None else sys.stdin.buffer.read()
             seq = int(time.time() * 10) % 255 + 1
-            keys.Keys(a.tool, gap_ms=a.gap).send(list(codec.bits(codec.build(a.channel, seq, data))))
+            link.post(a.channel, seq, data, link.keys_sender(a.tool, gap_ms=a.gap))
             return 0
         if a.cmd == "agent":
             served = agent.via_service(a.args)  # the link keeper has the link already, if it's running
             if served is not None:
                 print(served[1])
                 return served[0]
-        with link.Link(sender=keys.Keys(a.tool, gap_ms=a.gap)) as lk:
+        with link.Link(sender=link.keys_sender(a.tool, gap_ms=a.gap)) as lk:
             if a.cmd == "ping":
                 print("round trip %.0f ms (%d bytes each way)" % (lk.ping(os.urandom(a.size)) * 1000, a.size))
             elif a.cmd == "send":
@@ -96,7 +96,7 @@ def main(argv=None):
                     print("%d\t%s" % (got[0], got[1].decode("utf-8", "replace")), flush=True)
                     n += 1
         return 0
-    except (link.LinkError, keys.SendError, strip.NoStrip) as e:
+    except link.LinkError as e:
         print("decklink: %s" % e, file=sys.stderr)
         return 1
 
