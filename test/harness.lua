@@ -69,6 +69,7 @@ local focused = nil
 GetCurrentKeyBoardFocus = function() return focused or FOCUSED end
 local inCombat = false
 InCombatLockdown = function() return inCombat end
+UnitAffectingCombat = function() return inCombat end
 local bindings = {}
 SetOverrideBindingClick = function(_, _, key, button, mouse) bindings[key] = { button, mouse } end
 local errors = {}
@@ -89,6 +90,32 @@ end
 DeckKit.Dictation = { SetState = function(state, binding) print("DICTATION " .. state .. " " .. tostring(binding)) end,
     Claim = function() print("DICTATION claimed") end }
 local function fire(event, ...) for _, fn in ipairs(events[event] or {}) do fn(...) end end
+
+-- DeckKit's own Conditions and JSON, the real files (DeckAgent's conditions and layouts are DeckKit's):
+-- from the DeckKit repo beside this one, or DECKKIT_DIR.
+local DECKKIT = os.getenv("DECKKIT_DIR") or (DIR .. "/../../DeckKit/addons/DeckKit/")
+local coreNS = { On = function(event, fn) events[event] = events[event] or {}; table.insert(events[event], fn) end }
+for _, file in ipairs({ "Conditions.lua", "JSON.lua" }) do
+    assert(loadfile(DECKKIT .. file), "DeckKit's " .. file .. " (set DECKKIT_DIR to the DeckKit addon folder)")("DeckKit", coreNS)
+end
+DeckKit.Conditions, DeckKit.JSON = coreNS.Conditions, coreNS.JSON
+-- DeckKit's layout window, as far as DeckAgent sees it: LAYOUT is the one up (scenarios call its
+-- opts.onReply(n) for a reply button, DeckKit.UI.HideLayout() for B).
+DeckKit.UI = {
+    ShowLayout = function(spec, opts)
+        local old = LAYOUT
+        LAYOUT = { spec = spec, opts = opts, shown = true }
+        if old and old.shown and old.opts.onClose then old.shown = false; old.opts.onClose("replaced") end
+        print("LAYOUT " .. tostring(spec.type) .. " " .. tostring(opts.title))
+        return true
+    end,
+    HideLayout = function()
+        if LAYOUT and LAYOUT.shown then
+            LAYOUT.shown = false
+            if LAYOUT.opts.onClose then LAYOUT.opts.onClose("closed") end
+        end
+    end,
+}
 
 local ns = {}
 for line in io.lines(ADDON .. "DeckLink.toc") do

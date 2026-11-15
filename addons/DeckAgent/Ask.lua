@@ -29,6 +29,12 @@ local SHOWN, QUEUED = 1, 2
 local NO_ANSWER = 255
 local lastSeq, lastSpec -- the latest ASK: its frame's seq and its prompt, for DISMISS
 
+-- ANSWER for the request frame `seq` (a prompt here, or a layout's reply in Show.lua).
+function ns.SendAnswer(seq, choice)
+    local answer = U8(ns.VERSION * 64 + OP_ANSWER) .. U8(seq or 0) .. U8(S.OK) .. U8(choice)
+    if not DeckLink.Send(ns.CHANNEL, answer) then ns.Debug("agent", "answer not sent (link closed)") end
+end
+
 ns.OPS[OP_ASK] = function(p, seq)
     local flags, seconds = p:byte(2), p:byte(3)
     if not (flags and seconds) then return S.BAD_ARGS, Str("ASK needs flags and seconds") end
@@ -43,10 +49,7 @@ ns.OPS[OP_ASK] = function(p, seq)
         if not opt or opt == "" then return S.BAD_ARGS, Str("option " .. n .. " is missing") end
         options[n] = (opt:gsub("[%c|]", " "))
     end
-    local function Reply(choice)
-        local answer = U8(ns.VERSION * 64 + OP_ANSWER) .. U8(seq or 0) .. U8(S.OK) .. U8(choice)
-        if not DeckLink.Send(ns.CHANNEL, answer) then ns.Debug("agent", "answer not sent (link closed)") end
-    end
+    local function Reply(choice) ns.SendAnswer(seq, choice) end
     local spec = {
         title = "Decky asks", -- the assistant's name (agent/SYSTEM.md)
         text = (question:gsub("[%c|]", " ")),

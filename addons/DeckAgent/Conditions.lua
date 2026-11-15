@@ -55,29 +55,22 @@ function Cond.Read(p, i)
     return kind, a, b, i
 end
 
-local turnedIn = {} -- quest IDs turned in this session (IsQuestFlaggedCompleted can lag behind)
-
-local function Done(q)
-    return turnedIn[q] or (C_QuestLog.IsQuestFlaggedCompleted and C_QuestLog.IsQuestFlaggedCompleted(q)) or false
-end
-local function OnQuest(q) return C_QuestLog.IsOnQuest and C_QuestLog.IsOnQuest(q) or false end
-
-local function InZone(target)
-    local m = C_Map.GetBestMapForUnit("player")
-    if not m or m == 0 then return nil end -- can't tell (a loading screen)
-    for _ = 1, 8 do
-        if not m or m == 0 then return false end
-        if m == target then return true end
-        local info = C_Map.GetMapInfo(m)
-        m = info and info.parentMapID
-    end
-    return false
+-- The checks themselves are DeckKit's (DeckKit.Conditions, which DeckKit's layouts use too); only XP
+-- gained since a point is DeckAgent's own (it keeps the running total, below).
+local Core = DeckKit.Conditions
+local function CoreCond(kind, a, b)
+    if kind == TAKEN then return { quest = a } end
+    if kind == READY then return { quest = a, state = "ready" } end
+    if kind == TURNED_IN then return { quest = a, state = "done" } end
+    if kind == OBJECTIVE then return { quest = a, objective = b } end
+    if kind == ITEMS then return { item = a, count = b } end
+    if kind == LEVEL then return { level = a } end
+    if kind == ZONE then return { zone = a } end
 end
 
 function Cond.XP() return DeckAgentDB.xpTotal or 0 end
 
 local Plain
-
 function Cond.Check(kind, a, b, base)
     if kind >= NOT then
         local v = Plain(kind - NOT, a, b, base)
@@ -87,49 +80,18 @@ function Cond.Check(kind, a, b, base)
     return Plain(kind, a, b, base) or false
 end
 
+-- true / false, or nil when the game can't tell (a loading screen's no map, for zones)
 function Plain(kind, a, b, base)
-    if kind == TAKEN then return OnQuest(a) or Done(a) end
-    if kind == READY then return Done(a) or (OnQuest(a) and C_QuestLog.IsComplete(a)) or false end
-    if kind == TURNED_IN then return Done(a) end
-    if kind == OBJECTIVE then
-        if Done(a) or (OnQuest(a) and C_QuestLog.IsComplete(a)) then return true end
-        local goals = OnQuest(a) and C_QuestLog.GetQuestObjectives(a)
-        return goals and goals[b] and goals[b].finished or false
-    end
-    if kind == ITEMS then return (C_Item.GetItemCount(a) or 0) >= b end
-    if kind == LEVEL then return (UnitLevel("player") or 0) >= a end
-    if kind == ZONE then return InZone(a) end
     if kind == XP then return Cond.XP() - (base or 0) >= a end
-    return false
+    local c = CoreCond(kind, a, b)
+    if not c then return false end
+    return Core.Check(c)
 end
 
--- Watching: game events coalesce into one round of callbacks a moment later (bags and the quest log
--- fire in bursts).
-local listeners, pending = {}, false
-
-function Cond.OnChange(fn) listeners[#listeners + 1] = fn end
-
-local function Soon()
-    if pending then return end
-    pending = true
-    C_Timer.NewTimer(0.25, function()
-        pending = false
-        for _, fn in ipairs(listeners) do
-            local ok, err = pcall(fn)
-            if not ok then geterrorhandler()(err) end
-        end
-    end)
-end
+-- Watching: DeckKit's (game events coalesced into one round of callbacks a moment later), plus XP below.
+Cond.OnChange = Core.OnChange
+local Soon = Core.Soon
 Cond.Soon = Soon
-
-for _, e in ipairs({ "QUEST_ACCEPTED", "QUEST_REMOVED", "QUEST_LOG_UPDATE", "UNIT_QUEST_LOG_CHANGED",
-    "BAG_UPDATE_DELAYED", "PLAYER_LEVEL_UP", "ZONE_CHANGED", "ZONE_CHANGED_NEW_AREA", "ZONE_CHANGED_INDOORS" }) do
-    ns.On(e, Soon)
-end
-ns.On("QUEST_TURNED_IN", function(questID)
-    if questID then turnedIn[questID] = true end
-    Soon()
-end)
 
 -- XP: a running total across level-ups, kept in DeckAgentDB.
 local lastXP, lastMax

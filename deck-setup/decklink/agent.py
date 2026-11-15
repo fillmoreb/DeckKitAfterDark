@@ -24,6 +24,8 @@ link keeper alike. agent/mcp_server.py is the usual caller.
                                          the game and wait for his answer (2 options: a dialog)
     decklink agent show KIND [--seconds N] [--item ID] TITLE TEXT   show something: KIND echo (TITLE
                                          the question, TEXT the answer, into chat), card, or reading
+    decklink agent layout [--wait SECONDS] JSON   a DeckKit layout in its own window (addons/DeckKit/Layout.lua);
+                                         with --wait and reply buttons, waits for Ben's pick: {"answer": its value}
     decklink agent quests                the quest log: IDs, complete/failed, objective counts (no text)
     decklink agent quest-status ID ...   each quest's status: not taken, in the log, ready, done
 
@@ -62,12 +64,13 @@ INVTYPES = {0: None, 1: "head", 2: "neck", 3: "shoulder", 4: "shirt", 5: "chest"
             23: "held in off hand", 24: "ammo", 25: "thrown", 26: "ranged (gun/crossbow/wand)", 27: "quiver",
             28: "relic"}
 QUALITIES = {0: "poor", 1: "common", 2: "uncommon", 3: "rare", 4: "epic", 5: "legendary", 6: "artifact"}
-SHOW_KINDS = ["echo", "card", "reading"]  # SHOW byte 1 = index + 1
+SHOW_KINDS = ["echo", "card", "reading", "layout"]  # SHOW byte 1 = index + 1
 SHOW_RESULT = {1: "shown", 2: "queued"}
 QUEST_STATUS = {0: "not taken", 1: "in log", 2: "ready to turn in", 3: "done"}
 GOAL_KINDS = {1: "monster", 2: "item", 3: "object", 4: "event", 5: "reputation", 6: "other"}
 # Longest text per kind, in UTF-8 bytes. A reading view is one frame (codec.MAX_IN) whatever the title.
-SHOW_TEXT = {"echo": 1000, "card": 600, "reading": codec.MAX_IN - 9 - 255}
+SHOW_TEXT = {"echo": 1000, "card": 600, "reading": codec.MAX_IN - 9 - 255, "layout": codec.MAX_IN - 9 - 255}
+LAYOUT_WAIT_MAX = 300  # seconds a layout may wait for Ben's reply
 STATUS = {0: "ok", 1: "unknown op", 2: "bad arguments", 3: "refused", 4: "failed in the game", 5: "unknown version"}
 VIA = {1: "waypad", 2: "mappin"}
 FACTION = {0: None, 1: "A", 2: "H"}
@@ -176,6 +179,40 @@ def build_show(kind, title, text, seconds=None, item=0):
     seconds = max(0, min(255, int(seconds)))
     return (bytes([op_byte(OP_SHOW), SHOW_KINDS.index(kind) + 1, seconds]) + struct.pack(">I", int(item))
             + bytes([len(t)]) + t + struct.pack(">H", len(body)) + body)
+
+
+def layout_packet(spec, wait=0):
+    """SHOW kind layout: a DeckKit layout (addons/DeckKit/Layout.lua's header has the node types) as
+    compact JSON. Each reply value in it (a piece's buttons: {"a": {"reply": value}}) goes as its number,
+    1-n, and the values come back in order, to turn Ben's answer into the value again. wait: seconds the
+    game is told someone waits for that answer (0 when there's nothing to reply with)."""
+    if not isinstance(spec, dict) or not isinstance(spec.get("type"), str):
+        raise ValueError("a layout is a node: an object with a type")
+    replies = []
+
+    def walk(node):
+        if isinstance(node, list):
+            return [walk(x) for x in node]
+        if not isinstance(node, dict):
+            return node
+        out = {}
+        for k, v in node.items():
+            if k == "buttons" and isinstance(v, dict):
+                out[k] = {}
+                for key, act in v.items():
+                    if isinstance(act, dict) and "reply" in act:
+                        replies.append(act["reply"])
+                        act = dict(act, reply=len(replies))
+                    out[k][key] = act
+            else:
+                out[k] = walk(v)
+        return out
+
+    text = json.dumps(walk(spec), separators=(",", ":"), ensure_ascii=False)
+    if len(replies) > 250:
+        raise ValueError("more than 250 reply buttons")
+    wait = max(0, min(LAYOUT_WAIT_MAX, int(wait or 0))) if replies else 0
+    return build_show("layout", "", text, seconds=wait), replies
 
 
 # CHECKLIST item kinds: name -> (kind byte, the item fields packed after it, struct format).
@@ -567,7 +604,7 @@ def _await_answer(lk, packet, options, clock=time.monotonic, cancelled=None):
         if channel != CHANNEL or len(payload) < 3 or payload[1] != seq:
             continue
         reply = parse_reply(payload)
-        if reply["op"] == OP_ASK:
+        if reply["op"] in (OP_ASK, OP_SHOW):  # the request's own reply (a prompt, or a layout with replies)
             if not reply["ok"]:
                 return reply
             shown = reply["result"]
@@ -596,6 +633,11 @@ class Prepared:
         self._finish = finish or parse_reply
         self._options = answer_options  # a prompt: wait for Ben's answer, not just the reply
 
+    @property
+    def waits(self):
+        """Does it wait for Ben (a prompt, a layout with replies)? Then that time isn't the model's."""
+        return self._options is not None
+
     def run(self, lk, cancelled=None):
         """`cancelled`: a prompt's wait ends (and the prompt goes) once it's true."""
         if self._options is not None:
@@ -620,7 +662,7 @@ BUILDERS = {
     "show": lambda r: build_show(r["kind"], r.get("title", ""), r.get("text", ""), r.get("seconds"),
                                  r.get("item", 0)),
 }
-COMMANDS = set(BUILDERS) | {"state", "quest-status", "prompt"}
+COMMANDS = set(BUILDERS) | {"state", "quest-status", "prompt", "layout"}
 
 
 def prepare(req):
@@ -645,11 +687,26 @@ def prepare(req):
         options = list(req["options"])
         return Prepared(cmd, build_ask(req["question"], options, req.get("list", False), req.get("seconds", 30)),
                         answer_options=options)
+    if cmd == "layout":
+        packet, replies = layout_packet(req["spec"], req.get("wait", 0))
+        if packet[2] and replies:  # waiting: the answer turns back into its reply value
+            return Prepared(cmd, packet, answer_options=replies)
+        return Prepared(cmd, packet)
     if cmd == "hook":
         raise ValueError("hooks go through the link keeper (the decklink-agent service), which keeps their notes")
     if cmd not in BUILDERS:
         raise ValueError("unknown cmd %r" % cmd)
     return Prepared(cmd, BUILDERS[cmd](req))
+
+
+def service_wait(req):
+    """Seconds a request may take beyond the usual, waiting for Ben: a prompt's own seconds, a layout's
+    wait, plus what PROMPT_EXTRA_S allows for the reply and a fight in between."""
+    if req["cmd"] == "prompt":
+        return int(req.get("seconds", 30)) + 150
+    if req["cmd"] == "layout" and req.get("wait"):
+        return min(LAYOUT_WAIT_MAX, int(req["wait"])) + 150
+    return 0
 
 
 def via_service(argv):
@@ -663,7 +720,7 @@ def via_service(argv):
     req = _request_for(argv)
     if req is None:
         return None
-    wait = 30 + (int(req.get("seconds", 30)) + 150 if req["cmd"] == "prompt" else 0)
+    wait = 30 + service_wait(req)
     try:
         reply = agentd.ask(req, timeout=wait)
     except agentd.NotRunning:
@@ -734,6 +791,15 @@ def _request_for(argv):
         return {"cmd": "quests"}
     if argv[0] == "quest-status" and len(argv) > 1:
         return {"cmd": "quest-status", "ids": [int(a) for a in argv[1:]]}
+    if argv[0] == "layout" and len(argv) >= 2:
+        req, rest = {"cmd": "layout"}, list(argv[1:])
+        if rest[0] == "--wait" and len(rest) > 2:
+            rest.pop(0)
+            req["wait"] = int(rest.pop(0))
+        if len(rest) != 1:
+            return None
+        req["spec"] = json.loads(rest[0])
+        return req
     if argv[0] == "show" and len(argv) >= 2:
         req, rest = {"cmd": "show", "kind": argv[1]}, list(argv[2:])
         while rest and rest[0] in ("--seconds", "--item") and len(rest) > 1:

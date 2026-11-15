@@ -20,13 +20,20 @@
 --               takes those buttons only, never the sticks. In combat it waits for the fight to end.
 --   Both: "# " starts a heading, "- " a bullet, "[ ] " a checklist item to do, "[x] " one done (a
 --   check, the line grayed). The checks are the quest tracker's own.
+--   layout      (kind 4) text is a DeckKit layout as JSON (DeckKit/Layout.lua's header has the node types),
+--               shown in DeckKit's layout window, titled Decky. The host swaps reply values for numbers
+--               1-n; a reply sends ANSWER (Ask.lua's op 6) with this frame's seq and that number and
+--               closes the window, B closing it sends 0, a newer display replacing it 255. byte 2
+--               (seconds) > 0: the host is waiting for that answer. The title isn't used (the layout has
+--               its own). Your own ticks are kept per layout `id` (DeckAgentDB.layoutTicks). In combat it
+--               waits for the fight to end, and one closed by a fight comes back after it.
 -- A new card replaces the one up, a new reading view the one up.
 local _, ns = ...
 
 local B, S = ns.Bytes, ns.Status
 local U8, Str, ReadU16, ReadU32 = B.U8, B.Str, B.ReadU16, B.ReadU32
 local OP_SHOW = 7
-local ECHO, CARD, READING = 1, 2, 3
+local ECHO, CARD, READING, LAYOUT = 1, 2, 3, 4
 local SHOWN, QUEUED = 1, 2
 local DECKY = "|cffe8b04bDecky:|r " -- the assistant's name (agent/SYSTEM.md), in DeckAgent's color
 
@@ -309,10 +316,73 @@ ns.On("PLAYER_REGEN_ENABLED", function()
 end)
 
 ------------------------------------------------------------------------
+-- Layout
+------------------------------------------------------------------------
+
+local layoutQueued -- { spec, seq, waits }: shows when the fight ends
+local TICKS_KEPT = 20
+
+local function TicksFor(spec)
+    DeckAgentDB.layoutTicks = DeckAgentDB.layoutTicks or {}
+    local all, key = DeckAgentDB.layoutTicks, tostring(spec.id or spec.title or "layout")
+    if not all[key] then
+        local n = 0
+        for _ in pairs(all) do n = n + 1 end
+        if n >= TICKS_KEPT then all[next(all)] = nil end -- an old one makes room
+        all[key] = {}
+    end
+    return all[key]
+end
+
+local function OpenLayout(q)
+    local answered = false
+    local function Answer(choice)
+        if answered then return end
+        answered = true
+        if q.waits then ns.SendAnswer(q.seq, choice) end
+    end
+    return DeckKit.UI.ShowLayout(q.spec, {
+        title = "Decky", ticks = TicksFor(q.spec),
+        onReply = function(v)
+            Answer(tonumber(v) or 0)
+            DeckKit.UI.HideLayout()
+        end,
+        onClose = function(why)
+            if why == "closed" and (InCombatLockdown() or UnitAffectingCombat("player")) then
+                layoutQueued = q -- a fight took it down: back after the fight, still waiting
+                return
+            end
+            Answer(why == "replaced" and 255 or 0)
+        end,
+    })
+end
+
+local function ShowLayout(spec, seq, waits)
+    local q = { spec = spec, seq = seq, waits = waits }
+    local old = layoutQueued
+    if old and old.waits then ns.SendAnswer(old.seq, 255) end -- replaced before it could show
+    layoutQueued = nil
+    if InCombatLockdown() then
+        layoutQueued = q
+        return QUEUED
+    end
+    OpenLayout(q)
+    return SHOWN
+end
+
+ns.On("PLAYER_REGEN_ENABLED", function()
+    if layoutQueued then
+        local q = layoutQueued
+        layoutQueued = nil
+        OpenLayout(q)
+    end
+end)
+
+------------------------------------------------------------------------
 -- The op
 ------------------------------------------------------------------------
 
-ns.OPS[OP_SHOW] = function(p)
+ns.OPS[OP_SHOW] = function(p, seq)
     local kind, seconds = p:byte(2), p:byte(3)
     if not (kind and seconds) or #p < 8 then return S.BAD_ARGS, Str("SHOW needs kind, seconds and icon") end
     local itemID = ReadU32(p, 4)
@@ -332,6 +402,12 @@ ns.OPS[OP_SHOW] = function(p)
     elseif kind == READING then
         if text == "" then return S.BAD_ARGS, Str("nothing to read") end
         result = ShowReader(title, text)
+    elseif kind == LAYOUT then
+        local spec, why = DeckKit.JSON.Decode(text)
+        if type(spec) ~= "table" or type(spec.type) ~= "string" then
+            return S.BAD_ARGS, Str("layout: " .. (why or "not a layout (no type)"))
+        end
+        result = ShowLayout(spec, seq, seconds > 0)
     else
         return S.BAD_ARGS, Str("unknown kind " .. kind)
     end

@@ -32,6 +32,8 @@ Tools:
   set_hook(when, note, action, ...)   (game or timer) "tell me when...": wakes her (or says a reminder)
   list_hooks() / remove_hook(id)      her hooks
   track_checklist(title, items)       (game) a checklist that stays up and ticks itself off from the game
+  show_layout(layout, wait)           (game) a window built from pieces (DeckKit layouts): items, quests,
+                                      checks, progress, waypoints, reply buttons; can wait for his pick
   clear_checklist()                   (game) takes it down
   respond(say, display, ...)          (game) her answer, always last: what's spoken, and the one display
                                       that fits (none, text card, list, checklist, reading view); the
@@ -48,6 +50,24 @@ from agent import common, gamedb, items, memory  # noqa: E402
 import time  # noqa: E402
 
 PROTOCOL = "2025-06-18"
+
+# A layout node (addons/DeckKit/Layout.lua's header has the full vocabulary), nested a few levels deep
+# explicitly rather than by $ref.
+LAYOUT_TYPES = ["list", "section", "row", "text", "heading", "item", "quest", "check", "progress", "waypoint",
+                "icon", "button", "space"]
+
+
+def _layout_node(depth):
+    node = {"type": "object", "properties": {"type": {"type": "string", "enum": LAYOUT_TYPES}},
+            "required": ["type"]}
+    if depth > 0:
+        child = _layout_node(depth - 1)
+        node["properties"]["items"] = {"type": "array", "maxItems": 30, "items": child}
+        node["properties"]["footer"] = child
+    return node
+
+
+LAYOUT_NODE = _layout_node(4)
 
 TOOLS = [
     {"name": "get_player_state",
@@ -286,6 +306,32 @@ TOOLS = [
                  "xp": {"type": "integer", "minimum": 1}, "done": {"type": "boolean"}},
              "required": ["label", "track"], "additionalProperties": False}}},
          "required": ["title", "items"], "additionalProperties": False}},
+    {"name": "show_layout",
+     "description": "Put a window on Ben's screen built from pieces (DeckKit layouts): for answers worth "
+                    "looking at and acting on with the pad, richer than respond's displays. Real IDs make "
+                    "real pieces: the game fills in names, icons, quality colors, tooltips and live state.\n"
+                    "Containers (with `items`): list (one under another), section (`title` heading, then "
+                    "items), row (side by side on one line).\n"
+                    "Pieces: text (`text`, `style`: body/dim/small/heading/good/bad/gold), heading (`text`), "
+                    "item (`id`, `count`), quest (`id`, `text` = its name), check (`bind`: ticks itself from "
+                    "the game; or `toggle`: true for one Ben ticks), progress (`bind` an item count, `text`), "
+                    "waypoint (`map`, `x`, `y` 0-100, `label`: A sets it as his waypoint, holding Y shows "
+                    "the map), button (`text`, `buttons`: {\"a\": {\"reply\": \"value\", \"label\": "
+                    "\"Pick\"}}), space (`width`; none: pushes the rest of a row right).\n"
+                    "bind: {quest, state: taken/ready/done} | {quest, objective} | {item, count} | {level} | "
+                    "{zone}.\n"
+                    "The top node may have `footer` (a row kept in view under the scrolling part: put "
+                    "reply buttons there), `title` (the tab label), `id` (a short name: Ben's own ticks are "
+                    "kept per id) and `width` (360-900, default 560).\n"
+                    "Typical: a list of rows [item, check bound to {item, count}] for a shopping list; "
+                    "rows [quest, check bound to the quest] for quests to pick up; waypoints for places; "
+                    "reply buttons when you need him to pick (then wait: seconds to wait for it, and you "
+                    "get answer: the reply's value, or null if he closed it). After showing one, respond "
+                    "with display none and say it's on screen. Keep it to what fits one screen.",
+     "inputSchema": {"type": "object", "properties": {
+         "layout": LAYOUT_NODE,
+         "wait": {"type": "integer", "minimum": 0, "maximum": 240, "default": 0}},
+         "required": ["layout"], "additionalProperties": False}},
     {"name": "clear_checklist",
      "description": "Take down the checklist you put up with track_checklist (when he's done with it or "
                     "asks).",
@@ -893,6 +939,21 @@ def tool_remove_hook(args):
     return {"removed": hid}
 
 
+def tool_show_layout(args):
+    wait = int(args.get("wait") or 0)
+    reply = common.game("layout", "--wait", wait, json.dumps(args["layout"], separators=(",", ":")),
+                        timeout=wait + 90)
+    if not reply.get("ok"):
+        raise common.GameError(reply.get("reason") or reply.get("error") or reply.get("status") or "couldn't show it")
+    out = {"shown": "after the fight (he was in combat)" if (reply.get("shown") or reply.get("result")) == "queued"
+           else "on screen"}
+    if "choice" in reply:
+        out["answer"] = reply.get("answer")
+        if reply.get("answer") is None:
+            out["why"] = {0: "he closed it", 255: "replaced or no answer in time"}.get(reply.get("choice"), "no answer")
+    return out
+
+
 def tool_track_checklist(args):
     items = args["items"]
     reply = common.game("checklist", json.dumps({"title": args.get("title", ""), "items": items}))
@@ -985,7 +1046,7 @@ HANDLERS = {"get_player_state": tool_get_player_state, "find_npc": tool_find_npc
             "send_chat": tool_send_chat, "get_online": tool_get_online, "ask_player": tool_ask_player,
             "remember": tool_remember, "remember_fact": tool_remember_fact, "recall": tool_recall,
             "forget_fact": tool_forget_fact, "get_quests": tool_get_quests, "find_quests": tool_find_quests,
-            "respond": tool_respond, "track_checklist": tool_track_checklist,
+            "respond": tool_respond, "track_checklist": tool_track_checklist, "show_layout": tool_show_layout,
             "set_hook": tool_set_hook, "get_character": tool_get_character, "get_bags": tool_get_bags,
             "get_item_info": tool_get_item_info, "get_prices": tool_get_prices, "find_items": tool_find_items, "flag_items": tool_flag_items,
             "clear_flags": tool_clear_flags, "list_hooks": tool_list_hooks, "remove_hook": tool_remove_hook,

@@ -236,7 +236,7 @@ class MCPServer(unittest.TestCase):
         names = [t["name"] for t in mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]]
         self.assertEqual(names, ["get_player_state", "find_npc", "set_waypoint", "get_waypoints",
                                  "remove_waypoints", "send_chat", "get_online",
-                                 "ask_player", "get_quests", "find_quests", "get_character", "get_bags", "find_items", "flag_items", "clear_flags", "get_prices", "get_item_info", "set_hook", "list_hooks", "remove_hook", "track_checklist", "clear_checklist", "respond", "remember", "remember_fact",
+                                 "ask_player", "get_quests", "find_quests", "get_character", "get_bags", "find_items", "flag_items", "clear_flags", "get_prices", "get_item_info", "set_hook", "list_hooks", "remove_hook", "track_checklist", "show_layout", "clear_checklist", "respond", "remember", "remember_fact",
                                  "recall", "forget_fact"])
         self.assertEqual(mcp_server.handle({"jsonrpc": "2.0", "id": 3, "method": "nope"})["error"]["code"], -32601)
 
@@ -1121,6 +1121,69 @@ class Transcripts(Conversation):
         self.assertEqual([r["question"] for r in records], ["nearest innkeeper", "thanks"])
 
 
+class Layouts(unittest.TestCase):
+    """SHOW kind layout (Show.lua <-> decklink/agent.py layout_packet) and the show_layout tool."""
+
+    SPEC = {"type": "list", "id": "sfk", "items": [{"type": "item", "id": 6948}],
+            "footer": {"type": "row", "items": [
+                {"type": "button", "text": "In", "buttons": {"a": {"reply": "in", "label": "Join"}}},
+                {"type": "button", "text": "Out", "buttons": {"a": {"reply": {"why": "busy"}}}}]}}
+
+    def test_reply_values_go_as_numbers(self):
+        packet, replies = host.layout_packet(self.SPEC, wait=30)
+        self.assertEqual(replies, ["in", {"why": "busy"}])
+        self.assertEqual(packet[1:3], bytes([4, 30]))  # kind layout, waiting 30 s
+        text = packet[11:].decode()
+        self.assertIn('"reply":1', text)
+        self.assertIn('"reply":2', text)
+        self.assertNotIn(" ", text.replace('"In"', "").replace('"Out"', ""))  # compact
+        plain, none = host.layout_packet({"type": "text", "text": "hi"}, wait=30)
+        self.assertEqual((none, plain[2]), ([], 0))  # nothing to reply with: nobody waits
+        with self.assertRaises(ValueError):
+            host.layout_packet({"items": []})
+        prepared = host.prepare({"cmd": "layout", "spec": self.SPEC, "wait": 30})
+        self.assertTrue(prepared.waits)
+        self.assertFalse(host.prepare({"cmd": "layout", "spec": self.SPEC}).waits)
+
+    def test_the_cli_waits_as_long_as_the_layout_does(self):
+        self.assertEqual(host.service_wait({"cmd": "layout", "wait": 120}), 270)
+        self.assertEqual(host.service_wait({"cmd": "layout"}), 0)
+        self.assertEqual(host.service_wait({"cmd": "prompt", "seconds": 45}), 195)
+
+    def run_layout(self, after):
+        packet, _ = host.layout_packet(self.SPEC, wait=30)
+        return Asking.run_ask(self, packet, after)
+
+    def test_a_reply_is_an_answer_and_b_cancels(self):
+        shown, answer = self.run_layout("LAYOUT.opts.onReply(2)")
+        self.assertEqual((shown["ok"], shown["result"], answer["op"], answer["seq"], answer["choice"]), (True, "shown", 6, 7, 2))
+        _, answer = self.run_layout("DeckKit.UI.HideLayout()")
+        self.assertEqual(answer["choice"], 0)
+
+    def test_the_game_shows_it_titled_decky_with_its_ticks(self):
+        packet, _ = host.layout_packet(self.SPEC)
+        data, lines = ask(packet, 'DeckAgentDB.layoutTicks = { sfk = { ["1.1"] = true } }')
+        self.assertTrue(host.parse_reply(data)["ok"])
+        self.assertIn("LAYOUT list Decky", lines)
+        lines, _ = Game.run("login() " + hello() + ' taps("%s") frame() print("TICKS " .. tostring(LAYOUT.opts.ticks == '
+                            'DeckAgentDB.layoutTicks.sfk))' % bitstr(codec.build(host.CHANNEL, 7, packet)))
+        self.assertIn("TICKS true", lines)
+
+    def test_in_combat_it_waits_for_the_fight_to_end(self):
+        packet, _ = host.layout_packet(self.SPEC)
+        frame = bitstr(codec.build(host.CHANNEL, 7, packet))
+        lines, s = Game.run('login() combat(true) ' + hello() + ' taps("%s") frame() print("UP " .. tostring(LAYOUT ~= nil)) '
+                            'combat(false) print("UP " .. tostring(LAYOUT ~= nil and LAYOUT.shown))' % frame)
+        self.assertEqual(host.parse_reply(codec.parse(s.out)[2])["result"], "queued")
+        self.assertEqual([l for l in lines if l.startswith("UP ")], ["UP false", "UP true"])
+
+    def test_not_a_layout_is_refused(self):
+        data, _ = ask(host.build_show("layout", "", "{not json"))
+        reply = host.parse_reply(data)
+        self.assertFalse(reply["ok"])
+        self.assertIn("layout", reply.get("reason", ""))
+
+
 class Showing(unittest.TestCase):
     """SHOW (addons/DeckAgent/Show.lua <-> decklink/agent.py) and speak or show (decklink/voice.py)."""
 
@@ -1136,7 +1199,7 @@ class Showing(unittest.TestCase):
             host.build_show("poster", "t", "x")
         self.assertLessEqual(len(codec.build(host.CHANNEL, 1, host.build_show("reading", "t" * 120, "x" * host.SHOW_TEXT["reading"]))),
                              codec.MAX_IN + 16)
-        self.assertEqual(mcp_server.SHOW_TEXT, {k: v for k, v in host.SHOW_TEXT.items() if k != "echo"})
+        self.assertEqual(mcp_server.SHOW_TEXT, {k: v for k, v in host.SHOW_TEXT.items() if k not in ("echo", "layout")})
 
     def test_a_card_without_seconds_stays_long_enough_to_read(self):
         # One rule (card_seconds) for every card: respond's (no --seconds) and the voice's.

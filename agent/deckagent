@@ -24,7 +24,7 @@ TOOLS = ["mcp__deckagent__get_player_state", "mcp__deckagent__find_npc", "mcp__d
          "mcp__deckagent__send_chat", "mcp__deckagent__get_online", "mcp__deckagent__ask_player",
          "mcp__deckagent__remember", "mcp__deckagent__remember_fact", "mcp__deckagent__recall",
          "mcp__deckagent__forget_fact", "mcp__deckagent__get_quests", "mcp__deckagent__find_quests", "mcp__deckagent__respond",
-         "mcp__deckagent__track_checklist", "mcp__deckagent__clear_checklist",
+         "mcp__deckagent__track_checklist", "mcp__deckagent__clear_checklist", "mcp__deckagent__show_layout",
          "mcp__deckagent__get_character", "mcp__deckagent__get_bags",
          "mcp__deckagent__get_item_info", "mcp__deckagent__get_prices", "mcp__deckagent__find_items",
          "mcp__deckagent__flag_items", "mcp__deckagent__clear_flags", "mcp__deckagent__set_hook", "mcp__deckagent__list_hooks", "mcp__deckagent__remove_hook"]

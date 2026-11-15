@@ -153,7 +153,7 @@ class Keeper:
                     self._ensure()
                     return {"ok": True, "open": True}
                 lk = self._ensure()
-                if cmd == "prompt":
+                if prepared.waits:  # a prompt, or a layout waiting for a reply: Ben's time, not the model's
                     self._waiting_since = time.monotonic()
                     try:
                         reply = prepared.run(lk, cancelled)
