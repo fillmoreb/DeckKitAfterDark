@@ -34,9 +34,8 @@ Tools:
   track_checklist(title, items)       (game) a checklist that stays up and ticks itself off from the game
   clear_checklist()                   (game) takes it down
   respond(say, display, ...)          (game) her answer, always last: what's spoken, and the one display
-                                      that fits (none, text card, list, checklist, reading view)
-  show_card(title, text, ...)         (game) a small card on screen: a few lines Ben can glance at
-  show_reading(title, text)           (game) a window for long text he scrolls and pages through
+                                      that fits (none, text card, list, checklist, reading view); the
+                                      only way she puts a card or reading view up
 
 There is deliberately no way to run Lua, send slash commands or touch combat, movement, targeting or
 casting: only these named requests, answered by addons/DeckAgent in the game.
@@ -146,9 +145,10 @@ TOOLS = [
     {"name": "get_quests",
      "description": "Ben's quest log, right now: each quest's name, level and summary, whether it's complete "
                     "(ready to turn in) or failed, and its objectives with his progress (what, have/need, done; "
-                    "for items, who drops or sells them), plus who takes it in and where. The game sends only "
-                    "IDs and counts; the names come from the local database (QuestieDB Forever). Pass his "
-                    "position as `near` to get the turn-in NPC's nearest spawn and distance. Use it for "
+                    "for items, who drops or sells them), plus turned_in_at: every NPC or object that takes it in, "
+                    "with where (like find_quests'). The game sends only IDs and counts; the names come from "
+                    "the local database (QuestieDB Forever). Pass his position as `near` to get each one's "
+                    "nearest spawn and distance, nearest first. Use it for "
                     "anything about his quests: what he still needs, what's done, where to turn in.",
      "inputSchema": {"type": "object", "properties": {
          "near": {"type": "object", "description": "his position: map_id and x, y (0-100)",
@@ -320,42 +320,6 @@ TOOLS = [
          "note": {"type": "string", "maxLength": 120},
          "heard": {"type": "string", "maxLength": 160}},
          "required": ["say", "display"], "additionalProperties": False}},
-    {"name": "show_card",
-     "description": "Put a small card on Ben's screen (top left), for what's worth seeing rather than "
-                    "hearing. Two shapes; pick the one that fits the answer:\n"
-                    "- `text`: a short paragraph (1-4 sentences): an explanation, a tip, one detailed "
-                    "answer, coordinates with directions. Line breaks allowed; no lists in it.\n"
-                    "- `items`: a list, one short line each (under ~60 characters: a name and the one "
-                    "detail that matters, like 'Rahauro, Thunder Bluff (70, 29)'). Give an item `done` "
-                    "true or false for a checklist line (things to get or do, with his real progress); "
-                    "leave it out for a bullet.\n"
-                    "`note` is one optional short line at the bottom (a source, a caveat). The card "
-                    "stays up for `seconds` (default: long enough to read) or until he presses B. Then "
-                    "say the short version out loud in one sentence; never read the card.",
-     "inputSchema": {"type": "object", "properties": {
-         "title": {"type": "string", "maxLength": 60},
-         "text": {"type": "string", "minLength": 1, "maxLength": 500},
-         "items": {"type": "array", "minItems": 1, "maxItems": 12, "items": {
-             "type": "object", "properties": {
-                 "text": {"type": "string", "minLength": 1, "maxLength": 80},
-                 "done": {"type": "boolean"}},
-             "required": ["text"], "additionalProperties": False}},
-         "note": {"type": "string", "maxLength": 120},
-         "seconds": {"type": "integer", "minimum": 0, "maximum": 120,
-                     "description": "0: until he closes it"},
-         "item_id": {"type": "integer", "minimum": 1,
-                     "description": "an item ID (from a tool or Wowhead) whose icon goes by the title"}},
-         "required": ["title"], "additionalProperties": False}},
-    {"name": "show_reading",
-     "description": "Open a reading window for long text: a quest walkthrough, a boss summary, the useful "
-                    "points from Wowhead comments, a plan. He scrolls with the d-pad, pages with LB/RB and "
-                    "closes it with B. Plain text; lines starting '# ' are headings, '- ' bullets. Up to "
-                    "about 3,500 bytes: summarize, don't paste whole pages. In combat it opens when the fight "
-                    "ends (result 'queued'). Then say in one sentence what you put up.",
-     "inputSchema": {"type": "object", "properties": {
-         "title": {"type": "string", "maxLength": 60},
-         "text": {"type": "string", "minLength": 1, "maxLength": 3500}},
-         "required": ["title", "text"], "additionalProperties": False}},
     {"name": "remember",
      "description": "Write one line into your notes (CLAUDE.md in your folder, read before every question), so "
                     "you know it next time. section 'people': who someone is, e.g. 'Edna: BattleTag AMI#1362; "
@@ -545,22 +509,30 @@ def price_view(p):
 
 
 def _prices(ids):
-    """{item ID: price_view} from the game (MarketDeck), or {} when it isn't installed."""
-    out = {}
+    """The game's prices (MarketDeck), asked once: ({item ID: price_view}, how it went: {"ok", "reason"
+    when not, "installed": MarketDeck there, "scan_hours": each answer's hours since its auction house
+    scan}). get_prices and get_bags both use it."""
+    views, meta = {}, {"ok": True, "installed": True, "scan_hours": []}
     ids = list(ids)
     while ids:
         batch, ids = ids[:60], ids[60:]
         r = common.game("prices", *batch)
-        if not r.get("ok") or not r.get("market_installed"):
-            return out
+        if not r.get("ok"):
+            meta.update(ok=False, reason=r.get("reason") or r.get("error") or "the game said no")
+            break
+        if not r.get("market_installed"):
+            meta["installed"] = False
+            break
         got = r.get("prices", [])
         for p in got:
-            out[p["item_id"]] = price_view(p)
+            views[p["item_id"]] = price_view(p)
+            if p.get("hours_since_scan") is not None:
+                meta["scan_hours"].append(p["hours_since_scan"])
         if len(got) < len(batch):  # cut at one strip frame: ask again for the rest
             ids = batch[len(got):] + ids
             if not got:
                 break
-    return out
+    return views, meta
 
 
 def tool_find_items(args):
@@ -603,13 +575,14 @@ def tool_clear_flags(args):
 
 def tool_get_prices(args):
     ids = [int(i) for i in args["item_ids"]][:60]
-    r = common.game("prices", *ids)
-    if r.get("ok") and not r.get("market_installed"):
+    views, meta = _prices(ids)
+    if not meta["ok"]:
+        raise common.GameError(meta["reason"])
+    if not meta["installed"]:
         return {"note": "auction prices need DeckKit's MarketDeck addon (it isn't installed); vendor prices only via "
                         "get_item_info"}
     names = _names(ids)
-    views = _prices(ids)
-    scans = [p.get("hours_since_scan") for p in r.get("prices", []) if p.get("hours_since_scan") is not None]
+    scans = meta["scan_hours"]
     out = {"items": [dict({"item_id": i, "name": names.get(i)}, **views.get(i, {})) for i in ids]}
     if not scans:
         out["note"] = "no auction snapshot yet: prices fill in after he opens the auction house once"
@@ -627,7 +600,7 @@ def tool_get_bags(args):
         return {"bank": "not seen yet: it's only readable while he has it open, so ask him to visit the bank once"}
     ids = [i["item_id"] for i in b["items"]]
     names = _names(ids)
-    prices = _prices(ids)  # with MarketDeck: auction, vendor, disenchant and the best way to sell each
+    prices, _ = _prices(ids)  # with MarketDeck: auction, vendor, disenchant and the best way to sell each
     out = {"items": [dict({"item_id": i["item_id"], "name": names.get(i["item_id"]), "count": i["count"]},
                           **prices.get(i["item_id"], {})) for i in b["items"]],
            "free_slots": b["free"], "slots": b["slots"]}
@@ -650,7 +623,7 @@ def tool_find_npc(args):
     if not os.path.exists(common.DB_PATH):
         raise common.GameError("no game database yet: run `python3 -m agent.update_data`")
     near = args.get("near")
-    state = {"map": int(near["map_id"]), "x": float(near["x"]) / 100, "y": float(near["y"]) / 100} if near else None
+    state = gamedb.near_state(near)
     db = gamedb.connect(common.DB_PATH)
     try:
         if not (args.get("query") or args.get("role")):
@@ -703,8 +676,7 @@ def tool_get_waypoints(args):
     reply = common.game("waypoints")
     if not reply.get("ok"):
         raise common.GameError(reply.get("reason") or reply.get("error") or "the game said no")
-    near = args.get("near")
-    state = {"map": int(near["map_id"]), "x": float(near["x"]) / 100, "y": float(near["y"]) / 100} if near else None
+    state = gamedb.near_state(args.get("near"))
     return {"waypoints": _waypoint_list(reply.get("waypoints", []), state)}
 
 
@@ -780,8 +752,7 @@ def tool_find_quests(args):
         raise common.GameError("find_quests needs a place or name words")
     if not os.path.exists(common.DB_PATH):
         raise common.GameError("no game database yet: run deckagent-update")
-    near = args.get("near")
-    state = {"map": int(near["map_id"]), "x": float(near["x"]) / 100, "y": float(near["y"]) / 100} if near else None
+    state = gamedb.near_state(args.get("near"))
     db = gamedb.connect(common.DB_PATH)
     try:
         found = gamedb.find_quests(db, args.get("place", ""), args.get("name", ""), args.get("faction"), state)
@@ -803,8 +774,7 @@ def tool_get_quests(args):
     reply = common.game("quests")
     if not reply.get("ok"):
         raise common.GameError(reply.get("reason") or reply.get("error") or "the game said no")
-    near = args.get("near")
-    state = {"map": int(near["map_id"]), "x": float(near["x"]) / 100, "y": float(near["y"]) / 100} if near else None
+    state = gamedb.near_state(args.get("near"))
     if not os.path.exists(common.DB_PATH):  # IDs and counts are still worth something
         return {"quests": reply["quests"], "note": "no game database yet, so no names: run agent.update_data"}
     db = gamedb.connect(common.DB_PATH)
@@ -822,6 +792,8 @@ SHOW_TEXT = {"card": 600, "reading": 3832}  # bytes; deck-setup/decklink/agent.p
 
 
 def _show(kind, title, text, seconds=None, item=None):
+    """SHOW a card or reading view. Without `seconds` a card stays up as long as the host side's
+    card_seconds says (deck-setup/decklink/agent.py), the same rule as the voice's cards."""
     limit = SHOW_TEXT[kind]
     if len(text.encode("utf-8")) > limit:
         raise common.GameError("the text is over %d bytes: shorten it" % limit)
@@ -837,7 +809,7 @@ def _show(kind, title, text, seconds=None, item=None):
 
 
 def card_text(items, note=None, text=None):
-    """show_card's text or items -> the card's markup (addons/DeckAgent/Show.lua): the paragraph, or
+    """respond's text or items -> the card's markup (addons/DeckAgent/Show.lua): the paragraph, or
     "[x] " / "[ ] " checklist lines and "- " bullets; then the note."""
     lines = []
     if text and text.strip():
@@ -852,18 +824,6 @@ def card_text(items, note=None, text=None):
     if note and note.strip():
         lines += ["", " ".join(note.split())]
     return "\n".join(lines)
-
-
-def tool_show_card(args):
-    if args.get("text") and args.get("items"):
-        raise common.GameError("give the card `text` or `items`, not both")
-    text = card_text(args.get("items") or [], args.get("note"), args.get("text"))
-    if not text:
-        raise common.GameError("the card needs `text` or `items`")
-    seconds = args.get("seconds")
-    if seconds is None:
-        seconds = int(min(60, 8 + len(text) / 15))
-    return _show("card", args.get("title", ""), text, seconds, args.get("item_id"))
 
 
 def describe(when):
@@ -972,12 +932,8 @@ def tool_respond(args):
         body = card_text(items, note, text if display == "text" else None)
         if len(body.encode("utf-8")) > SHOW_TEXT["card"]:
             raise common.GameError("too much for a card: fewer or shorter items, or display reading")
-        result = _show("card", title, body, int(min(60, 8 + len(body) / 15)))
+        result = _show("card", title, body)  # on screen for decklink's card_seconds(body)
     return {"ok": True, "spoken": say, "shown": display, "result": result.get("result")}
-
-
-def tool_show_reading(args):
-    return _show("reading", args.get("title", ""), args["text"])
 
 
 def tool_remember(args):
@@ -1033,7 +989,7 @@ HANDLERS = {"get_player_state": tool_get_player_state, "find_npc": tool_find_npc
             "set_hook": tool_set_hook, "get_character": tool_get_character, "get_bags": tool_get_bags,
             "get_item_info": tool_get_item_info, "get_prices": tool_get_prices, "find_items": tool_find_items, "flag_items": tool_flag_items,
             "clear_flags": tool_clear_flags, "list_hooks": tool_list_hooks, "remove_hook": tool_remove_hook,
-            "clear_checklist": tool_clear_checklist, "get_waypoints": tool_get_waypoints, "remove_waypoints": tool_remove_waypoints, "show_card": tool_show_card, "show_reading": tool_show_reading}
+            "clear_checklist": tool_clear_checklist, "get_waypoints": tool_get_waypoints, "remove_waypoints": tool_remove_waypoints}
 
 
 def handle(msg):

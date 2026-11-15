@@ -24,7 +24,7 @@
 local _, ns = ...
 
 local B, S = ns.Bytes, ns.Status
-local U8, Str, ReadU16 = B.U8, B.Str, B.ReadU16
+local U8, Str, ReadU16, ReadU32 = B.U8, B.Str, B.ReadU16, B.ReadU32
 local OP_SHOW = 7
 local ECHO, CARD, READING = 1, 2, 3
 local SHOWN, QUEUED = 1, 2
@@ -315,7 +315,7 @@ end)
 ns.OPS[OP_SHOW] = function(p)
     local kind, seconds = p:byte(2), p:byte(3)
     if not (kind and seconds) or #p < 8 then return S.BAD_ARGS, Str("SHOW needs kind, seconds and icon") end
-    local itemID = ReadU16(p, 4) * 65536 + ReadU16(p, 6)
+    local itemID = ReadU32(p, 4)
     local n = p:byte(8)
     local title = p:sub(9, 8 + n)
     local i = 9 + n

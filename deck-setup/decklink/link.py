@@ -15,6 +15,13 @@ from . import codec, keys, strip
 # (~55 bytes a second), when a clipboard tool is there. Smaller ones aren't worth the focus change.
 PASTE_MIN = 40
 
+# The biggest payload that may go by keys. At ~55 bytes a second (keys.py) a frame this size takes
+# ~9 s of taps, so even its third try ends inside the game's 30 s windows: the link's (Link.lua closes
+# it 30 s after the last whole frame, hiding the strip and with it the ack) and its resend memory
+# (a seq counts as a resend for 30 s). A bigger one could arrive with no ack to see and then run
+# again, so it's refused: it goes by paste or not at all.
+KEYS_MAX = 500
+
 # When the link was last seen open (epoch seconds as text; 0 after a bye), for the cover (cover.py),
 # which shows only while this is fresh. Shared by root and deck, hence world-writable.
 OPEN_FILE = "/tmp/decklink-open"
@@ -127,10 +134,10 @@ class Link:
         self.seq = self.seq % 255 + 1
         return self.seq
 
-    def _frame(self, channel, payload):
+    def _frame(self, channel, payload, seq=None):
         if len(payload) > codec.MAX_IN:
             raise LinkError("payload over %d bytes" % codec.MAX_IN)
-        seq = self._next_seq()
+        seq = seq or self._next_seq()
         return seq, codec.build(channel, seq, payload)
 
     def open(self, timeout=10):
@@ -154,22 +161,30 @@ class Link:
 
     def send(self, channel, payload, timeout=10, tries=3):
         """Sends one frame and waits until the strip shows it arrived (its seq as the last good one).
-        Returns the frame's seq (replies can name it). Big frames go by paste when they can."""
-        payload = bytes(payload)
-        if len(payload) >= PASTE_MIN and hasattr(self.keys, "paste") and self.clipboard():
-            try:
-                return self.send_by_paste(channel, payload)
-            except (LinkError, OSError) as e:
-                print("decklink: paste failed (%s); sending by keys" % e, flush=True)
-        return self.send_by_keys(channel, payload, timeout, tries)
+        Returns the frame's seq (replies can name it). Big frames go by paste when they can.
 
-    def send_by_paste(self, channel, payload, tries=2):
-        """The frame as one line on the clipboard: a PASTE frame (by keys) has DeckLink focus its box,
-        Ctrl+V puts the line in, and the strip shows the frame's seq once it checked out. The clipboard
-        is given back what it had."""
+        The frame keeps one seq however it goes (each paste try, then keys): the game delivers a seq once
+        per channel (Link.lua), so a paste that ran while its ack went unseen isn't run again by the retry
+        or the fallback; the game just acks it. The PASTE control frames between take seqs of their own
+        on channel 0, which doesn't touch that."""
+        payload = bytes(payload)
         if len(payload) > codec.MAX_IN:
             raise LinkError("payload over %d bytes" % codec.MAX_IN)
         seq = self._next_seq()
+        if len(payload) >= PASTE_MIN and hasattr(self.keys, "paste") and self.clipboard():
+            try:
+                return self.send_by_paste(channel, payload, seq=seq)
+            except (LinkError, OSError) as e:
+                print("decklink: paste failed (%s); sending by keys" % e, flush=True)
+        return self.send_by_keys(channel, payload, timeout, tries, seq=seq)
+
+    def send_by_paste(self, channel, payload, tries=2, seq=None):
+        """The frame as one line on the clipboard: a PASTE frame (by keys) has DeckLink focus its box,
+        Ctrl+V puts the line in, and the strip shows the frame's seq once it checked out. The clipboard
+        is given back what it had. `seq`: the frame's own, kept across tries (send gives it)."""
+        if len(payload) > codec.MAX_IN:
+            raise LinkError("payload over %d bytes" % codec.MAX_IN)
+        seq = seq or self._next_seq()
         line = ("DLP1 %d %d %d %04x " % (seq, channel, len(payload), codec.crc16(payload))).encode() \
             + base64.b64encode(payload)
         clip = self.clipboard()
@@ -193,8 +208,11 @@ class Link:
                 except OSError:
                     pass
 
-    def send_by_keys(self, channel, payload, timeout=10, tries=3):
-        seq, frame = self._frame(channel, bytes(payload))
+    def send_by_keys(self, channel, payload, timeout=10, tries=3, seq=None):
+        if len(payload) > KEYS_MAX:
+            raise LinkError("%d bytes is too big to send by keys (at most %d; bigger frames need the paste "
+                            "route, which needs a clipboard tool)" % (len(payload), KEYS_MAX))
+        seq, frame = self._frame(channel, bytes(payload), seq)
         for _ in range(tries):
             s = self.wait(lambda s: s.flags & strip.FLAG_READY, timeout, "the game to be ready (chat open?)")
             bad = s.bad

@@ -7,6 +7,7 @@
 ## OptionalDeps: WayPad, MarketDeck, PackPad
 ## SavedVariables: DeckAgentDB
 
+Bytes.lua
 Agent.lua
 Prompt.lua
 Chat.lua

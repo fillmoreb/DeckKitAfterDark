@@ -61,10 +61,12 @@ PICKED = {}  # the model picked in the game's menu (DeckKit > Tools > DeckAgent)
 
 def prefetch(verbose):
     """Ben's position and faction, fetched before the brain starts, so "nearest X" skips a turn.
-    Returns a line for the prompt, or None if the game didn't answer (the brain can still ask)."""
+    Returns a line for the prompt, or None if the game didn't answer (the brain can still ask).
+    It also asks for the Quiet setting (`voice`): nothing here uses it, but the link keeper remembers
+    it from the reply, so the voice speaks or only shows this answer by the setting as it is now."""
     start = time.monotonic()
     try:
-        s = common.game("state", "pos", "world", "zone", "who", "brain", "target", timeout=15)
+        s = common.game("state", "pos", "world", "zone", "who", "brain", "voice", "target", timeout=15)
     except common.GameError as e:
         if verbose:
             print("[prefetch] failed: %s" % e, file=sys.stderr)

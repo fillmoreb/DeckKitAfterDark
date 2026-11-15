@@ -5,8 +5,8 @@ question doesn't pay to start the screen reader and open the link again.
 
 It listens on a Unix socket ($XDG_RUNTIME_DIR/deckagent.sock, this user only) for one JSON line per
 request and answers with one JSON line:
-  {"cmd": "state", "fields": ["pos", "world", ...]}   -> agent.state reply
-  {"cmd": "way", "map": 1454, "x": 36, "y": 87.7}     -> agent.way reply
+  {"cmd": "state", "fields": ["pos", "world", ...]}   -> the game's reply (agent.prepare: every
+  {"cmd": "way", "map": 1454, "x": 36, "y": 87.7}     -> agent.COMMANDS request, checked and built there)
   {"cmd": "warm"}       open the link now (a question is coming: L5+R5 went down)
   {"cmd": "status"}     whether the link is open, and how long it's been idle
   {"cmd": "dictation", "state": "recording", "binding": "agent"}   post a dictation state (the hook)
@@ -16,13 +16,15 @@ Errors come back as {"ok": false, "error": "..."}.
 
 Hooks: while any game hook is set, the keeper glances at the strip about once a second (one paused
 capture pipeline, ~2% of a core) for DeckLink's attention flag; when it's up it opens the link,
-collects the events (EVENTS) and hands each fired hook to the voice. Timers fire from here.
+collects the events (EVENTS) and hands each fired hook to the voice. Timers fire from here. Setting a
+hook in the game and saving its note happen under the keeper's lock, as does collecting the events and
+taking their notes, so a hook can't fire before its note is there.
 
 The link opens on the first request and closes after --idle seconds without one (the game closes its
 end after 30 s without a frame anyway). While it's closed nothing reads the screen: the GStreamer
 reader costs ~16% of a core while it runs (AddonTools lab E7), so it's stopped too.
 """
-import argparse, json, os, socket, socketserver, sys, threading, time
+import argparse, json, os, select, socket, socketserver, sys, threading, time
 
 from . import agent, dictation, hooks, keys, link, strip
 
@@ -41,14 +43,34 @@ class Keeper:
         self.voice = None  # voice.Voice, with --voice
         self.dictation_keys = None  # set in serve(): one key sender for dictation states
         self.quiet = False  # the game's "Quiet" setting, from the last reply that carried it
+        self.collected = []  # fired game hooks taken (with their notes) but not yet handed to the voice
         self.shown_at = 0  # time.monotonic() of the last card or reading view the assistant put up
         self._hooks = hook_store  # hooks.Hooks, made when first needed
+        self._hooks_made = threading.Lock()
+        # Seconds spent waiting on Ben's answers to prompts, ever (and since when, for the one up now),
+        # so the voice doesn't count that time against the assistant: it takes prompt_waited() as a
+        # question starts and subtracts the difference. One question runs at a time, and a dropped one's
+        # prompt ends within a second (cancel_requests), so the difference is that question's own.
+        self._waited, self._waiting_since = 0.0, None
+        # Bumped by cancel_requests() (the voice dropped a question): requests that came in before it
+        # are its, so they're dropped rather than run, and a prompt waiting for Ben is taken down.
+        self.epoch = 0
 
     @property
     def hooks(self):
-        if self._hooks is None:
-            self._hooks = hooks.Hooks()
+        with self._hooks_made:
+            if self._hooks is None:
+                self._hooks = hooks.Hooks()
         return self._hooks
+
+    def prompt_waited(self):
+        """Seconds spent waiting on Ben's answers to prompts so far, the one up now included."""
+        since = self._waiting_since
+        return self._waited + (time.monotonic() - since if since is not None else 0.0)
+
+    def cancel_requests(self):
+        """The question in progress was dropped: what it asked for and hasn't got yet isn't wanted."""
+        self.epoch += 1
 
     def _grabber(self):
         """The one screen reader (two at once garble each other's colors): the link's, and the glances'."""
@@ -91,7 +113,14 @@ class Keeper:
                 pass
             self.grabber = None
 
-    def handle(self, req):
+    def handle(self, req, client_gone=None):
+        """One request. `client_gone()`: the asker hung up (its process was ended), so the request
+        isn't wanted any more; like a cancel_requests() since it came in, it's dropped unrun, or a
+        prompt it's waiting on is taken down."""
+        epoch = self.epoch
+
+        def cancelled():
+            return self.epoch != epoch or bool(client_gone and client_gone())
         cmd = req.get("cmd")
         if cmd == "dictation":  # the dictation hook (decktation-hook.sh), without starting a Python per state
             state, binding = req.get("state"), req.get("binding", "chat")
@@ -106,41 +135,38 @@ class Keeper:
                 return {"ok": False, "error": "voice is off (start with --voice)"}
             return {"ok": self.voice.ask(req.get("text", "")), "started": True}
         if cmd == "hook":
-            return self.hook(req)
+            return self.hook(req, cancelled)
+        prepared = None
+        if cmd not in ("status", "warm"):
+            try:  # checked and built before the link opens (or is dropped): a bad request costs nothing
+                prepared = agent.prepare(req)
+            except (KeyError, TypeError, ValueError) as e:
+                return {"ok": False, "error": str(e) or e.__class__.__name__}
         with self.lock:
             if cmd == "status":
                 return {"ok": True, "open": self.lk is not None,
                         "idle_s": round(self.clock() - self.last, 1) if self.lk else None}
             try:
+                if cancelled():  # it waited for the lock behind a request of a question since dropped
+                    return {"ok": False, "cancelled": True, "error": "the question it was for was dropped"}
                 if cmd == "warm":
                     self._ensure()
                     return {"ok": True, "open": True}
-                if cmd in ("state", "way", "chat", "friends", "prompt", "show", "quests", "quest-status", "waypoints", "checklist",
-                           "character", "bags", "item-info", "prices", "mark"):
-                    if cmd == "state" and any(f not in agent.FIELDS for f in req.get("fields") or agent.FIELDS):
-                        return {"ok": False, "error": "unknown field"}
-                    # Packets are built (and checked) before the link opens: a bad request shouldn't cost one.
-                    {"chat": lambda: agent.build_chat(req["channel"], req.get("target", ""), req["text"]),
-                     "friends": lambda: agent.build_friends(req.get("lists") or agent.LISTS),
-                     "prompt": lambda: agent.build_ask(req["question"], req["options"], req.get("list", False),
-                                                       req.get("seconds", 30)),
-                     "checklist": lambda: agent.build_checklist(req.get("title"), req.get("items"),
-                                                                req.get("clear", False)),
-                     "mark": lambda: agent.build_marks(req.get("label", ""), req.get("ids"), req.get("clear", False)),
-                     "prices": lambda: agent.build_prices(req["ids"]),
-                     "item-info": lambda: agent.build_item_info(req["items"]),
-                     "waypoints": lambda: agent.build_waypoints(req.get("action", "list"), req.get("id", 0)),
-                     "quest-status": lambda: agent.build_quest_status(req["ids"]),
-                     "show": lambda: agent.build_show(req["kind"], req.get("title", ""), req.get("text", ""),
-                                                      req.get("seconds", 0), req.get("item", 0))
-                     }.get(cmd, lambda: None)()
-                    reply = agent.handle(self._ensure(), req)
-                    if cmd == "show" and req.get("kind") != "echo" and reply.get("ok"):
-                        self.shown_at = time.monotonic()
-                    if "quiet" in reply:  # remembered for the voice: speak answers or only show them
-                        self.quiet = reply["quiet"]
-                    return reply
-                return {"ok": False, "error": "unknown cmd %r" % cmd}
+                lk = self._ensure()
+                if cmd == "prompt":
+                    self._waiting_since = time.monotonic()
+                    try:
+                        reply = prepared.run(lk, cancelled)
+                    finally:
+                        self._waited += time.monotonic() - self._waiting_since
+                        self._waiting_since = None
+                else:
+                    reply = prepared.run(lk)
+                if cmd == "show" and req.get("kind") != "echo" and reply.get("ok"):
+                    self.shown_at = time.monotonic()
+                if "quiet" in reply:  # remembered for the voice: speak answers or only show them
+                    self.quiet = reply["quiet"]
+                return reply
             except (link.LinkError, keys.SendError, strip.NoStrip, agent.Malformed, KeyError, ValueError) as e:
                 # A link that failed mid-request may be in any state: start clean next time.
                 self._drop()
@@ -151,8 +177,11 @@ class Keeper:
 
     # Hooks ---------------------------------------------------------------------------------------------
 
-    def hook(self, req):
+    def hook(self, req, cancelled=lambda: False):
         op = req.get("op")
+        dropped = {"ok": False, "cancelled": True, "error": "the question it was for was dropped"}
+        if op in ("add", "remove", "clear") and cancelled():
+            return dropped
         try:
             if op == "add":
                 when, note, action = req.get("when") or {}, req.get("note", ""), req.get("action", "wake")
@@ -164,30 +193,51 @@ class Keeper:
                         return {"ok": False, "error": "a timer is 1 minute to 24 hours"}
                     return {"ok": True, "id": self.hooks.add_timer(minutes, note, action, req.get("desc", ""))}
                 agent.build_hooks("add", when, req.get("minutes", 0))  # a bad one is refused before the link opens
+                # The note is saved before the lock goes: until then the glance can't collect this hook's
+                # event and find no note for it.
                 with self.lock:
+                    if cancelled():  # dropped while it waited for the lock (behind a prompt, say)
+                        return dropped
                     reply = agent.hooks(self._ensure(), "add", when, req.get("minutes", 0))
-                if reply.get("ok") and not reply.get("already"):
-                    self.hooks.add_game(reply["id"], note, action, req.get("desc", ""), req.get("minutes", 0))
+                    if reply.get("ok") and not reply.get("already"):
+                        self.hooks.add_game(reply["id"], note, action, req.get("desc", ""), req.get("minutes", 0))
                 return reply
             if op == "list":
                 game = None
-                if self.hooks.any_game():
-                    with self.lock:
+                with self.lock:
+                    if self.hooks.any_game():
+                        # Hooks that fired are off the game's list but waiting as events: collected first
+                        # (handed to the next glance), so pruning below can't take their notes.
+                        self._collect_events()
                         r = agent.hooks(self._ensure(), "list")
-                    game = r.get("hooks") if r.get("ok") else None
-                return {"ok": True, "hooks": self.hooks.listing(game)}
+                        game = r.get("hooks") if r.get("ok") else None
+                        if game is not None:  # notes for hooks the game no longer has (a removal whose
+                            self.hooks.keep_game({g["id"] for g in game})  # answer was lost) go
+                    return {"ok": True, "hooks": self.hooks.listing(game)}
+            # Removing: the game first, the note only once the game says so. If the game can't be
+            # reached the hook is still set there, so its note stays (an answer lost after the game
+            # removed it leaves a stale note, which the next list takes away).
             if op == "remove":
                 hid = str(req.get("id", ""))
-                kind = self.hooks.remove(hid)
-                if hid.isdigit():
-                    with self.lock:
-                        agent.hooks(self._ensure(), "remove", hid=int(hid))
-                    kind = kind or "game"
+                with self.lock:
+                    if cancelled():
+                        return dropped
+                    if hid.isdigit():
+                        r = agent.hooks(self._ensure(), "remove", hid=int(hid))
+                        if not r.get("ok"):
+                            return {"ok": False, "error": r.get("reason") or "the game didn't remove it"}
+                        kind = self.hooks.remove(hid) or ("game" if r.get("removed") else None)
+                    else:
+                        kind = self.hooks.remove(hid)
                 return {"ok": kind is not None, "removed": hid if kind else None}
             if op == "clear":
-                self.hooks.clear()
                 with self.lock:
-                    agent.hooks(self._ensure(), "remove-all")
+                    if cancelled():
+                        return dropped
+                    r = agent.hooks(self._ensure(), "remove-all")
+                    if not r.get("ok"):
+                        return {"ok": False, "error": r.get("reason") or "the game didn't remove them"}
+                    self.hooks.clear()
                 return {"ok": True}
             return {"ok": False, "error": "hook op is add, list, remove or clear"}
         except (link.LinkError, keys.SendError, strip.NoStrip, agent.Malformed, KeyError, ValueError) as e:
@@ -195,11 +245,26 @@ class Keeper:
                 self._drop()
             return {"ok": False, "error": str(e) or e.__class__.__name__}
 
+    def _collect_events(self):
+        """Takes the game's fired-hook events (EVENTS) and their notes into self.collected, for the next
+        glance to hand to the voice. Called with the lock held."""
+        reply = agent.events(self._ensure())
+        self.last = self.clock()
+        for ev in reply.get("events", []):
+            e = self.hooks.pop_game(ev["id"])
+            if e is None:
+                print("hooks: game hook %s fired, but there's no note for it here" % ev["id"], flush=True)
+                continue
+            self.collected.append((e, ev.get("seconds_ago", 0)))
+
     def glance(self):
         """Fires due timers; if game hooks are set, looks at the strip for DeckLink's attention flag and
         collects the events. Called about once a second. Returns the fired [(entry, seconds_ago)]."""
         fired = [(e, 0) for _, e in self.hooks.due_timers()]
         self.hooks.expire()
+        with self.lock:  # events a hook list already took from the game
+            fired.extend(self.collected)
+            self.collected = []
         if not self.hooks.any_game():
             return fired
         try:
@@ -207,19 +272,13 @@ class Keeper:
                 status = self.lk.read() if self.lk is not None else self._grabber().glance()
                 if status is None or not status.flags & strip.FLAG_ATTENTION:
                     return fired
-                reply = agent.events(self._ensure())
-                self.last = self.clock()
+                self._collect_events()
+                fired.extend(self.collected)
+                self.collected = []
         except (link.LinkError, keys.SendError, strip.NoStrip, agent.Malformed, OSError) as e:
             print("hooks: glance failed: %s" % e, flush=True)
             with self.lock:
                 self._drop()
-            return fired
-        for ev in reply.get("events", []):
-            e = self.hooks.pop_game(ev["id"])
-            if e is None:
-                print("hooks: game hook %s fired, but there's no note for it here" % ev["id"], flush=True)
-                continue
-            fired.append((e, ev.get("seconds_ago", 0)))
         return fired
 
     def dispatch(self, fired):
@@ -247,33 +306,61 @@ class Keeper:
                 link.mark_open(time.time())
 
 
+class NotRunning(OSError):
+    """The service couldn't be reached: nothing was sent, so the caller may do the work itself."""
+
+
+class NoAnswer(Exception):
+    """The request went in, but no answer came back (a timeout, the service went away): it may have been
+    carried out. Never an OSError, so a caller falling back on "not running" can't take it for one."""
+
+
 def ask(req, path=SOCKET, timeout=30):
-    """A client's side: one request to the running service. Raises OSError when it isn't running."""
+    """A client's side: one request to the running service. NotRunning when it can't be reached,
+    NoAnswer when it took the request but its answer didn't come."""
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
-        s.connect(path)
-        s.sendall(json.dumps(req).encode() + b"\n")
-        data = b""
-        while not data.endswith(b"\n"):
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            data += chunk
+        try:
+            s.connect(path)
+        except OSError as e:
+            raise NotRunning(e.errno, str(e)) from e
+        try:
+            s.sendall(json.dumps(req).encode() + b"\n")
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+            return json.loads(data)
+        except (OSError, ValueError) as e:
+            raise NoAnswer(str(e) or e.__class__.__name__) from e
     finally:
         s.close()
-    return json.loads(data)
 
 
 def serve(keeper, path=SOCKET):
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
             line = self.rfile.readline()
+            conn = self.connection
+
+            def gone():
+                """The client sends one line and waits: anything readable now is its end closing."""
+                try:
+                    readable, _, _ = select.select([conn], [], [], 0)
+                    return bool(readable) and conn.recv(1, socket.MSG_PEEK) == b""
+                except OSError:
+                    return True
             try:
-                reply = keeper.handle(json.loads(line))
+                reply = keeper.handle(json.loads(line), gone)
             except ValueError:
                 reply = {"ok": False, "error": "not JSON"}
-            self.wfile.write(json.dumps(reply).encode() + b"\n")
+            try:
+                self.wfile.write(json.dumps(reply).encode() + b"\n")
+            except OSError:  # the asker hung up (its question was dropped): nobody to answer
+                pass
 
     if os.path.exists(path):
         os.remove(path)
@@ -327,8 +414,11 @@ def main(argv=None):
     if a.ask is not None:  # decklink-agent-ask: Decktation's agent binding command
         try:
             reply = ask({"cmd": "ask", "text": a.ask}, a.socket)
-        except OSError as e:
+        except NotRunning as e:
             print("decklink.agentd: the service isn't running (%s)" % e, file=sys.stderr)
+            return 1
+        except NoAnswer as e:
+            print("decklink.agentd: the service took the question but didn't answer (%s)" % e, file=sys.stderr)
             return 1
         print(json.dumps(reply))
         return 0 if reply.get("ok") else 1

@@ -14,6 +14,11 @@
 --
 -- Both ways carry frames (Codec.lua). Stop-and-wait: the strip shows the last good inbound seq, which
 -- is the host's ack; the strip shows one outbound frame at a time, which the host acks on channel 0.
+-- A frame is delivered once per channel and seq: the host keeps a frame's seq when it sends it again,
+-- by paste or by keys, with its own control frames (PASTE, on channel 0) in between, so a frame that
+-- arrived while its ack went unseen is acked again, not run twice. A hello (a new host session) forgets
+-- the seqs seen; so does DEDUP_FOR without that channel's frames, as a fire-and-forget sender (telemetry,
+-- dictation) picks seqs from its clock and may reuse one much later.
 --
 -- Hosts can also send without the strip: frames arrive whether the link is open or not, with no ack
 -- (channel 1 is Deck telemetry this way, for DeckTelemetry).
@@ -36,6 +41,7 @@ local MAX_IN = 4096 -- longest inbound payload
 local IDLE_RESET = 0.3 -- seconds without a tap: a half-received frame is dropped
 local OPEN_FOR = 30 -- seconds the link stays open after the last good frame
 local QUEUE_MAX = 64
+local DEDUP_FOR = OPEN_FOR -- seconds a channel's last seq counts as a resend
 
 local api = {}
 DeckLink = api
@@ -43,6 +49,7 @@ DeckLink = api
 local handlers = {}
 local open, lastHeard = false, 0
 local rxSeq, rxCount, bad, heartbeat = 0, 0, 0, 0
+local seenSeq, seenAt = {}, {} -- channel -> the seq last delivered on it, and when
 local queue, txSeq = {}, 0
 local lastError
 local bound = false
@@ -85,6 +92,8 @@ local function Control(payload)
     local op = payload:byte(1)
     if op == Codec.OP_HELLO then
         open = true
+        wipe(seenSeq) -- a new session: its seqs owe nothing to the last one's
+        wipe(seenAt)
     elseif op == Codec.OP_ACK then
         local head = queue[1]
         if head and head.seq == payload:byte(2) then table.remove(queue, 1) end
@@ -100,8 +109,11 @@ end
 local function Deliver(channel, seq, payload)
     lastHeard = GetTime()
     rxCount = rxCount + 1
-    if seq == rxSeq then return Changed() end -- the host sent it again: its ack (the strip) was slow
-    rxSeq = seq
+    rxSeq = seq -- the strip acks every good frame, a resend too
+    if seenSeq[channel] == seq and lastHeard - seenAt[channel] < DEDUP_FOR then
+        return Changed() -- the host sent it again: its ack (the strip) was slow or missed
+    end
+    seenSeq[channel], seenAt[channel] = seq, lastHeard
     if channel == 0 then
         Control(payload)
     else

@@ -10,20 +10,28 @@ up after an agent transcript); this then:
   3. speaks the answer with Piper (pw-play), or shows it ("speak or show", below).
 One question at a time. Starting a new recording cuts the spoken answer off (any binding: the mic
 would hear it); starting a new agent question also drops one still being worked on (agentd calls
-interrupt() on the hook's "recording" state), so you can just ask again.
+interrupt() on the hook's "recording" state), so you can just ask again. Each question's deckagent runs
+in a process group of its own (with claude and its MCP server under it), and dropping the question ends
+the whole group: nothing of the old question is left to act on the game.
+
+The assistant gets MODEL_S seconds per question, not counting time spent waiting for Ben to answer one
+of its prompts (ask_player, up to a couple of minutes: the link keeper counts it, prompt_waited).
+Dropping a question also cancels what it asked the link keeper for (cancel_requests): requests still
+waiting to run are dropped, and a prompt up for it is taken down in the game.
 
 Speak or show (through the link keeper's "show", addons/DeckAgent/Show.lua):
   - every answer is echoed into chat with its question, so it can be read again (the chat peek);
   - a long one (over SPOKEN_MAX characters; never one through respond, which caps `say` at 160) is
     spoken as the sentences that fit plus "The rest is on screen", and shown in full on a card;
-  - with Quiet on (the game's DeckKit menu), nothing is spoken: the answer goes on a card;
-  - if the assistant already put a card or reading view up for this question (show_card,
-    show_reading, respond), that's the full version: no second card, and a long spoken part is cut
-    to the sentences that fit;
+  - with Quiet on (the game's DeckKit menu), nothing is spoken: the answer goes on a card. The launcher
+    fetches the setting with Ben's position before each question (and a reminder asks for it), so
+    the answer follows a change made just before;
+  - if the assistant already put a card or reading view up for this question (respond), that's the
+    full version: no second card, and a long spoken part is cut to the sentences that fit;
   - last lines starting "Heard as:" (how she read misheard words) or "Note:" (a source or caveat with
     nothing on screen to carry it) go into chat only, never spoken.
 """
-import os, re, subprocess, threading, time
+import os, re, signal, subprocess, threading, time
 
 from . import dictation
 
@@ -139,10 +147,6 @@ def spoken_part(answer):
     return leading(answer, SPOKEN_MAX - len(ON_SCREEN) - 1) + " " + ON_SCREEN, True
 
 
-def card_seconds(text):
-    return int(min(60, 8 + len(text) / 15))
-
-
 # What Whisper tends to "hear" in silence or breath noise: never a question.
 PHANTOMS = {"you", "thank you", "thanks", "thanks for watching", "thank you for watching", "bye", "okay", "ok",
             "uh", "um", "hmm", "mm"}
@@ -151,6 +155,26 @@ PHANTOMS = {"you", "thank you", "thanks", "thanks for watching", "thank you for 
 def is_phantom(text):
     words = re.sub(r"[^a-z' ]", " ", (text or "").lower()).split()
     return not words or " ".join(words) in PHANTOMS
+
+
+MODEL_S = 120  # the assistant's time per question, prompts it waits on not counted
+KILL_GRACE_S = 2  # how long a dropped question's processes get to stop before they're killed
+
+
+def end_group(p, grace=KILL_GRACE_S):
+    """Ends a process and everything in its group (deckagent: claude, its MCP server): asked to stop,
+    then killed after `grace` seconds; the process itself is reaped."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(p.pid, sig)
+        except (ProcessLookupError, PermissionError):  # the group is gone already
+            break
+        if sig == signal.SIGTERM:
+            try:
+                p.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                pass
+    p.wait()
 
 
 class Voice:
@@ -162,20 +186,43 @@ class Voice:
         self.lock = threading.Lock()
         self.busy = False
         self.gen = 0  # bumped by interrupt(): an answer from an older question is dropped
-        self.proc = None  # the running deckagent (the default runner)
+        self.proc = None  # (gen, Popen): the running deckagent and the question it belongs to
         self.waiting = []  # hook wake-ups that came while a question was being answered: (prompt, title)
 
-    def _run(self, cmd, timeout=120, **kw):
-        """subprocess.run, but interrupt() can kill it."""
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        self.proc = p
+    def _waited(self):
+        """The link keeper's running total of time spent waiting on Ben's prompt answers (0 without)."""
+        waited = getattr(self.game, "prompt_waited", None)
+        return waited() if callable(waited) else 0.0
+
+    def model_seconds(self, since, waited_at_start=0.0):
+        """Seconds the assistant has had since `since`, without Ben's time answering its prompts
+        (the keeper's total now, less `waited_at_start`, its total when the question started)."""
+        return time.monotonic() - since - (self._waited() - waited_at_start)
+
+    def _run(self, cmd, timeout=MODEL_S, gen=None, **kw):
+        """subprocess.run in a process group of its own, which interrupt() ends whole. `timeout` is the
+        assistant's time (model_seconds), so a prompt waiting on Ben doesn't use it up."""
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        with self.lock:
+            dropped = gen is not None and gen != self.gen  # interrupted while it was starting
+            if not dropped:
+                self.proc = (gen, p)
+        if dropped:
+            end_group(p)
+        start, waited = time.monotonic(), self._waited()
         try:
-            out, err = p.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            out, err = p.communicate()
+            while True:
+                try:
+                    out, err = p.communicate(timeout=1.0)
+                    break
+                except subprocess.TimeoutExpired:
+                    if self.model_seconds(start, waited) > timeout:
+                        log("deckagent took over %d s: stopped" % timeout)
+                        end_group(p)
         finally:
-            self.proc = None
+            with self.lock:
+                if self.proc is not None and self.proc[1] is p:  # never a newer question's
+                    self.proc = None
         return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
     def interrupt(self, drop_question=True):
@@ -190,9 +237,12 @@ class Voice:
                 return
             self.gen += 1
             self.busy = False
-            proc = self.proc
-        if proc and proc.poll() is None:
-            proc.kill()
+            proc, self.proc = self.proc, None
+        cancel = getattr(self.game, "cancel_requests", None)
+        if callable(cancel):  # what it asked the game for and hasn't got (a prompt up) goes too
+            cancel()
+        if proc is not None:  # in the background: the dictation state shouldn't wait for it
+            threading.Thread(target=end_group, args=(proc[1],), daemon=True).start()
         log("dropped the last question")
 
     def ask(self, text):
@@ -227,7 +277,17 @@ class Voice:
     def remind(self, note, title):
         """A "say" hook: its note, spoken and in chat, with no model call."""
         log("reminder %r" % note)
+        self.refresh_quiet()  # nothing asked the game lately: Quiet may have changed since
         self.deliver(title, note, time.monotonic(), heading=True)
+
+    def refresh_quiet(self):
+        """Asks the game for its Quiet setting (the link keeper remembers it from the reply)."""
+        if self.game is None:
+            return
+        try:
+            self.game.handle({"cmd": "state", "fields": ["voice"]})
+        except Exception as e:
+            log("quiet: couldn't ask the game (%s); using the last answer" % e)
 
     def _answer(self, text, gen=0, title=None):
         t0 = time.monotonic()
@@ -235,7 +295,7 @@ class Voice:
         if title is None:
             self.indicator.show("thinking")
         try:
-            out = self.run([DECKAGENT, text], capture_output=True, text=True, timeout=120)
+            out = self.run([DECKAGENT, text], timeout=MODEL_S, gen=gen)
             if gen != self.gen:
                 log("answer to %r dropped (asked something else)" % text)
                 return
@@ -280,8 +340,7 @@ class Voice:
             echo = answer + ((" (" + heard + ")") if heard else "")
             line = question if heading else "You asked: " + question
             for req in [{"cmd": "show", "kind": "echo", "title": line, "text": echo}] + (
-                    [{"cmd": "show", "kind": "card", "title": "Decky", "text": answer[:600],
-                      "seconds": card_seconds(answer)}] if card else []):
+                    [{"cmd": "show", "kind": "card", "title": "Decky", "text": answer[:600]}] if card else []):
                 try:
                     reply = game.handle(req)
                     if not reply.get("ok"):

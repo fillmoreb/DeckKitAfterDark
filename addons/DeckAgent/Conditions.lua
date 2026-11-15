@@ -19,7 +19,7 @@
 --   ns.Cond.OnChange(fn)          fn() once, shortly after anything a condition reads may have changed
 local _, ns = ...
 
-local ReadU16 = ns.Bytes.ReadU16
+local ReadU16, ReadU32 = ns.Bytes.ReadU16, ns.Bytes.ReadU32
 local MANUAL, TAKEN, READY, TURNED_IN, OBJECTIVE, ITEMS, LEVEL, ZONE, XP = 0, 1, 2, 3, 4, 5, 6, 7, 8
 local ARGS = { [MANUAL] = "", [TAKEN] = "I", [READY] = "I", [TURNED_IN] = "I", [OBJECTIVE] = "IB", [ITEMS] = "IH",
     [LEVEL] = "B", [ZONE] = "H", [XP] = "I" }
@@ -40,7 +40,7 @@ function Cond.Read(p, i)
     for f in args:gmatch(".") do
         local v
         if f == "I" then
-            v = #p >= i + 3 and ReadU16(p, i) * 65536 + ReadU16(p, i + 2)
+            v = #p >= i + 3 and ReadU32(p, i)
             i = i + 4
         elseif f == "H" then
             v = #p >= i + 1 and ReadU16(p, i)

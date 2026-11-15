@@ -40,10 +40,11 @@
 --               CHAT, FRIENDS: see Chat.lua
 --               any failure: length uint8, a short reason (UTF-8)
 --
--- CHAT (op 3) and FRIENDS (op 4) are in Chat.lua, ASK (op 5) in Ask.lua, SHOW (op 7) in Show.lua,
+-- CHAT (op 3) and FRIENDS (op 4) are in Chat.lua, ASK (op 5) and DISMISS (19) in Ask.lua, SHOW (op 7) in Show.lua,
 -- QUESTS (op 8) in Quests.lua, CHECKLIST (op 11) in Checklist.lua, HOOKS (op 12) and EVENTS (op 13)
--- in Hooks.lua, CHARACTER (14), BAGS (15) and ITEM_INFO (16) in Inventory.lua; they use the helpers
--- shared below (ns.Bytes, ns.OPS). Ops get (payload, seq).
+-- in Hooks.lua, CHARACTER (14), BAGS (15), ITEM_INFO (16), PRICES (17) and MARKS (18) in Inventory.lua;
+-- each file's header documents its ops' layout. They pack and read with Bytes.lua (ns.Bytes, loaded
+-- first) and register in ns.OPS. Ops get (payload, seq).
 --
 -- Replies need the link open (the host says hello first): DeckLink.Send refuses otherwise.
 local ADDON, ns = ...
@@ -60,32 +61,8 @@ local OK, UNKNOWN_OP, BAD_ARGS, REFUSED, FAILED, UNKNOWN_VERSION = 0, 1, 2, 3, 4
 local VIA_WAYPAD, VIA_MAPPIN = 1, 2
 local FACTION = { Alliance = 1, Horde = 2 }
 
-------------------------------------------------------------------------
--- Bytes (Lua 5.1 has no string.pack)
-------------------------------------------------------------------------
-
-local function U8(n) return string.char(math.floor(n) % 256) end
-
-local function U16(n)
-    n = math.floor(n) % 65536
-    return string.char(math.floor(n / 256), n % 256)
-end
-
-local function S16(n)
-    n = math.floor(n + 0.5)
-    if n > 32767 then n = 32767 elseif n < -32768 then n = -32768 end
-    return U16(n % 65536)
-end
-
-local function Str(s)
-    s = tostring(s or ""):sub(1, 255)
-    return U8(#s) .. s
-end
-
-local function ReadU16(p, i)
-    local hi, lo = p:byte(i, i + 1)
-    return hi * 256 + lo
-end
+local B = ns.Bytes -- Bytes.lua, loaded first
+local U8, U16, U32, S16, Str, ReadU16 = B.U8, B.U16, B.U32, B.S16, B.Str, B.ReadU16
 
 local function Fraction(n) return math.floor(math.max(0, math.min(1, n)) * 65535 + 0.5) end
 
@@ -105,11 +82,6 @@ local function Position()
     if pos then x, y = pos:GetXY() end
     if Readable(x) and Readable(y) then return map, x, y end
     return map
-end
-
-local function U32(n)
-    n = math.floor(n) % 4294967296
-    return U16(math.floor(n / 65536)) .. U16(n % 65536)
 end
 
 -- The target: its NPC ID (from its GUID: Creature-0-<server>-<instance>-<zone>-<npc ID>-<spawn>), level
@@ -248,9 +220,8 @@ end
 
 local OPS = { [OP_STATE] = State, [OP_WAY] = Way, [OP_WAYPOINTS] = Waypoints }
 
--- For Chat.lua (loaded after this file).
+-- For the op files loaded after this one.
 ns.OPS = OPS
-ns.Bytes = { U8 = U8, U16 = U16, Str = Str, ReadU16 = ReadU16 }
 ns.VERSION, ns.CHANNEL = VERSION, CHANNEL
 ns.Status = { OK = OK, BAD_ARGS = BAD_ARGS, REFUSED = REFUSED, FAILED = FAILED }
 

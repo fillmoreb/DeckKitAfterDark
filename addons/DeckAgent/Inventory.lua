@@ -45,7 +45,8 @@
 local _, ns = ...
 
 local B, S = ns.Bytes, ns.Status
-local U8, U16, Str, ReadU16 = B.U8, B.U16, B.Str, B.ReadU16
+local U8, U16, U32, S16, Clamp16, Str = B.U8, B.U16, B.U32, B.S16, B.Clamp16, B.Str
+local ReadU32, ReadS16 = B.ReadU32, B.ReadS16
 local OP_CHARACTER, OP_BAGS, OP_ITEM_INFO, OP_PRICES, OP_MARKS = 14, 15, 16, 17, 18
 local NONE = 255
 
@@ -69,16 +70,6 @@ local INVTYPE = { INVTYPE_HEAD = 1, INVTYPE_NECK = 2, INVTYPE_SHOULDER = 3, INVT
     INVTYPE_WEAPONOFFHAND = 22, INVTYPE_HOLDABLE = 23, INVTYPE_AMMO = 24, INVTYPE_THROWN = 25,
     INVTYPE_RANGEDRIGHT = 26, INVTYPE_QUIVER = 27, INVTYPE_RELIC = 28 }
 
-local function U32(n)
-    n = math.floor(n) % 4294967296
-    return U16(math.floor(n / 65536)) .. U16(n % 65536)
-end
-local function S16(n)
-    n = math.floor((n or 0) + 0.5)
-    if n > 32767 then n = 32767 elseif n < -32768 then n = -32768 end
-    return U16(n % 65536)
-end
-local function Clamp16(n) return U16(math.max(0, math.min(65535, math.floor((n or 0) + 0.5)))) end
 
 -- Bags 0-4 (backpack and the four bag slots); the bank is -1 plus bags 5-10.
 local BAGS, BANK = { 0, 1, 2, 3, 4 }, { -1, 5, 6, 7, 8, 9, 10 }
@@ -143,11 +134,12 @@ ns.OPS[OP_CHARACTER] = function()
         local link = GetInventoryItemLink("player", slot)
         local id = link and tonumber(link:match("item:(%d+)"))
         if id then
-            -- item:ID:enchant:gem1:gem2:gem3:gem4:suffix:...
+            -- item:ID:enchant:gem1:gem2:gem3:gem4:suffix:uniqueID:...: field 7 is the random suffix
+            -- (it changes the stats; ItemEntry builds its links the same way), field 8 a per-copy ID.
             local fields = { strsplit(":", link:match("item:([%-%d:]+)") or "") }
             local cur, max = GetInventoryItemDurability(slot)
             local dur = (cur and max and max > 0) and math.floor(cur / max * 100 + 0.5) or NONE
-            parts[#parts + 1] = U8(slot) .. U32(id) .. U16(tonumber(fields[2]) or 0) .. S16(tonumber(fields[8]) or 0)
+            parts[#parts + 1] = U8(slot) .. U32(id) .. U16(tonumber(fields[2]) or 0) .. S16(tonumber(fields[7]) or 0)
                 .. U8(dur)
         end
     end
@@ -234,9 +226,7 @@ ns.OPS[OP_ITEM_INFO] = function(p)
     local parts, budget = {}, DeckLink.MaxPayload() - 5
     for k = 1, n do
         local i = 3 + (k - 1) * 6
-        local id = ReadU16(p, i) * 65536 + ReadU16(p, i + 2)
-        local suffix = ReadU16(p, i + 4)
-        if suffix >= 32768 then suffix = suffix - 65536 end
+        local id, suffix = ReadU32(p, i), ReadS16(p, i + 4)
         local entry = ItemEntry(id, suffix)
         if #entry > budget then break end
         budget = budget - #entry
@@ -252,7 +242,7 @@ ns.OPS[OP_PRICES] = function(p)
     local parts, budget, now = {}, DeckLink.MaxPayload() - 5, Now()
     for k = 1, n do
         local i = 3 + (k - 1) * 4
-        local id = ReadU16(p, i) * 65536 + ReadU16(p, i + 2)
+        local id = ReadU32(p, i)
         local pr = MarketDeck_GetPrice(id) or {}
         local hours = (pr.scanned and pr.scanned > 0) and math.min(65534, math.floor((now - pr.scanned) / 3600)) or 65535
         local entry = U32(id) .. U32(pr.now or 0) .. U16(math.min(65535, pr.quantity or 0)) .. U32(pr.market or 0)
@@ -290,7 +280,7 @@ ns.OPS[OP_MARKS] = function(p)
     local ids, have = {}, {}
     for k = 1, count do
         local j = i + 1 + (k - 1) * 4
-        ids[k] = ReadU16(p, j) * 65536 + ReadU16(p, j + 2)
+        ids[k] = ReadU32(p, j)
         have[k] = U16(math.min(65535, (C_Item.GetItemCount and C_Item.GetItemCount(ids[k])) or 0))
     end
     if PackPad_SetMarks then PackPad_SetMarks(MARK_PREFIX .. label, ids, label) end

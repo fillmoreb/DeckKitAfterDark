@@ -236,9 +236,21 @@ class MCPServer(unittest.TestCase):
         names = [t["name"] for t in mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]]
         self.assertEqual(names, ["get_player_state", "find_npc", "set_waypoint", "get_waypoints",
                                  "remove_waypoints", "send_chat", "get_online",
-                                 "ask_player", "get_quests", "find_quests", "get_character", "get_bags", "find_items", "flag_items", "clear_flags", "get_prices", "get_item_info", "set_hook", "list_hooks", "remove_hook", "track_checklist", "clear_checklist", "respond", "show_card", "show_reading", "remember", "remember_fact",
+                                 "ask_player", "get_quests", "find_quests", "get_character", "get_bags", "find_items", "flag_items", "clear_flags", "get_prices", "get_item_info", "set_hook", "list_hooks", "remove_hook", "track_checklist", "clear_checklist", "respond", "remember", "remember_fact",
                                  "recall", "forget_fact"])
         self.assertEqual(mcp_server.handle({"jsonrpc": "2.0", "id": 3, "method": "nope"})["error"]["code"], -32601)
+
+    def test_tools_advertised_handled_and_allowed_are_the_same(self):
+        # Every tool the server lists has a handler and is allowed by the launcher, and nothing else:
+        # a tool the launcher doesn't allow is one the model sees and can't call.
+        import importlib.machinery, importlib.util
+        path = os.path.join(HERE, "..", "agent", "deckagent")
+        loader = importlib.machinery.SourceFileLoader("deckagent_tools", path)
+        la = importlib.util.module_from_spec(importlib.util.spec_from_loader("deckagent_tools", loader))
+        loader.exec_module(la)
+        listed = {t["name"] for t in mcp_server.TOOLS}
+        self.assertEqual(listed, set(mcp_server.HANDLERS))
+        self.assertEqual(listed, {t.split("__")[-1] for t in la.TOOLS})
 
     def test_player_state_asks_only_for_its_fields(self):
         out, err = self.call("get_player_state", {"fields": ["position", "who", "combat"]})
@@ -334,7 +346,16 @@ class LinkKeeper(unittest.TestCase):
                 test.closed += 1
         self.FakeLink = FakeLink
         self.keeper = agentd.Keeper(25, make_link=FakeLink, clock=lambda: self.now[0])
-        p = mock.patch.object(host, "state", lambda lk, fields: {"ok": True, "fields": fields})
+        self.sent = []
+
+        def request(lk, packet, timeout=None):
+            """The game's reply to a STATE request: each asked field, zeroed."""
+            self.sent.append(packet)
+            sizes = {"pos": 6, "world": 5, "zone": 1, "who": 3, "combat": 1, "brain": 1, "voice": 1, "target": 7}
+            mask = packet[1]
+            return bytes([packet[0], 1, 0, mask]) + b"".join(
+                bytes(sizes[f]) for b, f in enumerate(host.FIELDS) if mask >> b & 1)
+        p = mock.patch.object(host, "request", request)
         p.start()
         self.addCleanup(p.stop)
         tmp = tempfile.TemporaryDirectory()
@@ -362,9 +383,9 @@ class LinkKeeper(unittest.TestCase):
         self.assertEqual(self.opened, 2)
 
     def test_a_failed_request_starts_clean(self):
-        def broken(lk, fields):
+        def broken(lk, packet, timeout=None):
             raise self.agentd.link.LinkError("frame not received")
-        with mock.patch.object(host, "state", broken):
+        with mock.patch.object(host, "request", broken):
             reply = self.keeper.handle({"cmd": "state"})
         self.assertEqual(reply, {"ok": False, "error": "frame not received"})
         self.assertEqual(self.closed, 1)
@@ -375,6 +396,107 @@ class LinkKeeper(unittest.TestCase):
         self.assertFalse(self.keeper.handle({"cmd": "runlua"})["ok"])
         self.assertFalse(self.keeper.handle({"cmd": "state", "fields": ["secrets"]})["ok"])
         self.assertFalse(self.keeper.handle({"cmd": "way", "map": 1})["ok"])  # missing x, y
+        self.assertFalse(self.keeper.handle({"cmd": "chat", "channel": "trade", "text": "wts"})["ok"])
+        self.assertEqual((self.opened, self.sent), (0, []))  # refused before any link opened
+
+    def test_every_command_is_prepared_once_in_agent_py(self):
+        # agentd has no command list or packet builders of its own: a waypoint (once missing from its
+        # checks) is built by agent.prepare and sent as is.
+        self.keeper.handle({"cmd": "way", "map": 1454, "x": 36, "y": 87.7})
+        self.assertEqual(self.sent, [host.build_way(1454, 36, 87.7)])
+        self.assertIn("way", host.COMMANDS)
+        self.assertFalse(self.keeper.handle({"cmd": "way", "map": 1454, "x": 136, "y": 87.7})["ok"])
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.opened, 1)
+
+    def test_a_dropped_question_frees_the_link_and_its_queued_requests_never_run(self):
+        # Its prompt holds the lock waiting for Ben; its next request queues behind it. The voice drops
+        # the question (cancel_requests): the prompt ends within its next check, the queued request is
+        # refused unrun, and the next question's request runs.
+        import threading, time as t
+        started = threading.Event()
+
+        def waits_for_ben(lk, cancelled=None):
+            started.set()
+            while not cancelled():
+                t.sleep(0.01)
+            return {"ok": False, "cancelled": True}
+        real = host.prepare
+        prompt = mock.Mock(run=waits_for_ben)
+        with mock.patch.object(host, "prepare", lambda req: prompt if req["cmd"] == "prompt" else real(req)):
+            out = {}
+            first = threading.Thread(target=lambda: out.update(prompt=self.keeper.handle({"cmd": "prompt"})))
+            first.start()
+            started.wait(2)
+            queued = threading.Thread(target=lambda: out.update(chat=self.keeper.handle(
+                {"cmd": "chat", "channel": "say", "target": "", "text": "old question's message"})))
+            queued.start()
+            t.sleep(0.05)
+            self.keeper.cancel_requests()
+            first.join(2)
+            queued.join(2)
+        self.assertTrue(out["prompt"]["cancelled"])
+        self.assertTrue(out["chat"]["cancelled"])
+        self.assertEqual(self.sent, [])  # the chat never went out
+        self.assertTrue(self.keeper.handle({"cmd": "state", "fields": ["zone"]})["ok"])  # the next question's
+
+    def test_a_client_that_hung_up_gets_nothing_run(self):
+        reply = self.keeper.handle({"cmd": "chat", "channel": "say", "target": "", "text": "hi"}, client_gone=lambda: True)
+        self.assertTrue(reply["cancelled"])
+        self.assertEqual(self.sent, [])
+
+    def test_the_service_notices_a_client_hang_up(self):
+        import socket, threading, time as t
+        seen = threading.Event()
+
+        def waits_for_ben(lk, cancelled=None):
+            for _ in range(300):
+                if cancelled():
+                    seen.set()
+                    break
+                t.sleep(0.01)
+            return {"ok": False, "cancelled": True}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(host, "prepare", return_value=mock.Mock(run=waits_for_ben)):
+            path = os.path.join(tmp, "s.sock")
+            threading.Thread(target=self.agentd.serve, args=(self.keeper, path), daemon=True).start()
+            for _ in range(100):
+                if os.path.exists(path):
+                    break
+                t.sleep(0.01)
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.connect(path)
+            c.sendall(b'{"cmd": "prompt"}\n')
+            t.sleep(0.1)
+            c.close()  # the asker's process was ended
+            self.assertTrue(seen.wait(2))
+
+    def test_a_request_the_service_took_is_never_sent_again(self):
+        # A timeout after the keeper took the request: reported as unknown, not handed to a second link.
+        from decklink import agentd
+        with mock.patch.object(agentd, "ask", side_effect=agentd.NoAnswer("timed out")):
+            code, out = host.via_service(["chat", "say", "", "hello"])
+        self.assertEqual(code, 1)
+        self.assertTrue(json.loads(out)["unknown"])
+        with mock.patch.object(agentd, "ask", side_effect=agentd.NotRunning(2, "no socket")):
+            self.assertIsNone(host.via_service(["chat", "say", "", "hello"]))  # nothing sent: do it yourself
+
+    def test_a_slow_service_is_no_answer_not_not_running(self):
+        import socket, threading
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "slow.sock")
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            srv.bind(path)
+            srv.listen(1)
+            got = []
+            threading.Thread(target=lambda: got.append(srv.accept()), daemon=True).start()
+            with self.assertRaises(self.agentd.NoAnswer):
+                self.agentd.ask({"cmd": "status"}, path, timeout=0.2)
+            with self.assertRaises(self.agentd.NotRunning):
+                self.agentd.ask({"cmd": "status"}, os.path.join(tmp, "nobody.sock"))
+            for conn, _ in got:
+                conn.close()
+            srv.close()
 
     def test_socket_round_trip(self):
         import threading
@@ -386,8 +508,8 @@ class LinkKeeper(unittest.TestCase):
                     break
                 __import__("time").sleep(0.01)
             self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
-            self.assertEqual(self.agentd.ask({"cmd": "state", "fields": ["zone"]}, path),
-                             {"ok": True, "fields": ["zone"]})
+            reply = self.agentd.ask({"cmd": "state", "fields": ["zone"]}, path)
+            self.assertEqual((reply["ok"], reply["fields"]), (True, ["zone"]))
             with self.assertRaises(OSError):
                 self.agentd.ask({"cmd": "status"}, os.path.join(tmp, "nobody.sock"))
 
@@ -495,6 +617,83 @@ class VoiceAnswers(unittest.TestCase):
         self.assertEqual(stops, [1])
         self.assertEqual(self.said, ["Old answer."])  # one answer: the second question's, not both
         self.assertEqual(self.shown.count("done"), 1)
+
+    def test_dropping_a_question_ends_its_whole_process_group(self):
+        # deckagent starts claude, which starts the MCP server: all of them go, even one that ignores
+        # SIGTERM (killed after the grace), and the old run never clears the next question's process.
+        import threading
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(self.voice, "KILL_GRACE_S", 0.3):
+            pidfile = os.path.join(tmp, "child")
+            v = self.voice.Voice(indicator=mock.Mock(), say=mock.Mock())
+            v.busy = True
+            done = []
+            cmd = ["sh", "-c", 'trap "" TERM; sleep 30 & echo $! > %s; wait' % pidfile]
+            t = threading.Thread(target=lambda: done.append(v._run(cmd, gen=0)), daemon=True)
+            t.start()
+            for _ in range(200):
+                if os.path.exists(pidfile) and open(pidfile).read().strip():
+                    break
+                __import__("time").sleep(0.01)
+            child = int(open(pidfile).read())
+            v.interrupt()
+            t.join(5)
+            self.assertTrue(done)
+            for _ in range(300):
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                __import__("time").sleep(0.01)
+            else:
+                self.fail("the grandchild outlived its dropped question")
+            newer = object()
+            v.proc, v.gen = (1, newer), 1
+            v._run(["true"], gen=0)  # an older question's runner, finishing late
+            self.assertEqual(v.proc, (1, newer))
+
+    def test_time_waiting_on_ben_isnt_the_assistants(self):
+        from decklink import agentd
+        clock = [1000.0]
+        keeper = agentd.Keeper(25, make_link=lambda: None)
+        keeper._ensure = lambda: object()
+
+        def answered_after_10_s(lk, cancelled=None):
+            clock[0] += 10
+            return {"ok": True, "answer": "A"}
+        with mock.patch.object(agentd.agent, "prepare", return_value=mock.Mock(run=answered_after_10_s)), \
+                mock.patch.object(agentd.time, "monotonic", lambda: clock[0]):
+            for _ in range(8):  # every wait counts, the sixth and later too
+                keeper.handle({"cmd": "prompt"})
+            self.assertEqual(keeper.prompt_waited(), 80)
+            keeper._waiting_since = clock[0] - 5  # one up now, for 5 s
+            self.assertEqual(keeper.prompt_waited(), 85)
+        keeper._waited, keeper._waiting_since = 30.0, None
+        v = self.voice.Voice(indicator=mock.Mock(), say=mock.Mock(), game=keeper)
+        t = __import__("time").monotonic()
+        # The question started 60 s ago, when the keeper's total was 10: 20 s of it were Ben's.
+        self.assertAlmostEqual(v.model_seconds(t - 60, 10.0), 40, delta=0.5)
+        v = self.voice.Voice(indicator=mock.Mock(), say=mock.Mock())  # no keeper: all of it counts
+        start = __import__("time").monotonic()
+        out = v._run(["sleep", "30"], timeout=0.2)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertLess(__import__("time").monotonic() - start, 5)
+
+    def test_a_reminder_asks_for_quiet_first(self):
+        asked = []
+        game = mock.Mock(quiet=False, shown_at=0)
+
+        def handle(req):
+            asked.append(req)
+            if req["cmd"] == "state":
+                game.quiet = True  # Ben turned Quiet on since the last answer
+            return {"ok": True}
+        game.handle = handle
+        said = []
+        v = self.voice.Voice(indicator=mock.Mock(), say=said.append, game=game)
+        with mock.patch("threading.Thread", lambda target, daemon=None, args=(): mock.Mock(start=lambda: target(*args))):
+            v.remind("Train your spells.", "Hook: level 20")
+        self.assertEqual(asked[0], {"cmd": "state", "fields": ["voice"]})
+        self.assertEqual(said, [])
 
     def test_dictation_recording_interrupts_the_voice(self):
         from decklink import agentd
@@ -647,6 +846,12 @@ class Conversation(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = os.path.join(self.tmp.name, "session.json")
+
+    def test_prefetch_asks_for_quiet_so_the_keeper_knows_it(self):
+        calls = []
+        with mock.patch.object(self.la.common, "game", lambda *a, **kw: calls.append(a) or {"ok": True}):
+            self.la.prefetch(False)
+        self.assertIn("voice", calls[0])
 
     def test_continues_within_the_window_then_starts_fresh(self):
         la = self.la
@@ -852,6 +1057,55 @@ class Asking(unittest.TestCase):
         self.assertTrue(all(p == bytes([codec.OP_PING]) for p in pings))
 
 
+class Dismissing(unittest.TestCase):
+    """DISMISS (Ask.lua): a prompt the host gave up on goes, unanswered and with no ANSWER sent."""
+
+    def test_dismiss_takes_the_prompt_down_without_an_answer(self):
+        self.assertEqual(host.build_dismiss(7), b"\x53\x07")
+        ask_frame = bitstr(codec.build(host.CHANNEL, 7, host.build_ask("Go?", ["Yes", "No"])))
+        base = "login() " + hello() + ' taps("%s") frame() ' % ask_frame
+        _, s = Game.run(base)
+        ack = lambda st, seq: 'taps("%s") frame() ' % bitstr(codec.build(0, seq, bytes([codec.OP_ACK, codec.parse(st.out)[1]])))
+        dismiss = 'taps("%s") frame() ' % bitstr(codec.build(host.CHANNEL, 9, host.build_dismiss(7)))
+        shown = 'print("PROMPT", tostring(DeckAgentPrompt.shown)) '
+        lines, s2 = Game.run(base + ack(s, 8) + dismiss + shown)
+        reply = host.parse_reply(codec.parse(s2.out)[2])
+        self.assertEqual((reply["op"], reply["dismissed"]), (host.OP_DISMISS, True))
+        self.assertIn("PROMPT\tfalse", lines)
+        # Its time running out later sends nothing: the strip is empty once the reply is acked.
+        _, s3 = Game.run(base + ack(s, 8) + dismiss + ack(s2, 10) + "fireTimers() frame()")
+        self.assertIsNone(s3.out if s3 else None)
+        # Another seq (a prompt that isn't the latest) is left alone.
+        _, s4 = Game.run(base + ack(s, 8) + 'taps("%s") frame() ' % bitstr(codec.build(host.CHANNEL, 9, host.build_dismiss(3))))
+        self.assertFalse(host.parse_reply(codec.parse(s4.out)[2])["dismissed"])
+
+    def test_a_cancelled_wait_dismisses_and_returns_at_once(self):
+        sent = []
+
+        class FakeLink:
+            t = 0.0
+
+            def send(self, ch, payload):
+                sent.append(bytes(payload))
+                return 0x21 if payload[0] & 0x3F == host.OP_ASK else 0x22
+
+            def recv(self, timeout):
+                self.t += 1.0
+                if sent[-1][0] & 0x3F == host.OP_DISMISS:
+                    return (3, b"\x53\x22\x00\x01")
+                return None
+        lk = FakeLink()
+        calls = [0]
+
+        def cancelled():
+            calls[0] += 1
+            return calls[0] > 2
+        out = host.prepare({"cmd": "prompt", "question": "Which?", "options": ["A", "B"]}).run(lk, cancelled)
+        self.assertTrue(out["cancelled"])
+        self.assertEqual(sent[-1], host.build_dismiss(0x21))
+        self.assertLess(lk.t, 10)  # seconds, not the prompt's minutes
+
+
 class Transcripts(Conversation):
     def test_one_line_per_question(self):
         la = self.la
@@ -865,8 +1119,7 @@ class Transcripts(Conversation):
 
 
 class Showing(unittest.TestCase):
-    """SHOW (addons/DeckAgent/Show.lua <-> decklink/agent.py), speak or show (decklink/voice.py) and the
-    show_card / show_reading tools."""
+    """SHOW (addons/DeckAgent/Show.lua <-> decklink/agent.py) and speak or show (decklink/voice.py)."""
 
     def test_packet(self):
         self.assertEqual(host.build_show("card", "Hi", "two\nlines", seconds=20, item=6948),
@@ -881,6 +1134,15 @@ class Showing(unittest.TestCase):
         self.assertLessEqual(len(codec.build(host.CHANNEL, 1, host.build_show("reading", "t" * 120, "x" * host.SHOW_TEXT["reading"]))),
                              codec.MAX_IN + 16)
         self.assertEqual(mcp_server.SHOW_TEXT, {k: v for k, v in host.SHOW_TEXT.items() if k != "echo"})
+
+    def test_a_card_without_seconds_stays_long_enough_to_read(self):
+        # One rule (card_seconds) for every card: respond's (no --seconds) and the voice's.
+        text = "x" * 300
+        self.assertEqual(host.build_show("card", "t", text)[2], host.card_seconds(text))
+        self.assertEqual(host.card_seconds(text), 28)
+        self.assertEqual(host.card_seconds("y" * 5000), 60)
+        self.assertEqual(host.build_show("card", "t", text, seconds=0)[2], 0)  # until he closes it
+        self.assertEqual(host.build_show("reading", "t", text)[2], 0)
 
     def test_echo_goes_to_chat_and_reply_says_quiet(self):
         data, lines = ask(host.build_show("echo", "You asked: where's the |cff bank", "Waypoint set: the bank."))
@@ -1058,9 +1320,22 @@ class Quests(unittest.TestCase):
         self.assertEqual(hidden["name"], "Hidden Enemies")
         self.assertEqual([(o["what"], o["have"], o["done"]) for o in hidden["objectives"]],
                          [("Far Trainer", 1, True), ("Jergosh the Invoker slain", 0, False)])
-        self.assertEqual(hidden["turn_in"]["name"], "Aelthalyste")
+        self.assertEqual([g["name"] for g in hidden["turned_in_at"]], ["Aelthalyste"])
         self.assertEqual(books["objectives"][0]["from"], ["Far Trainer", "Alliance Priest", "Kalimdor Priest (vendor)"])
-        self.assertEqual((books["complete"], books["turn_in"]["zone"]), (True, "Orgrimmar"))
+        self.assertEqual((books["complete"], books["turned_in_at"][0]["zone"]), (True, "Orgrimmar"))
+
+    def test_quest_log_gives_every_turn_in_like_find_quests(self):
+        # A quest taken in at an NPC and at an object: both, with the object's coordinates, the same
+        # list find_quests gives (quest_givers).
+        db = self.db()
+        db.execute("INSERT INTO quest_giver VALUES (5728, 'object', 31, 'end')")
+        game = host.parse_reply(ask(host.build_quests())[0])["quests"]
+        state = {"map": 1458, "x": 0.49, "y": 0.18}
+        hidden = gamedb.quest_log(db, game, state)[0]
+        self.assertEqual([g["name"] for g in hidden["turned_in_at"]], ["Aelthalyste", "Old Lion Statue"])
+        statue = hidden["turned_in_at"][1]
+        self.assertEqual((statue["map_id"], statue["x"], statue["y"]), (1458, 50, 50))
+        self.assertEqual(hidden["turned_in_at"], gamedb.quest_givers(db, 5728, "end", state))
 
     def test_cli(self):
         self.assertEqual(host._request_for(["quests"]), {"cmd": "quests"})
@@ -1125,14 +1400,6 @@ class CardItems(unittest.TestCase):
     def test_text_cards_stay_paragraphs(self):
         self.assertEqual(mcp_server.card_text([], "Wowhead.", "Take the lift down.\n- not a bullet"),
                          "Take the lift down.\nnot a bullet\n\nWowhead.")
-        with mock.patch.object(mcp_server.common, "game", return_value={"ok": True, "result": "shown"}) as game:
-            mcp_server.tool_show_card({"title": "Getting there", "text": "Take the lift down."})
-            self.assertEqual(game.call_args[0][0:2], ("show", "card"))
-            self.assertEqual(game.call_args[0][-1], "Take the lift down.")
-            with self.assertRaises(common.GameError):
-                mcp_server.tool_show_card({"title": "Both", "text": "a", "items": [{"text": "b"}]})
-            with self.assertRaises(common.GameError):
-                mcp_server.tool_show_card({"title": "Neither"})
 
 
 class Respond(unittest.TestCase):
@@ -1154,6 +1421,7 @@ class Respond(unittest.TestCase):
         self.assertEqual(game.call_args[0][-1], "- Rahauro")  # a list never shows checks
         _, game = self.call(display="text", title="How", text="Take the lift.")
         self.assertEqual(game.call_args[0][-1], "Take the lift.")
+        self.assertNotIn("--seconds", game.call_args[0])  # how long it stays: the host side's card_seconds
         _, game = self.call(display="reading", title="Guide", text="# Boss\n- dodge")
         self.assertEqual(game.call_args[0][1], "reading")
 
@@ -1359,6 +1627,81 @@ class DeckHooks(unittest.TestCase):
         self.assertEqual(again.expire(), ["3"])
         self.assertIn("Stepping Stones turned in", self.hooks_mod.wake_prompt("Stepping Stones turned in", "next"))
 
+    def test_saves_from_many_threads_keep_every_hook(self):
+        # Requests and the glance save from their own threads: each save its own temporary file, the
+        # state under the store's lock, so none fails and none is lost.
+        import threading
+        errors = []
+
+        def add(n):
+            try:
+                for k in range(10):
+                    self.store.add_timer(5, "note %d-%d" % (n, k), "say")
+            except Exception as e:  # noqa: BLE001 - any failure is the bug
+                errors.append(e)
+        threads = [threading.Thread(target=add, args=(n,)) for n in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        again = self.hooks_mod.Hooks(self.store.path, clock=lambda: self.now[0])
+        self.assertEqual(len(again.data["timers"]), 80)
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), ["hooks.json"])  # no temporary file left
+
+    def test_a_hook_is_set_and_its_note_saved_under_the_keeper_lock(self):
+        from decklink import agentd
+        k = agentd.Keeper(25, make_link=lambda: mock.Mock(), hook_store=self.store)
+        held = []
+        real = self.store.add_game
+        self.store.add_game = lambda *a, **kw: held.append(k.lock.locked()) or real(*a, **kw)
+        with mock.patch.object(agentd.agent, "hooks", return_value={"ok": True, "id": 5, "already": False}):
+            reply = k.handle({"cmd": "hook", "op": "add", "when": {"track": "level", "level": 20}, "note": "n",
+                              "action": "say"})
+        self.assertTrue(reply["ok"])
+        self.assertEqual(held, [True])  # the glance can't collect hook 5 before its note is saved
+
+    def test_a_hook_note_goes_only_once_the_game_removed_the_hook(self):
+        from decklink import agentd
+        self.store.add_game(3, "Set the waypoint.", "wake", "d", 30)
+        self.store.add_game(4, "Train.", "say", "level 20 reached", 30)
+        k = agentd.Keeper(25, make_link=lambda: mock.Mock(), hook_store=self.store)
+        lost = agentd.link.LinkError("frame not received")
+        with mock.patch.object(agentd.agent, "hooks", side_effect=lost):
+            self.assertFalse(k.handle({"cmd": "hook", "op": "remove", "id": "3"})["ok"])
+            self.assertFalse(k.handle({"cmd": "hook", "op": "clear"})["ok"])
+        self.assertEqual(sorted(self.store.data["game"]), ["3", "4"])  # still set in the game: notes kept
+        with mock.patch.object(agentd.agent, "hooks", return_value={"ok": True, "removed": 1}):
+            self.assertTrue(k.handle({"cmd": "hook", "op": "remove", "id": "3"})["ok"])
+        self.assertEqual(sorted(self.store.data["game"]), ["4"])
+        # A removal whose answer was lost leaves a stale note: the next list, from the game's own, drops it.
+        with mock.patch.object(agentd.agent, "hooks", return_value={"ok": True, "hooks": []}), \
+                mock.patch.object(agentd.agent, "events", return_value={"ok": True, "events": []}):
+            self.assertEqual(k.handle({"cmd": "hook", "op": "list"})["hooks"], [])
+        self.assertFalse(self.store.any_game())
+
+    def test_a_list_collects_fired_hooks_before_pruning(self):
+        # Hook 4 fired: it's off the game's list but its event waits. The list takes the event (and the
+        # note) first, so pruning can't lose it, and the next glance hands it to the voice.
+        from decklink import agentd
+        self.store.add_game(4, "Train.", "say", "level 20 reached", 30)
+        k = agentd.Keeper(25, make_link=lambda: mock.Mock(), hook_store=self.store)
+        with mock.patch.object(agentd.agent, "hooks", return_value={"ok": True, "hooks": []}), \
+                mock.patch.object(agentd.agent, "events",
+                                  return_value={"ok": True, "events": [{"id": 4, "seconds_ago": 2}]}):
+            k.handle({"cmd": "hook", "op": "list"})
+        fired = k.glance()
+        self.assertEqual([e["note"] for e, _ in fired], ["Train."])
+
+    def test_a_hook_change_dropped_while_waiting_for_the_lock_does_nothing(self):
+        from decklink import agentd
+        k = agentd.Keeper(25, make_link=lambda: mock.Mock(), hook_store=self.store)
+        answers = iter([False, True])  # not yet dropped when it arrives; dropped once it has the lock
+        with mock.patch.object(agentd.agent, "hooks") as hooks_call:
+            reply = k.hook({"op": "clear"}, cancelled=lambda: next(answers))
+        self.assertTrue(reply.get("cancelled"))
+        hooks_call.assert_not_called()
+
     def test_glance_collects_and_dispatches(self):
         from decklink import agentd
 
@@ -1458,6 +1801,15 @@ class Inventory(unittest.TestCase):
         self.assertEqual(reply["equipped"], [
             {"slot": "chest", "item_id": 16607, "enchant_id": None, "suffix_id": None, "durability_pct": 75},
             {"slot": "main_hand", "item_id": 277247, "enchant_id": 15, "suffix_id": -3, "durability_pct": None}])
+
+    def test_equipped_suffix_is_link_field_7_and_changes_the_stats(self):
+        # The Mug's link (harness EQUIPPED) is item:277247:15:::::-3:14: suffix -3, then the copy's own ID
+        # 14. The suffix, asked back through ITEM_INFO (signed), brings its stamina; the base item has none.
+        mug = host.parse_reply(ask(host.build_character())[0])["equipped"][1]
+        self.assertEqual((mug["item_id"], mug["suffix_id"]), (277247, -3))
+        with_suffix, base = host.parse_reply(ask(host.build_item_info([(277247, mug["suffix_id"]), 277247]))[0])["items"]
+        self.assertEqual(with_suffix["stats"], {"dps": 9.5, "stamina": 4})
+        self.assertEqual(base["stats"], {"dps": 9.5})
 
     def test_bags_and_bank(self):
         reply = host.parse_reply(ask(host.build_bags())[0])
@@ -1565,6 +1917,15 @@ class Prices(unittest.TestCase):
     def test_not_installed(self):
         with mock.patch.object(mcp_server.common, "game", return_value={"ok": True, "market_installed": False, "prices": []}):
             self.assertIn("MarketDeck", mcp_server.tool_get_prices({"item_ids": [2589]})["note"])
+
+    def test_get_prices_asks_the_game_once(self):
+        reply = host.parse_reply(ask(host.build_prices([2589, 12299]), self.STUB)[0])
+        with mock.patch.object(mcp_server.common, "game", return_value=reply) as game, \
+                mock.patch.object(mcp_server.common, "DB_PATH", "/nonexistent.db"):
+            out = mcp_server.tool_get_prices({"item_ids": [2589, 12299]})
+        self.assertEqual(game.call_count, 1)
+        self.assertEqual([i["best"] for i in out["items"]], ["auction house", "disenchant"])
+        self.assertNotIn("note", out)  # the newest scan (2 hours) is fresh
 
 
 class Marks(unittest.TestCase):

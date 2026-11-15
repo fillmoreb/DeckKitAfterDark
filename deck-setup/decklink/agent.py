@@ -1,6 +1,8 @@
 """The game side of DeckAgent, asked from the Deck: one binary request on channel 3, one reply.
-addons/DeckAgent/Agent.lua answers and documents the packet layout; keep the two in step
-(test/test_agent.py checks the bytes both ways). agent/mcp_server.py is the usual caller.
+addons/DeckAgent answers: Agent.lua's header documents the framing and its ops, each other op file
+(Chat, Ask, Show, Quests, Checklist, Hooks, Inventory) its own; keep them in step (test/test_agent.py
+checks the bytes both ways). Every request is checked and built here (prepare), for the CLI and the
+link keeper alike. agent/mcp_server.py is the usual caller.
 
     decklink agent state [FIELD ...]     where you are; FIELDs: pos world zone who combat brain voice
                                          (default: all)
@@ -33,8 +35,8 @@ from . import codec
 
 CHANNEL = 3
 VERSION = 1
-OP_STATE, OP_WAY, OP_CHAT, OP_FRIENDS, OP_ASK, OP_ANSWER, OP_SHOW, OP_QUESTS, OP_QUEST_STATUS, OP_WAYPOINTS, OP_CHECKLIST, OP_HOOKS, OP_EVENTS, OP_CHARACTER, OP_BAGS, OP_ITEM_INFO, OP_PRICES, OP_MARKS = (
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
+OP_STATE, OP_WAY, OP_CHAT, OP_FRIENDS, OP_ASK, OP_ANSWER, OP_SHOW, OP_QUESTS, OP_QUEST_STATUS, OP_WAYPOINTS, OP_CHECKLIST, OP_HOOKS, OP_EVENTS, OP_CHARACTER, OP_BAGS, OP_ITEM_INFO, OP_PRICES, OP_MARKS, OP_DISMISS = (
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)
 ASK_RESULT = {1: "shown", 2: "queued"}
 NO_ANSWER = 255
 KEEPALIVE_S = 10  # the game closes the link after 30 s without a frame
@@ -141,9 +143,21 @@ def build_ask(question, options, as_list=False, seconds=30):
     return bytes([op_byte(OP_ASK), 1 if as_list else 0, max(5, min(120, int(seconds)))]) + body
 
 
-def build_show(kind, title, text, seconds=0, item=0):
+def build_dismiss(seq):
+    """DISMISS: take down the prompt the ASK frame `seq` put up (nobody waits for its answer now)."""
+    return bytes([op_byte(OP_DISMISS), int(seq) & 0xFF])
+
+
+def card_seconds(text):
+    """How long a card stays up when nobody says: long enough to read it (8 s plus ~15 characters a
+    second, at most a minute). The one rule for every card, the assistant's (respond) and the voice's."""
+    return int(min(60, 8 + len(text or "") / 15))
+
+
+def build_show(kind, title, text, seconds=None, item=0):
     """SHOW: kind echo/card/reading, a title (echo: the question) and the text (echo: the answer). An
-    echo too long is cut (it's a copy of what was said); a card or reading view too long is refused."""
+    echo too long is cut (it's a copy of what was said); a card or reading view too long is refused.
+    seconds: a card's time on screen (0: until he closes it; None: card_seconds)."""
     if kind not in SHOW_KINDS:
         raise ValueError("kind is one of: " + " ".join(SHOW_KINDS))
     t = (title or "").encode("utf-8")
@@ -157,6 +171,8 @@ def build_show(kind, title, text, seconds=0, item=0):
         body = body[:limit - 3].decode("utf-8", "ignore").encode("utf-8") + "…".encode("utf-8")
     if kind != "echo" and not body.strip() and not t.strip():
         raise ValueError("nothing to show")
+    if seconds is None:
+        seconds = card_seconds(body.decode("utf-8", "ignore")) if kind == "card" else 0
     seconds = max(0, min(255, int(seconds)))
     return (bytes([op_byte(OP_SHOW), SHOW_KINDS.index(kind) + 1, seconds]) + struct.pack(">I", int(item))
             + bytes([len(t)]) + t + struct.pack(">H", len(body)) + body)
@@ -457,6 +473,9 @@ def parse_reply(p, asked=FIELDS):
     elif out["op"] == OP_QUEST_STATUS:
         (n,), i = _unpack(">B", p, i)
         out["status"] = [QUEST_STATUS.get(b, b) for b in _unpack(">%dB" % n, p, i)[0]]
+    elif out["op"] == OP_DISMISS:
+        (done,), i = _unpack(">B", p, i)
+        out["dismissed"] = done == 1
     elif out["op"] == OP_ANSWER:
         (choice,), i = _unpack(">B", p, i)
         out["choice"] = None if choice == NO_ANSWER else choice
@@ -507,19 +526,37 @@ def request(lk, packet, timeout=REPLY_TIMEOUT):
             return payload
 
 
+# How long a prompt may take beyond its own seconds: the reply to the request, and a prompt queued
+# behind a fight (it shows when combat ends). Callers further out wait longer (via_service, the MCP
+# server's ask_player, the launcher's MCP_TOOL_TIMEOUT), so this is the deadline that runs out first.
+PROMPT_EXTRA_S = REPLY_TIMEOUT + 120
+
+
 def ask(lk, question, options, as_list=False, seconds=30, clock=time.monotonic):
     """Shows a prompt and waits for Ben's answer: {"answer": option text or None, "choice": 1-6, 0 for
     cancelled, None for no answer}. Keeps the link alive while it waits."""
+    return _await_answer(lk, build_ask(question, options, as_list, seconds), options, clock)
+
+
+def _await_answer(lk, packet, options, clock=time.monotonic, cancelled=None):
+    """Sends the ASK packet and waits for Ben's answer. `cancelled()` true (checked about once a
+    second): the question it was for was dropped, so the prompt is taken down in the game (DISMISS) and
+    the wait ends at once, rather than holding the link for minutes."""
     from .link import LinkError
-    packet = build_ask(question, options, as_list, seconds)
     seq = lk.send(CHANNEL, packet)
     shown = None
-    deadline = clock() + int(packet[2]) + REPLY_TIMEOUT + 120  # a queued prompt (combat) can wait longer
+    deadline = clock() + int(packet[2]) + PROMPT_EXTRA_S
     keepalive = clock() + KEEPALIVE_S
     while True:
         now = clock()
         if now >= deadline:
             raise LinkError("no answer from the game")
+        if cancelled is not None and cancelled():
+            try:
+                request(lk, build_dismiss(seq))
+            except LinkError:
+                pass  # it times out by itself in the game
+            return {"ok": False, "cancelled": True, "error": "the question it was for was dropped"}
         if now >= keepalive:
             lk.send(0, bytes([codec.OP_PING]))  # any frame keeps the game's end open
             keepalive = now + KEEPALIVE_S
@@ -540,76 +577,88 @@ def ask(lk, question, options, as_list=False, seconds=30, clock=time.monotonic):
             return {"ok": True, "shown": shown, "choice": choice, "answer": answer}
 
 
-def state(lk, fields=FIELDS):
-    return parse_reply(request(lk, build_state(fields)), fields)
-
-
-def way(lk, map_id, x, y):
-    return parse_reply(request(lk, build_way(map_id, x, y)))
-
-
-def chat(lk, channel, target, text):
-    return parse_reply(request(lk, build_chat(channel, target, text)))
-
-
-def friends(lk, lists=LISTS):
-    return parse_reply(request(lk, build_friends(lists)))
-
-
-def character(lk):
-    return parse_reply(request(lk, build_character()))
-
-
-def bags(lk, bank=False):
-    return parse_reply(request(lk, build_bags(bank)))
-
-
-def item_info(lk, items):
-    return parse_reply(request(lk, build_item_info(items)))
-
-
-def prices(lk, ids):
-    return parse_reply(request(lk, build_prices(ids)))
-
-
-def marks(lk, label, ids=None, clear=False):
-    return parse_reply(request(lk, build_marks(label, ids, clear)))
-
-
 def hooks(lk, action, when=None, minutes=0, hid=0):
+    """HOOKS for the link keeper (agentd.py), which keeps each hook's note: never a CLI command."""
     return parse_reply(request(lk, build_hooks(action, when, minutes, hid)))
 
 
 def events(lk):
+    """EVENTS: the fired hooks the game has queued (the link keeper's glance)."""
     return parse_reply(request(lk, build_events()))
 
 
-def checklist(lk, title=None, items=None, clear=False):
-    return parse_reply(request(lk, build_checklist(title, items, clear)))
+class Prepared:
+    """A request checked and its packet built, before any link opens (a bad one shouldn't cost one):
+    run(lk) sends it on an open Link and returns the parsed reply."""
+
+    def __init__(self, cmd, packet, finish=None, answer_options=None):
+        self.cmd, self.packet = cmd, packet
+        self._finish = finish or parse_reply
+        self._options = answer_options  # a prompt: wait for Ben's answer, not just the reply
+
+    def run(self, lk, cancelled=None):
+        """`cancelled`: a prompt's wait ends (and the prompt goes) once it's true."""
+        if self._options is not None:
+            return _await_answer(lk, self.packet, self._options, cancelled=cancelled)
+        return self._finish(request(lk, self.packet))
 
 
-def waypoints(lk, action="list", wid=0):
-    return parse_reply(request(lk, build_waypoints(action, wid)))
+# Link keeper / CLI requests (see _request_for) -> their packets. state, quest-status and prompt are
+# in prepare(): their replies need the request to read them.
+BUILDERS = {
+    "way": lambda r: build_way(r["map"], r["x"], r["y"]),
+    "chat": lambda r: build_chat(r["channel"], r.get("target", ""), r["text"]),
+    "friends": lambda r: build_friends(r.get("lists") or LISTS),
+    "character": lambda r: build_character(),
+    "bags": lambda r: build_bags(r.get("bank", False)),
+    "item-info": lambda r: build_item_info(r["items"]),
+    "prices": lambda r: build_prices(r["ids"]),
+    "mark": lambda r: build_marks(r.get("label", ""), r.get("ids"), r.get("clear", False)),
+    "checklist": lambda r: build_checklist(r.get("title"), r.get("items"), r.get("clear", False)),
+    "waypoints": lambda r: build_waypoints(r.get("action", "list"), r.get("id", 0)),
+    "quests": lambda r: build_quests(),
+    "show": lambda r: build_show(r["kind"], r.get("title", ""), r.get("text", ""), r.get("seconds"),
+                                 r.get("item", 0)),
+}
+COMMANDS = set(BUILDERS) | {"state", "quest-status", "prompt"}
 
 
-def quests(lk):
-    return parse_reply(request(lk, build_quests()))
+def prepare(req):
+    """One link keeper request -> Prepared. ValueError or KeyError when it's bad (nothing is sent)."""
+    cmd = req.get("cmd")
+    if cmd == "state":
+        fields = list(req.get("fields") or FIELDS)
+        bad = [f for f in fields if f not in FIELDS]
+        if bad:
+            raise ValueError("unknown field %s (fields: %s)" % (", ".join(bad), " ".join(FIELDS)))
+        return Prepared(cmd, build_state(fields), lambda p: parse_reply(p, fields))
+    if cmd == "quest-status":
+        ids = [int(i) for i in req["ids"]]
 
-
-def quest_status(lk, ids):
-    reply = parse_reply(request(lk, build_quest_status(ids)))
-    if reply.get("ok"):
-        reply["quests"] = dict(zip([int(i) for i in ids], reply.pop("status")))
-    return reply
-
-
-def show(lk, kind, title, text, seconds=0, item=0):
-    return parse_reply(request(lk, build_show(kind, title, text, seconds, item)))
+        def finish(p):
+            reply = parse_reply(p)
+            if reply.get("ok"):
+                reply["quests"] = dict(zip(ids, reply.pop("status")))
+            return reply
+        return Prepared(cmd, build_quest_status(ids), finish)
+    if cmd == "prompt":
+        options = list(req["options"])
+        return Prepared(cmd, build_ask(req["question"], options, req.get("list", False), req.get("seconds", 30)),
+                        answer_options=options)
+    if cmd == "hook":
+        raise ValueError("hooks go through the link keeper (the decklink-agent service), which keeps their notes")
+    if cmd not in BUILDERS:
+        raise ValueError("unknown cmd %r" % cmd)
+    return Prepared(cmd, BUILDERS[cmd](req))
 
 
 def via_service(argv):
     """`decklink agent ...` through the link keeper (agentd) when it's running: (exit code, printed) or
-    None when there's no service (the caller then opens the link itself)."""
+    None when there's no service (the caller then opens the link itself).
+
+    Only a service that couldn't be reached at all means "no service". Once the request is in, the
+    keeper may be carrying it out (a chat message sent, a waypoint set) however its answer fails to come
+    back, so it's reported as unknown and never sent again by another link."""
     from . import agentd
     req = _request_for(argv)
     if req is None:
@@ -617,8 +666,11 @@ def via_service(argv):
     wait = 30 + (int(req.get("seconds", 30)) + 150 if req["cmd"] == "prompt" else 0)
     try:
         reply = agentd.ask(req, timeout=wait)
-    except OSError:
+    except agentd.NotRunning:
         return None
+    except agentd.NoAnswer as e:
+        reply = {"ok": False, "error": "the link keeper took the request but its answer never came (%s): it may "
+                                       "have been carried out, so it wasn't sent again" % e, "unknown": True}
     return (0 if reply.get("ok") else 1), json.dumps(reply)
 
 
@@ -694,55 +746,12 @@ def _request_for(argv):
     return None
 
 
-def handle(lk, req):
-    """One link keeper request (see _request_for) on an open Link -> the parsed reply."""
-    cmd = req["cmd"]
-    if cmd == "state":
-        fields = req.get("fields") or FIELDS
-        bad = [f for f in fields if f not in FIELDS]
-        if bad:
-            raise ValueError("unknown field %s (fields: %s)" % (", ".join(bad), " ".join(FIELDS)))
-        return state(lk, fields)
-    if cmd == "way":
-        return way(lk, req["map"], req["x"], req["y"])
-    if cmd == "chat":
-        return chat(lk, req["channel"], req.get("target", ""), req["text"])
-    if cmd == "friends":
-        return friends(lk, req.get("lists") or LISTS)
-    if cmd == "character":
-        return character(lk)
-    if cmd == "bags":
-        return bags(lk, req.get("bank", False))
-    if cmd == "item-info":
-        return item_info(lk, req["items"])
-    if cmd == "prices":
-        return prices(lk, req["ids"])
-    if cmd == "mark":
-        return marks(lk, req.get("label", ""), req.get("ids"), req.get("clear", False))
-    if cmd == "hook":
-        raise ValueError("hooks go through the link keeper (the decklink-agent service), which keeps their notes")
-    if cmd == "checklist":
-        return checklist(lk, req.get("title"), req.get("items"), req.get("clear", False))
-    if cmd == "waypoints":
-        return waypoints(lk, req.get("action", "list"), req.get("id", 0))
-    if cmd == "quests":
-        return quests(lk)
-    if cmd == "quest-status":
-        return quest_status(lk, req["ids"])
-    if cmd == "show":
-        return show(lk, req["kind"], req.get("title", ""), req.get("text", ""), req.get("seconds", 0),
-                    req.get("item", 0))
-    if cmd == "prompt":
-        return ask(lk, req["question"], req["options"], req.get("list", False), req.get("seconds", 30))
-    raise ValueError("unknown cmd %r" % cmd)
-
-
 def main(lk, argv):
     """`decklink agent ...` with an open Link. Returns the exit code."""
     req = _request_for(argv)
     if req is None:
         print(__doc__)
         return 2
-    reply = handle(lk, req)
+    reply = prepare(req).run(lk)
     print(json.dumps(reply))
     return 0 if reply.get("ok") else 1

@@ -16,7 +16,7 @@
 local _, ns = ...
 
 local B, S = ns.Bytes, ns.Status
-local U8, Str = B.U8, B.Str
+local U8, Str, ReadStr = B.U8, B.Str, B.ReadStr
 local Cond = ns.Cond
 local OP_CHECKLIST = 11
 local SET, CLEAR = 1, 2
@@ -132,12 +132,6 @@ Cond.OnChange(function() Checklist.Update() end)
 ------------------------------------------------------------------------
 -- The op
 ------------------------------------------------------------------------
-
-local function ReadStr(p, i)
-    local n = p:byte(i)
-    if not n or i + n > #p then return nil end
-    return p:sub(i + 1, i + n), i + 1 + n
-end
 
 local function Parse(p)
     local title, i = ReadStr(p, 3)

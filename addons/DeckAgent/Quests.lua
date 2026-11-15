@@ -18,15 +18,10 @@
 local _, ns = ...
 
 local B, S = ns.Bytes, ns.Status
-local U8, U16, Str = B.U8, B.U16, B.Str
+local U8, U32, Str = B.U8, B.U32, B.Str
 local OP_QUESTS, OP_QUEST_STATUS = 8, 9
 local KINDS = { monster = 1, item = 2, object = 3, event = 4, reputation = 5 }
 local OTHER = 6
-
-local function U32(n)
-    n = math.floor(n) % 4294967296
-    return U16(math.floor(n / 65536)) .. U16(n % 65536)
-end
 
 local function Count(n) return math.max(0, math.min(255, math.floor(tonumber(n) or 0))) end
 
@@ -69,7 +64,7 @@ ns.OPS[OP_QUEST_STATUS] = function(p)
     local out = {}
     for k = 1, n do
         local i = 3 + (k - 1) * 4
-        local id = B.ReadU16(p, i) * 65536 + B.ReadU16(p, i + 2)
+        local id = B.ReadU32(p, i)
         local status = NOT_TAKEN
         if C_QuestLog.IsQuestFlaggedCompleted and C_QuestLog.IsQuestFlaggedCompleted(id) then
             status = DONE

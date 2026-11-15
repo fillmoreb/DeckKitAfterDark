@@ -1,33 +1,48 @@
 # Installing DeckKitAfterDark
 
-Two halves: **addons** in the game, and a small **program side** on the Steam Deck (Python, two
-background services) that feeds them. Read the README's first paragraph before you install: these
-addons exchange data with programs outside the game, a gray area under Blizzard's terms.
+Two halves: **addons** in the game, and a **program side** on the Steam Deck (Python: three
+background services and a daily timer) that feeds them. DeckAgent, the voice assistant, needs a few
+more things set up by hand (steps 3 and 4); everything else works without it. Read the README's first
+paragraph before you install: these addons exchange data with programs outside the game, a gray area
+under Blizzard's terms.
 
 ## Before you start
 
 - **DeckKit** installed and working (its [INSTALL.md](https://github.com/fillmoreb/DeckKit/blob/main/INSTALL.md)).
 - Play in **Game Mode**: DeckLink reads the screen through gamescope's video stream, which only Game Mode has.
-- For DeckDictation: **Decktation** 0.3.24 or later (DeckKit's INSTALL.md, "Speech to text").
+- For DeckDictation: **Decktation** 0.3.24 or later (DeckKit's INSTALL.md, "Speech to text"). For
+  DeckAgent: Ben's fork of Decktation, with an agent binding (step 3).
 - **A password for the Deck's `deck` account.** It has none out of the box, and both `sudo` (step 3) and
   SSH need one. In Desktop Mode, open Konsole and run `passwd` once.
 
 ## 1. The addons
 
-Copy the folders in `addons/` (**DeckLink**, **DeckTelemetry**, **DeckDictation**) into WoW: Forever's
-`_forever_/Interface/AddOns` folder, next to DeckKit's. DeckTelemetry and DeckDictation need DeckLink;
-install only the ones you want.
+Copy the folders in `addons/` (**DeckLink**, **DeckTelemetry**, **DeckDictation**, **DeckAgent**) into
+WoW: Forever's `_forever_/Interface/AddOns` folder, next to DeckKit's. The others all need DeckLink;
+install only the ones you want. DeckAgent also uses DeckKit's WayPad (waypoints), MarketDeck (prices)
+and PackPad (item flags) when they're installed.
 
 ## 2. The program side
 
-It installs into your home folder only (`~/.local`), as the `deck` user, with no system changes:
+It installs into your home folder only (`~/.local`, `~/.config/systemd/user`), as the `deck` user,
+with no system changes:
 
-- the `decklink` package in `~/.local/lib/decklink`
-- `~/.local/bin/decklink` (the command) and `~/.local/bin/decklink-decktation-hook` (for Decktation)
-- two systemd **user** services, started now and with every boot:
+- the `decklink` package in `~/.local/lib/decklink`, and DeckAgent (launcher, MCP server, database
+  tools) in `~/.local/lib/deckagent`
+- in `~/.local/bin`: `decklink` (the command), `decklink-decktation-hook` (Decktation's status hook),
+  `decklink-agent-ask` (Decktation's agent binding command), `deckagent` (ask from a terminal) and
+  `deckagent-update` (rebuild DeckAgent's game database now)
+- three systemd **user** services, started now and with every boot:
   - `decklink-telemetry`: sends the Deck's battery, power, temperatures, fan and load to DeckTelemetry
     every 5 s
   - `decklink-cover`: hides DeckLink's strip of colored cells from you while a program has the link open
+  - `decklink-agent`: DeckAgent's link keeper, which holds the link open while the assistant is asked
+    things, answers voice questions, and keeps the assistant's hooks
+- the `deckagent-update` **timer**: once a day it rebuilds DeckAgent's game database when QuestieDB has
+  changed. The first install starts a build right away, in the background (a minute or two; it needs
+  internet). How it works: "DeckAgent notes" below.
+- Decktation's WoW hotwords: `wow-vocabulary.txt` into its `profiles.json` (`wow.hotwords` only; the
+  rest of the file is left as it is)
 
 Pick one way:
 
@@ -50,43 +65,78 @@ Settings › Internet on the Deck). ssh asks for the Deck's password.
 `git -C DeckKitAfterDark pull --ff-only`; from a zip, download and unzip a fresh one. Then copy the
 addon folders again (step 1) and rerun the install (step 2).
 
-## 3. Decktation's status hook (for DeckDictation)
+## 3. Decktation's settings (for DeckDictation and DeckAgent)
 
-Decktation runs a command each time its state changes; DeckLink carries that into the game. Decktation
-keeps that setting in a file owned by root, so on the Deck, in Konsole, run these three commands (the
-first keeps a backup of the file; the second sets the one setting and leaves the rest as they are; the
-third restarts Decky to load it):
+Decktation runs a command each time its state changes (its status hook); DeckLink carries that into
+the game. For DeckAgent, its agent binding (L5+R5) hands what you said to a command instead of typing
+it, and "exact binding only" keeps bigger grip chords from starting it. Decktation keeps these settings
+in a file owned by root, so on the Deck, in Konsole, run these three commands (the first keeps a backup
+of the file; the second sets those settings and leaves the rest as they are; the third restarts Decky
+to load them):
 ```
 sudo cp /home/deck/homebrew/settings/decktation/button_config.json{,.bak}
-sudo python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["statusHookCommand"]="/home/deck/.local/bin/decklink-decktation-hook"; json.dump(d, open(p, "w"), indent=2)' /home/deck/homebrew/settings/decktation/button_config.json
+sudo python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["statusHookCommand"]="/home/deck/.local/bin/decklink-decktation-hook"; d["agentBinding"]={"buttons": ["L5", "R5"], "command": "/home/deck/.local/bin/decklink-agent-ask"}; d["exactBindingMs"]=150; json.dump(d, open(p, "w"), indent=2)' /home/deck/homebrew/settings/decktation/button_config.json
 sudo systemctl restart plugin_loader
 ```
-If Decktation misbehaves afterwards, put the backup back:
-`sudo cp /home/deck/homebrew/settings/decktation/button_config.json{.bak,}` and restart Decky again.
+Without DeckAgent (or with stock Decktation, which has no agent binding), leave out the
+`agentBinding` and `exactBindingMs` assignments. Restarting Decky can drop the game's controller focus,
+so do it outside the game or expect to refocus. If Decktation misbehaves afterwards, put the backup
+back: `sudo cp /home/deck/homebrew/settings/decktation/button_config.json{.bak,}` and restart Decky
+again.
 
-## 4. Check it
+In Decktation's own settings, pick the speech model: **parakeet-v3** is recommended (Ben, 2026-11-14:
+"has been working much better" than Whisper). It runs on the CPU and takes no hotwords, so the WoW
+hotwords from step 2 only help the Whisper models (base, small ~465 MB, medium).
+
+## 4. DeckAgent (the voice assistant)
+
+Skip this step without DeckAgent.
+
+- **Claude Code** on the Deck (`~/.local/bin/claude`), signed in to a Claude plan: `claude`, then log
+  in (or `claude auth login`). `deckagent` warns if it ever runs on an API key instead.
+- **Piper** (text to speech) for spoken answers: the `piper` binary (in `piper/`) and the
+  `en_US-lessac-medium.onnx` + `.onnx.json` voice, all in `~/.local/share/deckagent/piper/`.
+- In DeckKit's menu: put **DeckKit Assistant** (`DECKKIT_ASSISTANT`) on the L5+R5 grip chord, so the
+  dictation box says "Starting" and game sound fades while you ask. Tools › DeckAgent has the model
+  pick, Quiet, chat preview, and "Clear Decky's checklist" (also offered to the grip chords, so her
+  checklist can be taken down with the controller alone).
+- First use: tell Decky who your friends are; she writes them under People in `~/.deckagent/CLAUDE.md`.
+
+## 5. Check it
 
 - In the game: `/deckkit telemetry` prints the latest readings (DeckHUD's status bar can show them:
-  Screen › Status bar). `/deckkit link` shows how the link is going.
-- On the Deck: `systemctl --user status decklink-telemetry decklink-cover`, and in Game Mode with the game
-  running, `decklink status` shows the strip as it reads it.
+  Screen › Status bar). `/deckkit link` shows how the link is going; `/deckkit agent` what the
+  assistant has asked of the game.
+- On the Deck: `systemctl --user status decklink-telemetry decklink-cover decklink-agent`, and in Game
+  Mode with the game running, `decklink status` shows the strip as it reads it.
+- DeckAgent: `systemctl --user list-timers deckagent-update.timer`, `journalctl --user -u
+  deckagent-update` (the database build), then `deckagent "where am I?"`.
 
 ## Uninstalling
 
+Stop and remove every service, the timer, and the installed files:
 ```
-systemctl --user disable --now decklink-cover decklink-telemetry
-rm -rf ~/.local/lib/decklink ~/.local/bin/decklink ~/.local/bin/decklink-decktation-hook \
-  ~/.config/systemd/user/decklink-cover.service ~/.config/systemd/user/decklink-telemetry.service
+systemctl --user disable --now decklink-cover decklink-telemetry decklink-agent deckagent-update.timer
+systemctl --user stop deckagent-update.service
+rm -rf ~/.local/lib/decklink ~/.local/lib/deckagent \
+  ~/.local/bin/decklink ~/.local/bin/decklink-decktation-hook ~/.local/bin/decklink-agent-ask \
+  ~/.local/bin/deckagent ~/.local/bin/deckagent-update \
+  ~/.config/systemd/user/decklink-cover.service ~/.config/systemd/user/decklink-telemetry.service \
+  ~/.config/systemd/user/decklink-agent.service ~/.config/systemd/user/deckagent-update.service \
+  ~/.config/systemd/user/deckagent-update.timer
+systemctl --user daemon-reload
 ```
-Put Decktation's settings back from the backup (step 3), or run step 3's python command with `d.pop("statusHookCommand", None)` in place of the assignment, then delete the addon folders.
+Put Decktation's settings back from the backup (step 3), or run step 3's python command with
+`d.pop("statusHookCommand", None); d.pop("agentBinding", None); d.pop("exactBindingMs", None)` in place
+of the assignments, and restart Decky. To take the WoW hotwords out of Decktation's profile:
+`python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d.get("wow", {}).pop("hotwords", None); json.dump(d, open(p, "w"), indent=2)' /home/deck/homebrew/settings/decktation/profiles.json`.
+Then delete the addon folders. DeckAgent's own folder, `~/.deckagent` (the game database, and her
+notes, memory, hooks and transcripts: all personal), stays until you delete it: `rm -rf ~/.deckagent`.
 
-## DeckAgent: notes for the install steps (still to be written up)
+## DeckAgent notes
 
-A running list of everything a DeckAgent install needs, kept as we build it so nothing is lost. Fold
-it into numbered steps above once DeckAgent settles. "Done by the installer" means
-`install-on-deck.sh` (or `install.sh`) already does it.
-
-**Addons:** also copy **DeckAgent** (needs DeckLink; WayPad from DeckKit is optional, for waypoints).
+What the steps above set up for DeckAgent, and why, kept current as it's built. "Done by the installer"
+means `install-on-deck.sh` (or `install.sh`) already does it (step 2); "by hand" is steps 3 and 4.
 
 **Done by the installer**
 - `~/.local/lib/deckagent` (launcher, MCP server, database tools), `~/.local/bin/deckagent`,
@@ -110,15 +160,15 @@ it into numbered steps above once DeckAgent settles. "Done by the installer" mea
     `journalctl --user -u deckagent-update`, `systemctl --user list-timers deckagent-update.timer`.
   - Never commit or redistribute the data (QuestieDB has no license file): download only.
 
-**Manual today (to automate or document)**
+**By hand (steps 3 and 4; to automate later)**
 - **Claude Code** on the Deck (`~/.local/bin/claude`) and signed in to a Claude plan (`claude`,
   then log in). `deckagent` warns if it ever runs on an API key instead.
 - **Piper** (text to speech) for spoken answers: the `piper` binary and the
   `en_US-lessac-medium.onnx` + `.onnx.json` voice in `~/.local/share/deckagent/piper/`.
 - **Decktation**: Ben's fork, with an **agent binding** (L5+R5) that hands its transcript to a
-  command. In `button_config.json` (root-owned, like step 3):
+  command. In `button_config.json` (root-owned):
   `"agentBinding": {"buttons": ["L5", "R5"], "command": "/home/deck/.local/bin/decklink-agent-ask"}`,
-  `"exactBindingMs": 150`, and `"statusHookCommand"` as in step 3. Then restart Decky
+  `"exactBindingMs": 150`, and `"statusHookCommand"`, all set by step 3's command. Then restart Decky
   (`sudo systemctl restart plugin_loader`). This can drop the game's controller focus, so do it
   outside the game or expect to refocus.
 - The speech model in Decktation's settings: **parakeet-v3** recommended (Ben, 2026-11-14: "has
@@ -130,7 +180,8 @@ it into numbered steps above once DeckAgent settles. "Done by the installer" mea
   her checklist can be taken down with the controller alone).
 - First use: tell Decky who your friends are; she writes them under People in
   `~/.deckagent/CLAUDE.md`. Her facts go in `~/.deckagent/memory.db`, her hooks' notes and timers in
-  `~/.deckagent/hooks.json`. All personal; they stay out of the repo.
+  `~/.deckagent/hooks.json`. All personal; they stay out of the repo (uninstalling leaves them; see
+  Uninstalling).
 
 **Requirements already on SteamOS** (checked 2026-11-14): Python 3.13, GStreamer with PyGObject,
 PipeWire tools (`pw-dump`, `pw-play`), `xdotool`. The paste route needs `xclip`, which SteamOS

@@ -9,6 +9,8 @@
 --       seconds = 30,                        -- then it closes unanswered
 --       onAnswer = function(choice) end,     -- 1..n the option, 0 cancelled (B on a list), nil none
 --   })                                       -- returns "shown", or "queued" (in combat: shows after)
+--   ns.Prompt.Dismiss(spec)                  -- takes that prompt down (or out of the queue) unanswered,
+--                                            -- without calling its onAnswer; false if it isn't up
 --
 -- The answer runs inside your own button press (a real hardware event), so it can do what only a press
 -- may, like /say outdoors. It reads only the pad's button events: no polling (a polled press isn't a
@@ -174,6 +176,18 @@ function Prompt.Show(spec)
 end
 
 function Prompt.IsShown() return box ~= nil and box:IsShown() end
+
+function Prompt.Dismiss(spec)
+    if queued == spec then
+        queued = nil
+        return true
+    end
+    if not (box and current == spec) then return false end
+    spec.onAnswer = nil -- nobody is waiting for it any more
+    box.Answer(nil)
+    if not draining then box:Hide() end
+    return true
+end
 
 ns.On("PLAYER_REGEN_ENABLED", function()
     if queued then

@@ -239,6 +239,14 @@ def set_meta(db, **values):
         db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (k, str(v)))
 
 
+def near_state(near):
+    """An MCP tool's `near` ({map_id, x, y}, x and y 0-100 like /way) -> the state dict the searches
+    here take ({map, x, y}, x and y 0-1, like the game's STATE reply), or None without one."""
+    if not near:
+        return None
+    return {"map": int(near["map_id"]), "x": float(near["x"]) / 100, "y": float(near["y"]) / 100}
+
+
 def player_world(db, state):
     """(cont, wx, wy) for a DeckAgent state reply: the game's own world position, else from its map."""
     if state.get("cont") is not None and state.get("wx") is not None:
@@ -351,9 +359,10 @@ def _item_sources(db, item):
 
 def quest_log(db, game_quests, state=None):
     """The game's QUESTS reply (IDs and counts only) with names from the database: each quest's name,
-    level, summary, objectives (what, have/need, done; for items, who drops or sells them) and who
-    takes it in (nearest spawn when `state` has a position). The game lists objectives kills and objects
-    first, then items, each in the quest's order: they're matched to the database's by kind, in order."""
+    level, summary, objectives (what, have/need, done; for items, who drops or sells them) and
+    turned_in_at, every NPC or object that takes it in (quest_givers, as find_quests gives them). The
+    game lists objectives kills and objects first, then items, each in the quest's order: they're
+    matched to the database's by kind, in order."""
     out = []
     for q in game_quests:
         row = db.execute("SELECT * FROM quest WHERE id = ?", (q["id"],)).fetchone()
@@ -377,14 +386,9 @@ def quest_log(db, game_quests, state=None):
                     obj["from"] = _item_sources(db, g["target"])
             objectives.append(obj)
         entry["objectives"] = objectives
-        ender = db.execute("SELECT kind, id FROM quest_giver WHERE quest = ? AND role = 'end' ORDER BY kind = 'npc' DESC",
-                           (q["id"],)).fetchone()
-        if ender and ender["kind"] == "npc":
-            spot = find_npc_once(db, "n.id = ?", [ender["id"]], state, None, 1)
-            entry["turn_in"] = ({k: spot[0][k] for k in ("name", "zone", "map_id", "x", "y", "distance_yards")}
-                                if spot else {"name": _name(db, "monster", ender["id"])})
-        elif ender:
-            entry["turn_in"] = {"name": _name(db, ender["kind"], ender["id"])}
+        enders = quest_givers(db, q["id"], "end", state)
+        if enders:
+            entry["turned_in_at"] = enders
         out.append(entry)
     return out
 
@@ -411,9 +415,12 @@ def load_areas(db, dungeons_lua, zones_lua):
 
 
 def quest_givers(db, qid, role, state=None):
-    """Who starts (or ends) a quest: [{name, zone, map_id, x, y, distance_yards}] (or just a name)."""
+    """Who starts (or ends) a quest, NPCs and objects alike: [{name, zone, map_id, x, y, distance_yards}]
+    (each at its spawn nearest `state`; just a name when it has no spawn outside an instance), nearest
+    first when there's a position, NPCs before objects otherwise."""
     out = []
-    for g in db.execute("SELECT kind, id FROM quest_giver WHERE quest = ? AND role = ?", (qid, role)):
+    for g in db.execute("SELECT kind, id FROM quest_giver WHERE quest = ? AND role = ? ORDER BY kind = 'npc' DESC",
+                        (qid, role)):
         if g["kind"] == "npc":
             spot = find_npc_once(db, "n.id = ?", [g["id"]], state, None, 1)
             if spot:
@@ -427,6 +434,8 @@ def quest_givers(db, qid, role, state=None):
         name = _name(db, {"npc": "monster"}.get(g["kind"], g["kind"]), g["id"])
         if name:
             out.append({"name": name + (" (an item: it starts the quest)" if g["kind"] == "item" else "")})
+    # Nearest first; those with no distance (another continent, no spawn) keep their order after.
+    out.sort(key=lambda g: (g.get("distance_yards") is None, g.get("distance_yards") or 0))
     return out
 
 

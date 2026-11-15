@@ -27,7 +27,7 @@
 local _, ns = ...
 
 local B, S = ns.Bytes, ns.Status
-local U8, U16, Str = B.U8, B.U16, B.Str
+local U8, U16, U32, Str, ReadStr = B.U8, B.U16, B.U32, B.Str, B.ReadStr
 local OP_CHAT, OP_FRIENDS = 3, 4
 local CHANNELS = { "SAY", "YELL", "PARTY", "RAID", "GUILD", "WHISPER", "BN_WHISPER", "INSTANCE_CHAT" }
 local LABELS = { SAY = "Say", YELL = "Yell", PARTY = "Party", RAID = "Raid", GUILD = "Guild", WHISPER = "Whisper",
@@ -37,18 +37,6 @@ local PREVIEW_SECONDS = 30
 
 DeckAgentDB = DeckAgentDB or {}
 local function Preview() return DeckAgentDB.previewChat == true end
-
-local function U32(n)
-    n = math.floor(n) % 4294967296
-    return U16(math.floor(n / 65536)) .. U16(n % 65536)
-end
-
--- A length-prefixed string at i: returns it and the next index, or nil when it runs past the end.
-local function ReadStr(p, i)
-    local n = p:byte(i)
-    if not n or i + n > #p then return nil end
-    return p:sub(i + 1, i + n), i + 1 + n
-end
 
 -- Chat can't carry control characters, and "|" starts the game's escape codes (links, colors).
 local function Clean(text)

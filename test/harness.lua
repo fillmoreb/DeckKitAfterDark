@@ -159,22 +159,31 @@ C_Container = {
     GetContainerNumSlots = function(bag) return BAGSLOTS[bag] and #BAGSLOTS[bag] or 0 end,
     GetContainerItemInfo = function(bag, slot) local s = BAGSLOTS[bag] and BAGSLOTS[bag][slot]; return s or nil end,
 }
-EQUIPPED = { [5] = "|cff1eff00|Hitem:16607::::::::14|h[Robe]|h|r", [16] = "|Hitem:277247:15::::::-3:14|h[Mug]|h" }
+-- Links are item:ID:enchant:gem1:gem2:gem3:gem4:suffix:uniqueID: the Mug's random suffix (-3) changes its
+-- stats (ITEMS below); 14 is the copy's own ID, which must never be read as the suffix.
+EQUIPPED = { [5] = "|cff1eff00|Hitem:16607::::::::14|h[Robe]|h|r", [16] = "|Hitem:277247:15:::::-3:14|h[Mug]|h" }
 GetInventoryItemLink = function(_, slot) return EQUIPPED[slot] end
 GetInventoryItemDurability = function(slot) if slot == 5 then return 30, 40 end end
 C_SpecializationInfo = { GetSpecialization = function() return 1 end, GetSpecializationInfo = function() return 1487 end }
 ITEMS = { [19019] = { cached = true, loc = "INVTYPE_WEAPON", class = 2, sub = 7, q = 5, ilvl = 80, req = 60,
                       stats = { ITEM_MOD_AGILITY_SHORT = 5, ITEM_MOD_DAMAGE_PER_SECOND_SHORT = 41.84, RESISTANCE2_NAME = 8,
                                 FIRE_RESISTANCE = 8 } },
-          [5000] = { cached = false, loc = "INVTYPE_HEAD", class = 4, sub = 1, q = 2, ilvl = 20, req = 15, stats = {} } }
+          [5000] = { cached = false, loc = "INVTYPE_HEAD", class = 4, sub = 1, q = 2, ilvl = 20, req = 15, stats = {} },
+          [277247] = { cached = true, loc = "INVTYPE_WEAPON", class = 2, sub = 4, q = 2, ilvl = 18, req = 13,
+                       stats = { ITEM_MOD_DAMAGE_PER_SECOND_SHORT = 9.5 },
+                       suffixes = { [-3] = { ITEM_MOD_DAMAGE_PER_SECOND_SHORT = 9.5, ITEM_MOD_STAMINA_SHORT = 4 } } } }
 LOADS = {}
 C_Item.GetItemInfoInstant = function(id) local it = ITEMS[id]; if it then return id, "", "", it.loc, 0, it.class, it.sub end end
 C_Item.IsItemDataCachedByID = function(id) return ITEMS[id] and ITEMS[id].cached end
 C_Item.RequestLoadItemDataByID = function(id) table.insert(LOADS, id) end
 C_Item.GetItemInfo = function(link) local it = ITEMS[tonumber(link:match("item:(%d+)"))]
     if it and it.cached then return "x", link, it.q, it.ilvl, it.req end end
-C_Item.GetItemStats = function(link) local it = ITEMS[tonumber(link:match("item:(%d+)"))]
-    if it and it.cached then return it.stats end end
+C_Item.GetItemStats = function(link)
+    local fields = { strsplit(":", link:match("item:([%-%d:]+)") or "") }
+    local it = ITEMS[tonumber(fields[1])]
+    if not (it and it.cached) then return end
+    return it.suffixes and it.suffixes[tonumber(fields[7])] or it.stats
+end
 strsplit = strsplit or function(sep, s) local out = {} for part in (s .. sep):gmatch("(.-)" .. sep:gsub("%p", "%%%0")) do out[#out + 1] = part end return unpack(out) end
 
 -- For DeckAgent's Show.lua.

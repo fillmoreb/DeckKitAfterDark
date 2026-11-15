@@ -208,6 +208,23 @@ class Paste(unittest.TestCase):
         self.assertEqual(s.bad, 1)
         self.assertNotEqual(s.rx_seq, 9)
 
+    def test_a_frame_sent_again_runs_once_whichever_way_it_comes(self):
+        # The paste ran, but its ack went unseen: the host sends another PASTE (a new seq, channel 0),
+        # pastes the same line, then falls back to keys with the same seq. One delivery, each one acked.
+        payload = b"x" * 60
+        paste = lambda seq: 'taps("%s") frame() ' % bitstr(codec.build(0, seq, bytes([codec.OP_PASTE])))
+        line = 'DeckLinkPaste:SetText("%s") frame() ' % self.line(9, 5, payload)
+        code = (ECHO + hello() + paste(2) + line + paste(3) + line
+                + 'taps("%s") frame() ' % bitstr(codec.build(5, 9, payload)))
+        lines, s = Game.run(code)
+        self.assertEqual(lines.count("GOT " + payload.decode()), 1)
+        self.assertEqual(s.rx_seq, 9)
+
+    def test_a_new_session_or_a_long_gap_forgets_the_seqs(self):
+        frame = 'taps("%s") frame() ' % bitstr(codec.build(5, 9, b"again"))
+        lines, _ = Game.run(ECHO + hello(1) + frame + hello(2) + frame + "later(31) " + frame)
+        self.assertEqual(lines.count("GOT again"), 3)
+
     def test_the_box_gives_focus_back_if_nothing_comes(self):
         paste = bitstr(codec.build(0, 2, bytes([codec.OP_PASTE])))
         lines, _ = Game.run(ECHO + hello() + ' taps("%s") frame() later(4) frame()'
@@ -326,6 +343,8 @@ class FakeGame:
 
     def __init__(self, drop_first=0):
         self.rx_seq = self.rx_count = self.bad = 0
+        self.seen = {}  # channel -> last seq delivered on it (Link.lua's seenSeq)
+        self.lose_paste_acks = 0  # pastes delivered while the strip keeps showing the old seq
         self.open = False
         self.queue = []
         self.drop_first = drop_first
@@ -341,22 +360,20 @@ class FakeGame:
         payload = base64.b64decode(data)
         if len(payload) == int(length) and codec.crc16(payload) == int(crc, 16):
             self.pastes += 1
-            self.rx_seq = int(seq)
-            self.received.append((int(ch), payload))
+            self.deliver(int(ch), int(seq), payload)
+            if self.lose_paste_acks:  # it ran, but the host never sees the ack
+                self.lose_paste_acks -= 1
+                self.rx_seq = -1
 
-    def send(self, bits):
-        data = bytes(int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8))
-        if self.drop_first:
-            self.drop_first -= 1
-            self.bad += 1
-            return
-        ch, seq, payload = codec.parse(data)
-        self.rx_count += 1
-        if seq == self.rx_seq:
-            return
+    def deliver(self, ch, seq, payload):
+        """Link.lua's Deliver: every good frame is acked, but a seq runs once per channel."""
         self.rx_seq = seq
+        if self.seen.get(ch) == seq:
+            return
+        self.seen[ch] = seq
         if ch == 0 and payload[0] == codec.OP_HELLO:
             self.open = True
+            self.seen = {0: seq}
         elif ch == 0 and payload[0] == codec.OP_ACK:
             if self.queue and self.queue[0][1] == payload[1]:
                 self.queue.pop(0)
@@ -366,6 +383,16 @@ class FakeGame:
             self.queue.append(codec.parse(codec.build(0, len(self.queue) + 50, payload)))
         else:
             self.received.append((ch, payload))
+
+    def send(self, bits):
+        data = bytes(int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits), 8))
+        if self.drop_first:
+            self.drop_first -= 1
+            self.bad += 1
+            return
+        ch, seq, payload = codec.parse(data)
+        self.rx_count += 1
+        self.deliver(ch, seq, payload)
 
     def read(self):
         if not self.open:
@@ -451,6 +478,48 @@ class Host(unittest.TestCase):
         lk.open()
         lk.send(5, bytes(100))
         self.assertEqual(game.received, [(5, bytes(100))])
+
+    def paster(self, game):
+        game.clipboard = FakeClipboard(None)
+        tick = iter(range(1000000))
+        lk = link.Link(sender=game, reader=None, sleep=lambda s: None, clipboard=game.clipboard,
+                       clock=lambda: next(tick) * 0.05)
+        lk.read = lambda: setattr(lk, "status", self._read(game)) or lk.status
+        return lk.open()
+
+    def test_a_paste_whose_ack_was_missed_runs_once(self):
+        game = FakeGame()
+        game.lose_paste_acks = 1
+        lk = self.paster(game)
+        seq = lk.send(5, bytes(100))
+        self.assertEqual(game.received, [(5, bytes(100))])
+        self.assertEqual((game.pastes, game.rx_seq), (2, seq))  # pasted again, acked, not run again
+
+    def test_the_key_fallback_keeps_the_frame_seq(self):
+        game = FakeGame()
+        game.lose_paste_acks = 2  # both paste tries ran unseen: the frame then goes by keys
+        lk = self.paster(game)
+        seq = lk.send(5, bytes(100))
+        self.assertEqual(game.received, [(5, bytes(100))])
+        self.assertEqual(game.rx_seq, seq)
+
+    def test_frames_too_big_to_finish_by_keys_are_refused(self):
+        # By keys, KEYS_MAX bytes take ~9 s, so three tries fit the game's 30 s windows; one byte more
+        # is refused without a tap (when its paste failed, it isn't sent at all).
+        game = FakeGame()
+        lk = self.make(game).open()
+        lk.send_by_keys(5, bytes(link.KEYS_MAX))
+        self.assertEqual(game.received, [(5, bytes(link.KEYS_MAX))])
+        taps = game.rx_count
+        with self.assertRaises(link.LinkError):
+            lk.send_by_keys(5, bytes(link.KEYS_MAX + 1))
+        self.assertEqual(game.rx_count, taps)
+        self.assertLess((link.KEYS_MAX + codec.OVERHEAD) * 8 * 3 / 450, 30)  # bits at ~450 a second, 3 tries
+        broken = FakeGame()
+        broken.paste_broken = True
+        with self.assertRaises(link.LinkError):
+            self.paster(broken).send(5, bytes(link.KEYS_MAX + 1))
+        self.assertEqual(broken.received, [])
 
     def test_key_commands(self):
         k = keys.Keys.__new__(keys.Keys)

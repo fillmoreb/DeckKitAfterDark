@@ -14,7 +14,7 @@ Every addon here needs the DeckKit core (`## Dependencies: DeckKit`).
 | **DeckLink** | A two-way data link between a program on the Deck and addons: key taps in, colored cells on screen out. `/deckkit link` shows how it's going. |
 | **DeckDictation** | Decktation's exact state (recording, transcribing, done, error) for DeckKit's dictation indicator, from Decktation's status hook (`deck-setup/decktation-hook.sh`, installed as `decklink-decktation-hook`). |
 | **DeckTelemetry** | The Deck's battery, charging, power, temperatures, fan and CPU/GPU/memory load, for other addons to show (it draws nothing itself). `/deckkit telemetry` prints the latest. |
-| **DeckAgent** | The game side of DeckAgent, a gaming assistant you ask things ("give me a waypoint to the nearest priest trainer"). It answers where you are and sets waypoints (through WayPad), nothing else. `/deckkit agent`. Early: see [DeckAgent](#deckagent). |
+| **DeckAgent** | The game side of DeckAgent, a gaming assistant you ask things by voice ("give me a waypoint to the nearest priest trainer"). Through a fixed list of requests it reads where you are, your target, quest log, character, bags and prices and who's online; sets and removes waypoints (through WayPad); sends chat for you (or previews it for your A press); asks you with a prompt; shows its answers on a card, a reading view or a self-ticking checklist; flags items in your bags (PackPad); and keeps hooks that tell it when something happens. `/deckkit agent`. See [DeckAgent](#deckagent). |
 
 ## DeckLink
 
@@ -34,11 +34,15 @@ clipboard tool is there (`xclip`; Decktation ships one). A PASTE control frame, 
 DeckLink focus a hidden edit box. The program presses Ctrl+V, and the box checks the one-line paste:
 `DLP1 <seq> <channel> <length> <crc> <base64>`. It then delivers the frame as if it came by keys and
 gives focus back at once (or after 3 s if nothing comes). About 0.3 s whatever the size. Your
-clipboard is put back afterwards, and if a paste fails, the frame goes by keys.
+clipboard is put back afterwards, and if a paste fails, the frame goes by keys (up to 500 bytes: a bigger
+one would take longer than the game keeps the link open, so it isn't sent).
 
 **Frames** both ways: `len (2) | channel (1) | seq (1) | payload | CRC-16 (2)`. Stop-and-wait: the
 program waits until the strip shows its frame's seq (resending if not), and acks each frame the game
-shows. A lost or extra tap fails the CRC: that frame is dropped and counted, never delivered wrong.
+shows. A lost or extra tap fails the CRC: that frame is dropped and counted, never delivered wrong. A
+frame keeps its seq when it's sent again, by paste or by keys, and the game runs a seq once per channel
+(it forgets them at a hello, or after 30 s without that channel), so a frame that arrived while its ack
+went unseen is acked again, never run twice.
 Channel 0 is the link's own (hello, ack, bye, ping); addons use 1-255:
 
 ```lua
@@ -87,49 +91,81 @@ DeckTelemetry.Age()                     -- seconds since the last update: tells 
 
 ## DeckAgent
 
-A gaming assistant, the way Claude Code is a coding assistant: you ask, it looks things up and acts in
-the game through a short, fixed list of requests. **Early (slice 1): text questions from a computer,
-NPC lookups and waypoints.** Voice, info popups, addon installs and memory are planned.
+A gaming assistant, the way Claude Code is a coding assistant: you ask (by voice, on the Deck), it looks
+things up and acts in the game through a short, fixed list of requests, and answers out loud and on
+screen. It calls itself Decky. A `codex exec` engine and addon installs are planned.
 
 ```
-agent/deckagent "give me a waypoint to the nearest priest trainer"
+deckagent "give me a waypoint to the nearest priest trainer"
 # -> I set a waypoint to X'yera, a priest trainer in Orgrimmar about 202 yards away.
 ```
 
+- **Asking:** hold the agent binding (L5+R5 in Ben's setup: Decktation's agent binding, a DeckKit
+  fork of Decktation) and speak. The transcript goes to the link keeper (`decklink-agent-ask`), which
+  runs `deckagent`, speaks the answer with Piper and echoes it into chat (`deck-setup/decklink/voice.py`).
+  Asking again cuts the answer off and drops a question still being worked on, with what it asked the
+  game for and hasn't got (a prompt up for it is taken down). With Quiet on (DeckKit
+  menu, Tools › DeckAgent) answers are only shown. `deckagent "…"` also works from a terminal.
 - **The brain** is `claude -p` (Claude Code, signed in with your own Claude plan, so it draws on your
-  plan's limits, not an API bill), run from the agent's own folder (`~/.deckagent`) with
-  `--strict-mcp-config` and only web search and fetch as built-in tools. A `codex exec` engine is planned.
-- **The only way into the game** is `agent/mcp_server.py` (MCP, standard library only), with three
-  tools:
-  - `get_player_state`
-  - `find_npc`: nearest first, from the agent's database only (it never asks the game)
-  - `set_waypoint`
+  plan's limits, not an API bill; Sonnet unless the game's menu picks Haiku or Opus), run from the
+  agent's own folder (`~/.deckagent`) with `--strict-mcp-config`. Its built-in tools are web search and
+  fetch, and Read, Edit and Write inside its own folder only (its notes); everything else is denied.
+- **The only way into the game** is `agent/mcp_server.py` (MCP, standard library only). Its tools:
+  - where Ben is and what he has: `get_player_state` (position, zone, faction, level, class, combat,
+    target), `get_character`, `get_bags`, `get_item_info`, `get_prices` (DeckKit's MarketDeck),
+    `get_quests` (his quest log, named from the database), `get_online` (friends and guild)
+  - the database alone, never the game: `find_npc` (nearest first, by role or name), `find_quests`
+    (with his status from the game), `find_items`
+  - doing things: `set_waypoint`, `get_waypoints`, `remove_waypoints`, `send_chat`, `ask_player` (a
+    prompt he answers with the pad), `flag_items` / `clear_flags` (PackPad's star),
+    `track_checklist` / `clear_checklist`
+  - hooks ("tell me when…"): `set_hook`, `list_hooks`, `remove_hook`
+  - memory: `remember` (People and Ben's rules in its notes), `remember_fact`, `recall`, `forget_fact`
+  - `respond`: always last, the answer: what's spoken (160 characters at most) and the one display that
+    fits (none, a text card, a list, a checklist or a reading view)
 
-  It reaches the game with `decklink agent state [FIELD…] | way MAP X Y` (`deck-setup/decklink/agent.py`,
-  DeckLink channel 3), answered by the DeckAgent addon. There is no way to run Lua, send slash
-  commands, or touch combat, movement, targeting or casting.
+  The launcher (`agent/deckagent`) allows exactly these. They reach the game with `decklink agent …`
+  (`deck-setup/decklink/agent.py`, DeckLink channel 3), answered by the DeckAgent addon. There is no
+  way to run Lua, send slash commands, or touch combat, movement, targeting or casting.
 - **Packets** are binary, with fields at fixed places, because keys into the game carry only about 55
-  bytes a second:
-  - asking for your location is 2 bytes (op byte, field mask), 64 key taps
-  - a waypoint is 7 bytes (op byte, map, x, y)
-  - the reply comes back on the strip: status, then only the fields asked for, or the WayPad
-    waypoint id
+  bytes a second: asking for your location is 2 bytes (op byte, field mask), 64 key taps; a waypoint
+  is 7 bytes (op byte, map, x, y); big ones (a checklist, a reading view) go by paste. The reply comes
+  back on the strip: status, then the op's fields. Each op's layout is in the header of the file that
+  answers it; `deck-setup/decklink/agent.py` builds and reads them all:
 
-  The full layout is at the top of `addons/DeckAgent/Agent.lua`.
+  | Ops | Layout in |
+  |---|---|
+  | the packet and reply framing, STATE (1), WAY (2), WAYPOINTS (10) | `addons/DeckAgent/Agent.lua` |
+  | CHAT (3), FRIENDS (4) | `addons/DeckAgent/Chat.lua` |
+  | ASK (5), ANSWER (6), DISMISS (19) | `addons/DeckAgent/Ask.lua` |
+  | SHOW (7: echo, card, reading view) | `addons/DeckAgent/Show.lua` |
+  | QUESTS (8), QUEST_STATUS (9) | `addons/DeckAgent/Quests.lua` |
+  | CHECKLIST (11) | `addons/DeckAgent/Checklist.lua` (its conditions: `Conditions.lua`) |
+  | HOOKS (12), EVENTS (13) | `addons/DeckAgent/Hooks.lua` |
+  | CHARACTER (14), BAGS (15), ITEM_INFO (16), PRICES (17), MARKS (18) | `addons/DeckAgent/Inventory.lua` |
+
+  `addons/DeckAgent/Bytes.lua` packs and reads the numbers for all of them.
 - **The link keeper** (`decklink.agentd`, the `decklink-agent` user service) holds DeckLink open for
-  the assistant:
-  - it opens on the first request and closes after 25 s idle, with no screen reading while closed
+  the assistant and answers voice questions:
+  - it opens on the first request and closes after 25 s idle; while it's closed the screen isn't read,
+    except that while a hook is set it glances at the strip about once a second (one paused capture,
+    ~2% of a core) for DeckAgent's attention flag
   - `decklink agent …` goes through it over a local socket
   - a request then takes about 0.6 s on the Deck, against about 4.4 s when each call opened the link
-  - the launcher fetches your position and faction before asking, so "nearest X" skips a model turn
+  - the launcher fetches your position, faction, target and settings before asking, so "nearest X"
+    skips a model turn
+- **Hooks**: the game keeps only a hook's condition (a quest taken or done, an objective, an item
+  count, a level, a zone, XP), as numbers; the keeper keeps Decky's note for it and timers
+  (`~/.deckagent/hooks.json`). When one fires, the note is spoken as a reminder or Decky is woken with it.
+- **Memory**: her notes (`~/.deckagent/CLAUDE.md`: People and Ben's rules), facts in
+  `~/.deckagent/memory.db` (the launcher brings related ones with each question) and every character
+  seen online. Questions close together continue one conversation.
 - **The database** (`~/.deckagent/deckagent.db`, SQLite) is built by `python3 -m agent.update_data`. It
-  draws on QuestieDB's Forever NPCs (spawn coordinates converted for 1.60) and wago.tools' Forever map
-  tables. Those are downloaded to `~/.deckagent/data`, never committed: they aren't ours to
-  redistribute.
-- **On the Deck** (the usual way): `deck-setup/install.sh` installs `deckagent` there too. Then, as deck:
-  - `claude auth login` (once)
-  - `cd ~/.local/lib/deckagent && python3 -m agent.update_data`
-  - `deckagent "…"`
+  draws on QuestieDB's Forever NPCs, quests, items and objects (spawn coordinates converted for 1.60) and
+  wago.tools' Forever map tables. Those are downloaded to `~/.deckagent/data`, never committed: they
+  aren't ours to redistribute.
+- **On the Deck** (the usual way): [INSTALL.md](INSTALL.md) installs it all, including a daily
+  database update. Then, as deck: `claude auth login` (once), and `deckagent "…"` or the agent binding.
 - **Setup on a Mac** (the brain on the Mac, the game on the Deck; each game call adds ~2 s of SSH): install Claude Code and sign in, then
   set `DECKAGENT_DECK=claude@<deck>` (an SSH target that can `sudo -u deck`; `DECK` in deploy.local works too) and run
   `python3 -m agent.update_data`. On the Deck itself, leave `DECKAGENT_DECK` unset.
@@ -157,7 +193,7 @@ second, so every byte counts):
 | 0 | the link's own (hello, ack, bye, ping) | 1-2 bytes | `codec.py` |
 | 1 | Deck telemetry (DeckTelemetry) | 17 bytes | `telemetry.py` |
 | 2 | dictation state + which binding (DeckDictation) | 2 bytes | `dictation.py` |
-| 3 | DeckAgent's requests and replies | 2-7 bytes in | `addons/DeckAgent/Agent.lua` |
+| 3 | DeckAgent's requests and replies | 1 byte to 4 KB in (paste from 40 bytes) | `addons/DeckAgent/Agent.lua` and the op files ([DeckAgent](#deckagent)) |
 
 ## The cover
 
