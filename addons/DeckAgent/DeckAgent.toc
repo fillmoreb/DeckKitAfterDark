@@ -4,7 +4,7 @@
 ## Version: @project-version@
 ## Author: Ben Fillmore
 ## Dependencies: DeckKit, DeckLink
-## OptionalDeps: WayPad
+## OptionalDeps: WayPad, MarketDeck, PackPad
 ## SavedVariables: DeckAgentDB
 
 Agent.lua
@@ -16,3 +16,4 @@ Quests.lua
 Conditions.lua
 Checklist.lua
 Hooks.lua
+Inventory.lua

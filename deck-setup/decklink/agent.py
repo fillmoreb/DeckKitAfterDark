@@ -6,6 +6,11 @@ addons/DeckAgent/Agent.lua answers and documents the packet layout; keep the two
                                          (default: all)
     decklink agent way MAP X Y           a waypoint (X, Y 0-100, like /way), made active
     decklink agent waypoints [remove ID | remove-active | remove-all]   list (or remove) waypoints
+    decklink agent character             his character sheet: equipped item IDs, stats, money, spec (numbers)
+    decklink agent bags [bank]           what he carries (or had in the bank when he last opened it)
+    decklink agent item-info ID[:SUFFIX] ...   exact stats of items, as the game computes them
+    decklink agent prices ID ...         auction (now, market), vendor and disenchant prices (MarketDeck)
+    decklink agent mark LABEL ID ... | unmark [LABEL]   flag items in his bags (PackPad's lilac star)
     decklink agent hook add JSON | list | remove ID | clear   the assistant's hooks (through the link
                                          keeper only: it keeps their notes; see hooks.py)
     decklink agent checklist JSON | clear   put up a self-ticking checklist ({"title", "items": [{"label",
@@ -28,16 +33,33 @@ from . import codec
 
 CHANNEL = 3
 VERSION = 1
-OP_STATE, OP_WAY, OP_CHAT, OP_FRIENDS, OP_ASK, OP_ANSWER, OP_SHOW, OP_QUESTS, OP_QUEST_STATUS, OP_WAYPOINTS, OP_CHECKLIST, OP_HOOKS, OP_EVENTS = (
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)
+OP_STATE, OP_WAY, OP_CHAT, OP_FRIENDS, OP_ASK, OP_ANSWER, OP_SHOW, OP_QUESTS, OP_QUEST_STATUS, OP_WAYPOINTS, OP_CHECKLIST, OP_HOOKS, OP_EVENTS, OP_CHARACTER, OP_BAGS, OP_ITEM_INFO, OP_PRICES, OP_MARKS = (
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
 ASK_RESULT = {1: "shown", 2: "queued"}
 NO_ANSWER = 255
 KEEPALIVE_S = 10  # the game closes the link after 30 s without a frame
 CHANNELS = ["say", "yell", "party", "raid", "guild", "whisper", "bnet", "instance"]  # CHAT byte 1 = index + 1
 CHAT_RESULT = {1: "sent", 2: "previewed", 3: "previewed after combat"}
 LISTS = ["bnet", "friends", "guild"]  # FRIENDS byte 1 bits
-FIELDS = ["pos", "world", "zone", "who", "combat", "brain", "voice"]  # mask bit 0, 1, 2, ...
+FIELDS = ["pos", "world", "zone", "who", "combat", "brain", "voice", "target"]  # mask bit 0, 1, 2, ...
 BRAIN = {1: "haiku", 2: "sonnet", 3: "opus"}  # 0: the default
+# Inventory.lua's stat codes (keep in step).
+STAT_CODES = {1: "strength", 2: "agility", 3: "stamina", 4: "intellect", 5: "spirit", 6: "armor",
+              7: "holy_resistance", 8: "fire_resistance", 9: "nature_resistance", 10: "frost_resistance",
+              11: "shadow_resistance", 12: "arcane_resistance", 13: "dps", 14: "spell_power", 15: "healing",
+              16: "attack_power", 17: "crit_rating", 18: "hit_rating", 19: "defense_rating", 20: "mana_per_5",
+              21: "health_per_5", 22: "block_value", 23: "spell_crit_rating", 24: "spell_hit_rating",
+              25: "ranged_attack_power", 26: "dodge_rating", 27: "parry_rating", 28: "block_rating",
+              29: "spell_penetration"}
+SLOT_NAMES = {1: "head", 2: "neck", 3: "shoulder", 4: "shirt", 5: "chest", 6: "waist", 7: "legs", 8: "feet",
+              9: "wrist", 10: "hands", 11: "finger1", 12: "finger2", 13: "trinket1", 14: "trinket2", 15: "back",
+              16: "main_hand", 17: "off_hand", 18: "ranged", 19: "tabard"}
+INVTYPES = {0: None, 1: "head", 2: "neck", 3: "shoulder", 4: "shirt", 5: "chest", 6: "waist", 7: "legs", 8: "feet",
+            9: "wrist", 10: "hands", 11: "finger", 12: "trinket", 13: "one-hand", 14: "shield", 15: "ranged",
+            16: "back", 17: "two-hand", 18: "bag", 19: "tabard", 20: "chest (robe)", 21: "main hand", 22: "off hand",
+            23: "held in off hand", 24: "ammo", 25: "thrown", 26: "ranged (gun/crossbow/wand)", 27: "quiver",
+            28: "relic"}
+QUALITIES = {0: "poor", 1: "common", 2: "uncommon", 3: "rare", 4: "epic", 5: "legendary", 6: "artifact"}
 SHOW_KINDS = ["echo", "card", "reading"]  # SHOW byte 1 = index + 1
 SHOW_RESULT = {1: "shown", 2: "queued"}
 QUEST_STATUS = {0: "not taken", 1: "in log", 2: "ready to turn in", 3: "done"}
@@ -184,6 +206,42 @@ def build_hooks(action, when=None, minutes=0, hid=0):
     return out
 
 
+def build_character():
+    return bytes([op_byte(OP_CHARACTER)])
+
+
+def build_bags(bank=False):
+    return bytes([op_byte(OP_BAGS), 2 if bank else 1])
+
+
+def build_item_info(items):
+    """items: [item ID or (item ID, suffix)], 1-30."""
+    items = [(i, 0) if isinstance(i, int) else (int(i[0]), int(i[1])) for i in items]
+    if not 1 <= len(items) <= 30:
+        raise ValueError("1-30 items")
+    return bytes([op_byte(OP_ITEM_INFO), len(items)]) + b"".join(struct.pack(">Ih", i, sfx) for i, sfx in items)
+
+
+def build_prices(ids):
+    ids = [int(i) for i in ids]
+    if not 1 <= len(ids) <= 60:
+        raise ValueError("1-60 item IDs")
+    return bytes([op_byte(OP_PRICES), len(ids)]) + b"".join(struct.pack(">I", i) for i in ids)
+
+
+def build_marks(label, ids=None, clear=False):
+    """MARKS: flag item IDs under a label (PackPad's star and tooltip line), or clear a label ("" all)."""
+    lab = _pstr(label or "", 60)
+    if clear:
+        return bytes([op_byte(OP_MARKS), 2]) + lab
+    ids = [int(i) for i in ids or []]
+    if not 1 <= len(ids) <= 40:
+        raise ValueError("1-40 item IDs")
+    if not (label or "").strip():
+        raise ValueError("a label (what they're for)")
+    return bytes([op_byte(OP_MARKS), 1]) + lab + bytes([len(ids)]) + b"".join(struct.pack(">I", i) for i in ids)
+
+
 def build_events():
     return bytes([op_byte(OP_EVENTS)])
 
@@ -277,9 +335,15 @@ def parse_reply(p, asked=FIELDS):
             elif f == "brain":
                 (b,), i = _unpack(">B", p, i)
                 v = {"model": BRAIN.get(b)}
-            else:  # voice
+            elif f == "voice":
                 (q,), i = _unpack(">B", p, i)
                 v = {"quiet": q == 1}
+            else:  # target
+                (npc, lvl, tflags, hp), i = _unpack(">IBBB", p, i)
+                v = {"target": None if not tflags & 1 else {
+                    "npc_id": npc or None, "level": None if lvl == 255 else lvl, "attackable": bool(tflags & 2),
+                    "dead": bool(tflags & 4), "elite": bool(tflags & 8), "rare": bool(tflags & 16),
+                    "player": bool(tflags & 32), "tapped_by_others": bool(tflags & 64), "health_pct": hp}}
             if f in given:
                 out.update(v)
     elif out["op"] == OP_WAY:
@@ -306,6 +370,56 @@ def parse_reply(p, asked=FIELDS):
                               "have": have, "need": need})
             quests.append({"id": qid, "complete": bool(qflags & 1), "failed": bool(qflags & 2), "objectives": goals})
         out["quests"], out["more"] = quests, bool(flags & 1)
+    elif out["op"] == OP_CHARACTER:
+        (level, money, free, slots, spec), i = _unpack(">BIBBH", p, i)
+        stats, i = _unpack(">10H", p, i)
+        names = ["strength", "agility", "stamina", "intellect", "spirit", "armor", "spell_power", "healing",
+                 "max_health", "max_mana"]
+        (n,), i = _unpack(">B", p, i)
+        equipped = []
+        for _ in range(n):
+            (slot, item, enchant, suffix, dur), i = _unpack(">BIHhB", p, i)
+            equipped.append({"slot": SLOT_NAMES.get(slot, slot), "item_id": item, "enchant_id": enchant or None,
+                             "suffix_id": suffix or None, "durability_pct": None if dur == 255 else dur})
+        out.update({"level": level, "money_copper": money, "bag_free": free, "bag_slots": slots,
+                    "spec_id": spec or None, "stats": dict(zip(names, stats)), "equipped": equipped})
+    elif out["op"] == OP_BAGS:
+        (flags, free, slots, age, n), i = _unpack(">BBBHB", p, i)
+        items = []
+        for _ in range(n):
+            (item, count), i = _unpack(">IH", p, i)
+            items.append({"item_id": item, "count": count})
+        out.update({"items": items, "more": bool(flags & 1), "bank_never_seen": bool(flags & 2), "free": free,
+                    "slots": slots, "minutes_old": age})
+    elif out["op"] == OP_ITEM_INFO:
+        (n,), i = _unpack(">B", p, i)
+        items = []
+        for _ in range(n):
+            (item, status), i = _unpack(">IB", p, i)
+            entry = {"item_id": item, "status": {0: "ok", 1: "loading", 2: "no such item"}.get(status, status)}
+            if status == 0:
+                (q, ilvl, req, inv, cls, sub, ns_), i = _unpack(">BHBBBBB", p, i)
+                stats = {}
+                for _ in range(ns_):
+                    (code, value), i = _unpack(">Bh", p, i)
+                    stats[STAT_CODES.get(code, "stat%d" % code)] = value / 10 if code == 13 else value
+                entry.update({"quality": QUALITIES.get(q, q), "item_level": ilvl, "required_level": req,
+                              "slot": INVTYPES.get(inv, inv), "class_id": cls, "subclass_id": sub, "stats": stats})
+            items.append(entry)
+        out["items"] = items
+    elif out["op"] == OP_PRICES:
+        (flags, n), i = _unpack(">BB", p, i)
+        prices = []
+        for _ in range(n):
+            (item, now, qty, market, days, hours, vendor, de), i = _unpack(">IIHIBHII", p, i)
+            prices.append({"item_id": item, "auction_now": now or None, "quantity_up": qty, "market": market or None,
+                           "days_of_history": days, "hours_since_scan": None if hours == 65535 else hours,
+                           "vendor": vendor or None, "disenchant": de or None})
+        out["prices"], out["market_installed"] = prices, not flags & 1
+    elif out["op"] == OP_MARKS:
+        (flags, n), i = _unpack(">BB", p, i)
+        out["carried"] = list(_unpack(">%dH" % n, p, i)[0]) if n else []
+        out["packpad_installed"] = not flags & 1
     elif out["op"] == OP_HOOKS:
         (action,), i = _unpack(">B", p, i)
         if action == 1:  # add: id, already true
@@ -442,6 +556,26 @@ def friends(lk, lists=LISTS):
     return parse_reply(request(lk, build_friends(lists)))
 
 
+def character(lk):
+    return parse_reply(request(lk, build_character()))
+
+
+def bags(lk, bank=False):
+    return parse_reply(request(lk, build_bags(bank)))
+
+
+def item_info(lk, items):
+    return parse_reply(request(lk, build_item_info(items)))
+
+
+def prices(lk, ids):
+    return parse_reply(request(lk, build_prices(ids)))
+
+
+def marks(lk, label, ids=None, clear=False):
+    return parse_reply(request(lk, build_marks(label, ids, clear)))
+
+
 def hooks(lk, action, when=None, minutes=0, hid=0):
     return parse_reply(request(lk, build_hooks(action, when, minutes, hid)))
 
@@ -511,6 +645,18 @@ def _request_for(argv):
         if len(rest) < 3:
             return None
         return {"cmd": "prompt", "question": rest[0], "options": rest[1:], "list": as_list, "seconds": seconds}
+    if argv[0] == "character" and len(argv) == 1:
+        return {"cmd": "character"}
+    if argv[0] == "bags" and len(argv) <= 2:
+        return {"cmd": "bags", "bank": argv[1:] == ["bank"]}
+    if argv[0] == "mark" and len(argv) > 2:
+        return {"cmd": "mark", "label": argv[1], "ids": [int(a) for a in argv[2:]]}
+    if argv[0] == "unmark" and len(argv) <= 2:
+        return {"cmd": "mark", "label": argv[1] if len(argv) == 2 else "", "clear": True}
+    if argv[0] == "prices" and len(argv) > 1:
+        return {"cmd": "prices", "ids": [int(a) for a in argv[1:]]}
+    if argv[0] == "item-info" and len(argv) > 1:
+        return {"cmd": "item-info", "items": [[int(x) for x in (a.split(":") + ["0"])[:2]] for a in argv[1:]]}
     if argv[0] == "hook" and len(argv) >= 2:
         if argv[1] == "add" and len(argv) == 3:
             return dict(json.loads(argv[2]), cmd="hook", op="add")
@@ -563,6 +709,16 @@ def handle(lk, req):
         return chat(lk, req["channel"], req.get("target", ""), req["text"])
     if cmd == "friends":
         return friends(lk, req.get("lists") or LISTS)
+    if cmd == "character":
+        return character(lk)
+    if cmd == "bags":
+        return bags(lk, req.get("bank", False))
+    if cmd == "item-info":
+        return item_info(lk, req["items"])
+    if cmd == "prices":
+        return prices(lk, req["ids"])
+    if cmd == "mark":
+        return marks(lk, req.get("label", ""), req.get("ids"), req.get("clear", False))
     if cmd == "hook":
         raise ValueError("hooks go through the link keeper (the decklink-agent service), which keeps their notes")
     if cmd == "checklist":

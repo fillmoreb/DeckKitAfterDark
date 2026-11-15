@@ -133,10 +133,53 @@ GetServerTime = function() return SERVERTIME end
 function fireTimers() for _, t in ipairs(TIMERS) do if not t.cancelled then t.fn() end end TIMERS = {} end
 function fireEvent(event, ...) for _, fn in ipairs(EVENTS[event] or {}) do fn(...) end end
 UnitClass = function() return "Priest", PLAYER.class, 5 end
-UnitLevel = function() return PLAYER.level end
+UnitLevel = function(u) if u == "target" then return TARGET and TARGET.level end return PLAYER.level end
+C_Item = C_Item or {}
+-- For DeckAgent's target field and Inventory.lua. Scenarios set TARGET, BAGSLOTS, EQUIPPED, ITEMS.
+TARGET = nil -- { guid, level, class, attackable, dead, player, hp, max }
+UnitExists = function(u) return u == "target" and TARGET ~= nil end
+UnitGUID = function(u) return u == "target" and TARGET and TARGET.guid end
+UnitClassification = function() return TARGET and TARGET.class or "normal" end
+UnitCanAttack = function() return TARGET and TARGET.attackable end
+UnitIsDead = function() return TARGET and TARGET.dead end
+UnitIsPlayer = function() return TARGET and TARGET.player end
+UnitHealth = function(u) return u == "target" and TARGET and TARGET.hp or 100 end
+UnitHealthMax = function(u) return u == "target" and TARGET and TARGET.max or 300 end
+UnitPowerMax = function() return 400 end
+UnitStat = function(_, i) return 10 + i, 20 + i end
+UnitArmor = function() return 90, 95 end
+GetMoney = function() return 123456 end
+GetSpellBonusDamage = function(school) return school == 6 and 9 or 4 end
+GetSpellBonusHealing = function() return 12 end
+UnitName = function() return "Lucien" end
+GetRealmName = function() return "Realm" end
+BAGSLOTS = { [0] = { { itemID = 6948, stackCount = 1 }, false, { itemID = 2589, stackCount = 15 } },
+             [1] = { { itemID = 2589, stackCount = 5 }, false } }
+C_Container = {
+    GetContainerNumSlots = function(bag) return BAGSLOTS[bag] and #BAGSLOTS[bag] or 0 end,
+    GetContainerItemInfo = function(bag, slot) local s = BAGSLOTS[bag] and BAGSLOTS[bag][slot]; return s or nil end,
+}
+EQUIPPED = { [5] = "|cff1eff00|Hitem:16607::::::::14|h[Robe]|h|r", [16] = "|Hitem:277247:15::::::-3:14|h[Mug]|h" }
+GetInventoryItemLink = function(_, slot) return EQUIPPED[slot] end
+GetInventoryItemDurability = function(slot) if slot == 5 then return 30, 40 end end
+C_SpecializationInfo = { GetSpecialization = function() return 1 end, GetSpecializationInfo = function() return 1487 end }
+ITEMS = { [19019] = { cached = true, loc = "INVTYPE_WEAPON", class = 2, sub = 7, q = 5, ilvl = 80, req = 60,
+                      stats = { ITEM_MOD_AGILITY_SHORT = 5, ITEM_MOD_DAMAGE_PER_SECOND_SHORT = 41.84, RESISTANCE2_NAME = 8,
+                                FIRE_RESISTANCE = 8 } },
+          [5000] = { cached = false, loc = "INVTYPE_HEAD", class = 4, sub = 1, q = 2, ilvl = 20, req = 15, stats = {} } }
+LOADS = {}
+C_Item.GetItemInfoInstant = function(id) local it = ITEMS[id]; if it then return id, "", "", it.loc, 0, it.class, it.sub end end
+C_Item.IsItemDataCachedByID = function(id) return ITEMS[id] and ITEMS[id].cached end
+C_Item.RequestLoadItemDataByID = function(id) table.insert(LOADS, id) end
+C_Item.GetItemInfo = function(link) local it = ITEMS[tonumber(link:match("item:(%d+)"))]
+    if it and it.cached then return "x", link, it.q, it.ilvl, it.req end end
+C_Item.GetItemStats = function(link) local it = ITEMS[tonumber(link:match("item:(%d+)"))]
+    if it and it.cached then return it.stats end end
+strsplit = strsplit or function(sep, s) local out = {} for part in (s .. sep):gmatch("(.-)" .. sep:gsub("%p", "%%%0")) do out[#out + 1] = part end return unpack(out) end
+
 -- For DeckAgent's Show.lua.
 DEFAULT_CHAT_FRAME = { AddMessage = function(_, msg) print("ECHO " .. msg) end }
-C_Item = { GetItemIconByID = function(id) return 1000 + id end }
+C_Item.GetItemIconByID = function(id) return 1000 + id end
 -- The quest log, for Quests.lua: QUESTLOG = { header or {id, complete, failed, objectives}, ... }.
 QUESTLOG = { { header = "Orgrimmar" },
     { id = 5728, objectives = { { type = "monster", numFulfilled = 1, numRequired = 1, finished = true },

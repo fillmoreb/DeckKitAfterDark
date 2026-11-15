@@ -25,7 +25,9 @@ TOOLS = ["mcp__deckagent__get_player_state", "mcp__deckagent__find_npc", "mcp__d
          "mcp__deckagent__remember", "mcp__deckagent__remember_fact", "mcp__deckagent__recall",
          "mcp__deckagent__forget_fact", "mcp__deckagent__get_quests", "mcp__deckagent__find_quests", "mcp__deckagent__respond",
          "mcp__deckagent__track_checklist", "mcp__deckagent__clear_checklist",
-         "mcp__deckagent__set_hook", "mcp__deckagent__list_hooks", "mcp__deckagent__remove_hook"]
+         "mcp__deckagent__get_character", "mcp__deckagent__get_bags",
+         "mcp__deckagent__get_item_info", "mcp__deckagent__get_prices", "mcp__deckagent__find_items",
+         "mcp__deckagent__flag_items", "mcp__deckagent__clear_flags", "mcp__deckagent__set_hook", "mcp__deckagent__list_hooks", "mcp__deckagent__remove_hook"]
 # Built-in tools: the web, and its own notes. Read/Edit/Write are allowed only inside its folder (the
 # working directory, ~/.deckagent): anything elsewhere would need an approval -p can't give, so it's denied.
 BUILTIN = "WebSearch,WebFetch,Read,Edit,Write"
@@ -62,7 +64,7 @@ def prefetch(verbose):
     Returns a line for the prompt, or None if the game didn't answer (the brain can still ask)."""
     start = time.monotonic()
     try:
-        s = common.game("state", "pos", "world", "zone", "who", "brain", timeout=15)
+        s = common.game("state", "pos", "world", "zone", "who", "brain", "target", timeout=15)
     except common.GameError as e:
         if verbose:
             print("[prefetch] failed: %s" % e, file=sys.stderr)
@@ -77,6 +79,19 @@ def prefetch(verbose):
     for key, label in (("zone", "zone"), ("faction", "faction"), ("level", "level"), ("class", "class")):
         if s.get(key) is not None:
             parts.append("%s %s" % (label, s[key]))
+    t = s.get("target")
+    if t:
+        try:
+            from agent import mcp_server
+            t = mcp_server.target_line(t) or t
+        except Exception:
+            pass
+        what = t.get("name") or ("a player" if t.get("player") else "NPC %s" % t.get("npc_id"))
+        tags = [w for w, on in (("elite", t.get("elite")), ("rare", t.get("rare")), ("dead", t.get("dead")),
+                                ("hostile", t.get("attackable"))) if on]
+        parts.append("target %s%s (level %s%s, %s%% health)" % (
+            what, " <%s>" % t["title"] if t.get("title") else "", t.get("level") or "??",
+            ", " + ", ".join(tags) if tags else "", t.get("health_pct")))
     return "[Ben's game state when he asked: " + ", ".join(parts) + "]"
 
 

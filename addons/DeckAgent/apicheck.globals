@@ -3,5 +3,11 @@ DeckKit
 DeckLink
 # Optional: WayPad's waypoint API (DeckKit's WayPad addon).
 WayPad_Add
+# Optional: MarketDeck's price API (DeckKit's MarketDeck addon).
+MarketDeck_GetPrice
+# Optional: PackPad's item marks (DeckKit's PackPad addon).
+PackPad_SetMarks
+PackPad_ClearMarks
+PackPad_GetMarks
 WayPad_GetPoints
 WayPad_Remove

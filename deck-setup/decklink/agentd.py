@@ -115,7 +115,8 @@ class Keeper:
                 if cmd == "warm":
                     self._ensure()
                     return {"ok": True, "open": True}
-                if cmd in ("state", "way", "chat", "friends", "prompt", "show", "quests", "quest-status", "waypoints", "checklist"):
+                if cmd in ("state", "way", "chat", "friends", "prompt", "show", "quests", "quest-status", "waypoints", "checklist",
+                           "character", "bags", "item-info", "prices", "mark"):
                     if cmd == "state" and any(f not in agent.FIELDS for f in req.get("fields") or agent.FIELDS):
                         return {"ok": False, "error": "unknown field"}
                     # Packets are built (and checked) before the link opens: a bad request shouldn't cost one.
@@ -125,6 +126,9 @@ class Keeper:
                                                        req.get("seconds", 30)),
                      "checklist": lambda: agent.build_checklist(req.get("title"), req.get("items"),
                                                                 req.get("clear", False)),
+                     "mark": lambda: agent.build_marks(req.get("label", ""), req.get("ids"), req.get("clear", False)),
+                     "prices": lambda: agent.build_prices(req["ids"]),
+                     "item-info": lambda: agent.build_item_info(req["items"]),
                      "waypoints": lambda: agent.build_waypoints(req.get("action", "list"), req.get("id", 0)),
                      "quest-status": lambda: agent.build_quest_status(req["ids"]),
                      "show": lambda: agent.build_show(req["kind"], req.get("title", ""), req.get("text", ""),

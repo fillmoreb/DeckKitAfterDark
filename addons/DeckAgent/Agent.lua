@@ -16,6 +16,9 @@
 --                    bit 5 BRAIN   uint8, the model picked in the DeckKit menu (Tools > DeckAgent):
 --                                  0 the default, 1 Haiku, 2 Sonnet, 3 Opus
 --                    bit 6 VOICE   uint8, answers: 0 spoken, 1 quiet (shown only; DeckKit menu)
+--                    bit 7 TARGET  NPC ID uint32 (0: none, or not an NPC), level uint8 (255: ??), flags
+--                                  uint8 (1 a target, 2 attackable, 4 dead, 8 elite, 16 rare, 32 a
+--                                  player, 64 tapped by someone else), health percent uint8
 --   WAY (op 2):    bytes 1-2 map uint16, 3-4 x uint16, 5-6 y uint16: a WayPad waypoint, made active
 --                  (the game's own map pin when WayPad is missing)
 --   WAYPOINTS (op 10): byte 1 action: 1 list, 2 remove the one with id (bytes 2-3, uint16), 3 remove
@@ -39,7 +42,8 @@
 --
 -- CHAT (op 3) and FRIENDS (op 4) are in Chat.lua, ASK (op 5) in Ask.lua, SHOW (op 7) in Show.lua,
 -- QUESTS (op 8) in Quests.lua, CHECKLIST (op 11) in Checklist.lua, HOOKS (op 12) and EVENTS (op 13)
--- in Hooks.lua; they use the helpers shared below (ns.Bytes, ns.OPS). Ops get (payload, seq).
+-- in Hooks.lua, CHARACTER (14), BAGS (15) and ITEM_INFO (16) in Inventory.lua; they use the helpers
+-- shared below (ns.Bytes, ns.OPS). Ops get (payload, seq).
 --
 -- Replies need the link open (the host says hello first): DeckLink.Send refuses otherwise.
 local ADDON, ns = ...
@@ -49,7 +53,7 @@ DeckKit.NewModule(ns, ADDON, "|cffe8b04bDeckAgent|r")
 local CHANNEL = 3
 local VERSION = 1
 local OP_STATE, OP_WAY, OP_WAYPOINTS = 1, 2, 10
-local POS, WORLD, ZONE, WHO, COMBAT, BRAIN, VOICE = 1, 2, 4, 8, 16, 32, 64
+local POS, WORLD, ZONE, WHO, COMBAT, BRAIN, VOICE, TARGET = 1, 2, 4, 8, 16, 32, 64, 128
 local MODELS = { haiku = 1, sonnet = 2, opus = 3 }
 ns.MODELS = MODELS
 local OK, UNKNOWN_OP, BAD_ARGS, REFUSED, FAILED, UNKNOWN_VERSION = 0, 1, 2, 3, 4, 5
@@ -103,6 +107,30 @@ local function Position()
     return map
 end
 
+local function U32(n)
+    n = math.floor(n) % 4294967296
+    return U16(math.floor(n / 65536)) .. U16(n % 65536)
+end
+
+-- The target: its NPC ID (from its GUID: Creature-0-<server>-<instance>-<zone>-<npc ID>-<spawn>), level
+-- and a few flags; names come from the assistant's database.
+local function TargetInfo()
+    if not UnitExists("target") then return U32(0) .. U8(0) .. U8(0) .. U8(0) end
+    local guid = UnitGUID("target")
+    local npc = Readable(guid) and guid:match("^%a+%-%d+%-%d+%-%d+%-%d+%-(%d+)%-") or nil
+    local isNpc = Readable(guid) and (guid:find("^Creature") or guid:find("^Vehicle")) and npc
+    local level = UnitLevel("target")
+    local class = UnitClassification("target")
+    local flags = 1 + (UnitCanAttack("player", "target") and 2 or 0) + (UnitIsDead("target") and 4 or 0)
+        + ((class == "elite" or class == "rareelite" or class == "worldboss") and 8 or 0)
+        + ((class == "rare" or class == "rareelite") and 16 or 0) + (UnitIsPlayer("target") and 32 or 0)
+        + (UnitIsTapDenied and UnitIsTapDenied("target") and 64 or 0)
+    local hp, max = UnitHealth("target"), UnitHealthMax("target")
+    local pct = (Readable(hp) and Readable(max) and max and max > 0) and math.floor(hp / max * 100 + 0.5) or 0
+    return U32(isNpc and tonumber(npc) or 0) .. U8((Readable(level) and level and level > 0) and level or 255)
+        .. U8(flags) .. U8(pct)
+end
+
 local function State(p)
     if #p < 2 then return BAD_ARGS, Str("STATE needs a field mask") end
     local mask = p:byte(2)
@@ -151,6 +179,10 @@ local function State(p)
     if mask % 128 >= 64 then -- VOICE
         sent = sent + VOICE
         parts[#parts + 1] = U8(DeckAgentDB and DeckAgentDB.quiet and 1 or 0)
+    end
+    if mask >= 128 then -- TARGET
+        sent = sent + TARGET
+        parts[#parts + 1] = TargetInfo()
     end
     return OK, U8(sent) .. table.concat(parts)
 end

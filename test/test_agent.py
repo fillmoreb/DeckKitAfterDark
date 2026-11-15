@@ -27,15 +27,15 @@ def ask(packet, setup="", seq=7):
 class GameSide(unittest.TestCase):
     def test_state_request_is_two_bytes(self):
         self.assertEqual(host.build_state(["pos", "world"]), b"\x41\x03")
-        self.assertEqual(host.build_state(), b"\x41\x7f")
+        self.assertEqual(host.build_state(), b"\x41\xff")
 
     def test_state_all_fields(self):
         data, _ = ask(host.build_state())
-        self.assertEqual(data[:4], b"\x41\x07\x00\x7f")  # op, seq, ok, every field given
+        self.assertEqual(data[:4], b"\x41\x07\x00\xff")  # op, seq, ok, every field given
         self.assertEqual(host.parse_reply(data), {
             "op": 1, "seq": 7, "ok": True, "status": "ok", "fields": host.FIELDS, "map": 1458, "x": 49.0, "y": 18.3, "cont": 0,
             "wx": 1636, "wy": 240, "zone": "Undercity", "faction": "H", "level": 20, "class": "PRIEST",
-            "in_combat": False, "model": None, "quiet": False})
+            "in_combat": False, "model": None, "quiet": False, "target": None})
 
     def test_state_brain_is_the_menu_model(self):
         for setup, model in (("", None), ('DeckAgentDB = { model = "sonnet" }', "sonnet"),
@@ -81,7 +81,7 @@ class GameSide(unittest.TestCase):
         self.assertIn("TRACKED\ttrue", lines)
 
     def test_bad_requests_are_refused(self):
-        for packet, status in ((b"\x4f", "unknown op"), (b"\x81\x01", "unknown version"), (b"", "unknown version"),
+        for packet, status in ((b"\x7f", "unknown op"), (b"\x81\x01", "unknown version"), (b"", "unknown version"),
                                (b"\x42\x05\x8e", "bad arguments"), (b"\x41", "bad arguments")):
             data, _ = ask(packet)
             reply = host.parse_reply(data)
@@ -236,7 +236,7 @@ class MCPServer(unittest.TestCase):
         names = [t["name"] for t in mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]]
         self.assertEqual(names, ["get_player_state", "find_npc", "set_waypoint", "get_waypoints",
                                  "remove_waypoints", "send_chat", "get_online",
-                                 "ask_player", "get_quests", "find_quests", "set_hook", "list_hooks", "remove_hook", "track_checklist", "clear_checklist", "respond", "show_card", "show_reading", "remember", "remember_fact",
+                                 "ask_player", "get_quests", "find_quests", "get_character", "get_bags", "find_items", "flag_items", "clear_flags", "get_prices", "get_item_info", "set_hook", "list_hooks", "remove_hook", "track_checklist", "clear_checklist", "respond", "show_card", "show_reading", "remember", "remember_fact",
                                  "recall", "forget_fact"])
         self.assertEqual(mcp_server.handle({"jsonrpc": "2.0", "id": 3, "method": "nope"})["error"]["code"], -32601)
 
@@ -1432,3 +1432,173 @@ class NotConditions(unittest.TestCase):
             host.build_hooks("add", {"track": "manual", "not": True})
         with mock.patch.object(mcp_server.common, "DB_PATH", "/nonexistent.db"):
             self.assertEqual(mcp_server.describe({"track": "zone", "map_id": 1454, "not": True}), "left #1454")
+
+
+class Inventory(unittest.TestCase):
+    """CHARACTER / BAGS / ITEM_INFO (addons/DeckAgent/Inventory.lua) and the target field."""
+
+    def test_target(self):
+        setup = ('TARGET = { guid = "Creature-0-4372-1-123-11519-00004A1B2C", level = 16, class = "elite", '
+                 'attackable = true, hp = 150, max = 300 }')
+        reply = host.parse_reply(ask(host.build_state(["target"]), setup)[0], ["target"])
+        self.assertEqual(reply["target"], {"npc_id": 11519, "level": 16, "attackable": True, "dead": False,
+                                           "elite": True, "rare": False, "player": False, "tapped_by_others": False,
+                                           "health_pct": 50})
+        reply = host.parse_reply(ask(host.build_state(["target"]), 'TARGET = { guid = "Player-4372-0ABC", '
+                                     'player = true, level = 14 }')[0], ["target"])
+        self.assertEqual((reply["target"]["npc_id"], reply["target"]["player"]), (None, True))
+        self.assertIsNone(host.parse_reply(ask(host.build_state(["target"]))[0], ["target"])["target"])
+
+    def test_character(self):
+        reply = host.parse_reply(ask(host.build_character())[0])
+        self.assertEqual((reply["level"], reply["money_copper"], reply["spec_id"]), (20, 123456, 1487))
+        self.assertEqual((reply["bag_free"], reply["bag_slots"]), (2, 5))
+        self.assertEqual(reply["stats"]["intellect"], 24)
+        self.assertEqual((reply["stats"]["armor"], reply["stats"]["spell_power"], reply["stats"]["healing"]), (95, 9, 12))
+        self.assertEqual(reply["equipped"], [
+            {"slot": "chest", "item_id": 16607, "enchant_id": None, "suffix_id": None, "durability_pct": 75},
+            {"slot": "main_hand", "item_id": 277247, "enchant_id": 15, "suffix_id": -3, "durability_pct": None}])
+
+    def test_bags_and_bank(self):
+        reply = host.parse_reply(ask(host.build_bags())[0])
+        self.assertEqual(reply["items"], [{"item_id": 6948, "count": 1}, {"item_id": 2589, "count": 20}])
+        self.assertEqual((reply["free"], reply["slots"], reply["more"]), (2, 5, False))
+        reply = host.parse_reply(ask(host.build_bags(bank=True))[0])
+        self.assertTrue(reply["bank_never_seen"])
+        reply = host.parse_reply(ask(host.build_bags(bank=True), 'BAGSLOTS[-1] = { { itemID = 4306, stackCount = 40 } } '
+                                     'fireEvent("BANKFRAME_OPENED") fireEvent("BANKFRAME_CLOSED") SERVERTIME = SERVERTIME + 600')[0])
+        self.assertEqual((reply["items"], reply["minutes_old"]), ([{"item_id": 4306, "count": 40}], 10))
+
+    def test_item_info_is_exact_and_paced(self):
+        reply = host.parse_reply(ask(host.build_item_info([19019, 5000, 1]))[0])
+        tf, helm, bad = reply["items"]
+        self.assertEqual((tf["quality"], tf["item_level"], tf["slot"]), ("legendary", 80, "one-hand"))
+        self.assertEqual(tf["stats"], {"agility": 5, "dps": 41.8, "fire_resistance": 8})
+        self.assertEqual((helm["status"], bad["status"]), ("loading", "no such item"))
+        # Not cached: one paced server request, and only once however often it's asked.
+        many = [5000 + n for n in range(14)]
+        lines, _ = Game.run("login() " + "".join("ITEMS[%d] = { cached = false, loc = 'INVTYPE_HEAD' } " % n for n in many)
+                            + hello() + ' taps("%s") frame() ' % bitstr(codec.build(host.CHANNEL, 7, host.build_item_info(many)))
+                            + ' taps("%s") frame() ' % bitstr(codec.build(host.CHANNEL, 8, host.build_item_info(many)))
+                            + 'print("LOADS", #LOADS)')
+        self.assertIn("LOADS\t10", lines)  # 14 unknown items, twice: 10 requests (the bucket), none repeated
+
+    def test_cli(self):
+        self.assertEqual(host._request_for(["item-info", "19019", "1234:-7"]), {"cmd": "item-info", "items": [[19019, 0], [1234, -7]]})
+        self.assertEqual(host._request_for(["bags", "bank"]), {"cmd": "bags", "bank": True})
+
+
+class ItemLookups(unittest.TestCase):
+    """agent/items.py and mcp_server.lookup_items: remembered, valid IDs only, paced retries."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        p = mock.patch.object(mcp_server.items, "PATH", os.path.join(self.tmp.name, "items.db"))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_remembers_and_skips_unknown_ids(self):
+        replies = [{"ok": True, "items": [{"item_id": 19019, "status": "ok", "stats": {"agility": 5}},
+                                          {"item_id": 5000, "status": "loading"}]},
+                   {"ok": True, "items": [{"item_id": 5000, "status": "ok", "stats": {}}]}]
+        with mock.patch.object(mcp_server.common, "game", side_effect=replies) as game:
+            out = mcp_server.lookup_items([(19019, 0), (5000, 0), (424242, 0)], known={19019: "TF", 5000: "Helm"},
+                                          sleep=lambda s: None)
+        self.assertEqual(game.call_count, 2)
+        self.assertEqual(game.call_args_list[0][0], ("item-info", "19019:0", "5000:0"))  # never 424242
+        self.assertEqual(game.call_args_list[1][0], ("item-info", "5000:0"))  # only what was still loading
+        self.assertIn("not in the database", out[(424242, 0)]["status"])
+        with mock.patch.object(mcp_server.common, "game") as game:  # second time: from memory, no game at all
+            again = mcp_server.lookup_items([(19019, 0)], known={19019: "TF"})
+        game.assert_not_called()
+        self.assertEqual(again[(19019, 0)]["stats"], {"agility": 5})
+
+    def test_gives_up_politely(self):
+        with mock.patch.object(mcp_server.common, "game", return_value={"ok": True, "items": [
+                {"item_id": 5000, "status": "loading"}]}) as game:
+            out = mcp_server.lookup_items([(5000, 0)], sleep=lambda s: None, tries=3)
+        self.assertEqual(game.call_count, 3)
+        self.assertIn("still loading", out[(5000, 0)]["status"])
+
+    def test_target_line_names_it(self):
+        db_path = os.path.join(self.tmp.name, "g.db")
+        db = gamedb.connect(db_path)
+        gamedb.load_maps(db, UIMAP_CSV, UMA_CSV)
+        gamedb.load_npcs(db, NPC_LUA, ZONES_LUA)
+        gamedb.load_items(db, ITEM_LUA)
+        db.commit()
+        db.close()
+        t = mcp_server.target_line({"npc_id": 2, "level": 30, "elite": True}, db_path)
+        self.assertEqual((t["name"], t["title"], t["quest_items_it_drops"]), ("Far Trainer", "Priest Trainer", ["Spells of Shadow"]))
+        self.assertIsNone(mcp_server.target_line(None))
+
+
+class Prices(unittest.TestCase):
+    """PRICES (Inventory.lua, from MarketDeck_GetPrice) and get_prices / get_bags' price views."""
+
+    STUB = ('MarketDeck_GetPrice = function(id) if id == 2589 then return { now = 1200, quantity = 40, market = 1000, '
+            'days = 9, scanned = SERVERTIME - 7200, vendor = 13 } elseif id == 12299 then return { vendor = 16, '
+            'disenchant = 900 } end end ')
+
+    def test_game_reply(self):
+        reply = host.parse_reply(ask(host.build_prices([2589, 12299, 6948]), self.STUB)[0])
+        linen, gloves, hearth = reply["prices"]
+        self.assertTrue(reply["market_installed"])
+        self.assertEqual((linen["auction_now"], linen["quantity_up"], linen["market"], linen["days_of_history"],
+                          linen["hours_since_scan"], linen["vendor"]), (1200, 40, 1000, 9, 2, 13))
+        self.assertEqual((gloves["vendor"], gloves["disenchant"], gloves["hours_since_scan"]), (16, 900, None))
+        self.assertIsNone(hearth["vendor"])
+        none = host.parse_reply(ask(host.build_prices([2589]))[0])
+        self.assertFalse(none["market_installed"])
+
+    def test_best_way_to_sell(self):
+        v = mcp_server.price_view({"auction_now": 1200, "quantity_up": 40, "market": 1000, "days_of_history": 9,
+                                   "vendor": 13, "disenchant": None})
+        self.assertEqual((v["auction_now"], v["auction_market"], v["vendor"], v["best"]),
+                         ("0g 12s 0c (40 up)", "0g 10s 0c (9 days)", "0g 0s 13c", "auction house"))
+        v = mcp_server.price_view({"vendor": 16, "disenchant": 900, "days_of_history": 0, "quantity_up": 0})
+        self.assertEqual(v["best"], "disenchant")
+        v = mcp_server.price_view({"market": 20, "days_of_history": 3, "vendor": 20, "quantity_up": 0})
+        self.assertEqual(v["best"], "vendor")  # 20 at auction is 19 after the 5% cut
+
+    def test_not_installed(self):
+        with mock.patch.object(mcp_server.common, "game", return_value={"ok": True, "market_installed": False, "prices": []}):
+            self.assertIn("MarketDeck", mcp_server.tool_get_prices({"item_ids": [2589]})["note"])
+
+
+class Marks(unittest.TestCase):
+    """MARKS (Inventory.lua -> PackPad_SetMarks) and find_items / flag_items / clear_flags."""
+
+    STUB = ('MARKS = {} PackPad_SetMarks = function(src, ids, label) MARKS[src] = { label = label, ids = ids } return true end '
+            'PackPad_ClearMarks = function(src) if src then MARKS[src] = nil else MARKS = {} end end '
+            'PackPad_GetMarks = function() return MARKS end C_Item.GetItemCount = function(id) return id == 2589 and 20 or 0 end ')
+
+    def test_mark_and_clear(self):
+        lines, s = Game.run("login() " + self.STUB + hello() + ' taps("%s") frame() ' % bitstr(codec.build(
+            host.CHANNEL, 7, host.build_marks("Red Linen Bag", [2589, 2320]))) + 'for k, m in pairs(MARKS) do print("MARK", k, m.label, #m.ids) end')
+        reply = host.parse_reply(codec.parse(s.out)[2])
+        self.assertEqual((reply["carried"], reply["packpad_installed"]), ([20, 0], True))
+        self.assertIn("MARK\tDeckAgent:Red Linen Bag\tRed Linen Bag\t2", lines)
+        lines, _ = Game.run("login() " + self.STUB + 'MARKS["DeckAgent:a"] = {} MARKS["DeckAgent:b"] = {} MARKS["Other"] = {} '
+                            + hello() + ' taps("%s") frame() ' % bitstr(codec.build(host.CHANNEL, 7, host.build_marks("", clear=True)))
+                            + 'for k in pairs(MARKS) do print("LEFT", k) end')
+        self.assertEqual([l for l in lines if l.startswith("LEFT")], ["LEFT\tOther"])  # only DeckAgent's
+        with self.assertRaises(ValueError):
+            host.build_marks("", [1])
+
+    def test_without_packpad(self):
+        reply = host.parse_reply(ask(host.build_marks("x", [2589]))[0])
+        self.assertFalse(reply["packpad_installed"])
+
+    def test_find_items(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "g.db")
+        db = gamedb.connect(path)
+        gamedb.load_items(db, ITEM_LUA.replace("}]]", "[2996] = {'Bolt of Linen Cloth'},[2589] = {'Linen Cloth'},}]]"))
+        db.commit()
+        db.close()
+        with mock.patch.object(mcp_server.common, "DB_PATH", path):
+            out = mcp_server.tool_find_items({"name": "linen cloth"})
+        self.assertEqual([i["name"] for i in out["items"]], ["Linen Cloth", "Bolt of Linen Cloth"])  # exact first

@@ -22,6 +22,13 @@ Tools:
   find_quests(place, name, ...)       (database + game) quests for a dungeon/zone or by name, with his status
   get_quests(near)                    (game + database) his quest log: names, objectives with his progress,
                                       what drops the items, who takes each quest in
+  get_character()                     (game + database) his gear with exact stats, his stats, money, bags
+  get_bags(bank)                      (game + database) what he carries, or had in the bank
+  get_item_info(item_ids)             (game, remembered) exact stats of items: rewards, drops, upgrades
+  find_items(name)                    (database) item IDs by name words
+  flag_items(item_ids, label)         (game) a lilac star on those items in his bags (PackPad), and how many he has
+  clear_flags(label)                  (game) takes flags off (one label, or all)
+  get_prices(item_ids)                (game) auction, vendor and disenchant prices (DeckKit's MarketDeck)
   set_hook(when, note, action, ...)   (game or timer) "tell me when...": wakes her (or says a reminder)
   list_hooks() / remove_hook(id)      her hooks
   track_checklist(title, items)       (game) a checklist that stays up and ticks itself off from the game
@@ -38,7 +45,8 @@ import json, os, re, sys, traceback
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from agent import common, gamedb, memory  # noqa: E402
+from agent import common, gamedb, items, memory  # noqa: E402
+import time  # noqa: E402
 
 PROTOCOL = "2025-06-18"
 
@@ -46,10 +54,12 @@ TOOLS = [
     {"name": "get_player_state",
      "description": "Ask the game about the player. `fields` picks what to fetch (default all): "
                     "'position' (map_id and x/y 0-100), 'zone' (zone name), 'who' (faction H/A, level, class), "
-                    "'combat' (in combat or not). Ask only for what the question needs: for 'nearest X' "
+                    "'combat' (in combat or not), 'target' (what he has targeted: name, level, elite/rare, "
+                    "hostile, health, quest items it drops). Ask only for what the question needs: for 'nearest X' "
                     "that's position and who (for the faction).",
      "inputSchema": {"type": "object", "properties": {
-         "fields": {"type": "array", "items": {"type": "string", "enum": ["position", "zone", "who", "combat"]},
+         "fields": {"type": "array", "items": {"type": "string", "enum": ["position", "zone", "who", "combat",
+                                                                         "target"]},
                     "uniqueItems": True}},
          "additionalProperties": False}},
     {"name": "find_npc",
@@ -162,6 +172,59 @@ TOOLS = [
                   "properties": {"map_id": {"type": "integer"}, "x": {"type": "number"}, "y": {"type": "number"}},
                   "required": ["map_id", "x", "y"], "additionalProperties": False}},
          "additionalProperties": False}},
+    {"name": "get_character",
+     "description": "Ben's character sheet: each equipped item (slot, name, quality, item level and exact "
+                    "stats as the game computes them, durability), his stats with gear (strength ... spirit, "
+                    "armor, spell power, healing, max health and mana), money, free bag slots, spec ID, and "
+                    "which slots need repair. Use it for upgrades ('is this better than what I have?'), "
+                    "repairs, 'what should I enchant'.",
+     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "get_bags",
+     "description": "What Ben carries: item names and counts (stacks added up), free slots, and with "
+                    "MarketDeck each item's prices (auction now and market, vendor, disenchant, best way to "
+                    "sell). bank: true "
+                    "gives the bank instead, as it was the last time he opened it (it can't be read "
+                    "otherwise). For an item's stats, get_item_info.",
+     "inputSchema": {"type": "object", "properties": {"bank": {"type": "boolean"}}, "additionalProperties": False}},
+    {"name": "find_items",
+     "description": "Items in the local database (QuestieDB Forever) by words in their name: id and name, "
+                    "exact matches first. Use it to turn item names (a recipe's reagents, a quest item) into "
+                    "the IDs flag_items, get_prices and get_item_info take.",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string", "minLength": 2},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8}},
+         "required": ["name"], "additionalProperties": False}},
+    {"name": "flag_items",
+     "description": "Flag items in Ben's bags: every stack of them gets a lilac star in its slot (PackPad), and "
+                    "its tooltip says `label` ('Red Linen Bag'). Flags stay until cleared. Returns how many of "
+                    "each he carries, so you can say what he still needs. A new call with the same label "
+                    "replaces that set; different labels coexist.",
+     "inputSchema": {"type": "object", "properties": {
+         "item_ids": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1, "maxItems": 40},
+         "label": {"type": "string", "minLength": 1, "maxLength": 60}},
+         "required": ["item_ids", "label"], "additionalProperties": False}},
+    {"name": "clear_flags",
+     "description": "Take flags off Ben's items: one `label`'s set, or all of yours with no label.",
+     "inputSchema": {"type": "object", "properties": {"label": {"type": "string", "maxLength": 60}},
+                     "additionalProperties": False}},
+    {"name": "get_prices",
+     "description": "What items are worth, from DeckKit's MarketDeck: the auction house's lowest buyout now "
+                    "(and how many are up), the two-week market price, the vendor price, the estimated "
+                    "disenchant value, and the best way to sell each (the auction house's 5% cut counted). "
+                    "Prices are from his own auction house snapshots, so they're as fresh as his last visit. "
+                    "get_bags already includes these for what he carries.",
+     "inputSchema": {"type": "object", "properties": {
+         "item_ids": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1, "maxItems": 60}},
+         "required": ["item_ids"], "additionalProperties": False}},
+    {"name": "get_item_info",
+     "description": "Exact stats of items by ID, as the game computes them (quality, item level, required "
+                    "level, slot, armor, DPS, stats): for quest rewards, drops, comparing with his gear. Up "
+                    "to 30. Answers are remembered; an item the game hasn't seen is fetched from Blizzard's "
+                    "server, paced, so it may say 'still loading': ask again a moment later. Ask only for "
+                    "items you need, with IDs from the tools (never guessed).",
+     "inputSchema": {"type": "object", "properties": {
+         "item_ids": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1, "maxItems": 30}},
+         "required": ["item_ids"], "additionalProperties": False}},
     {"name": "set_hook",
      "description": "Be told when something happens, so you can act on it later without Ben asking: a "
                     "reminder ('remind me at level 20 to train', 'in 20 minutes check the auction') or the "
@@ -332,7 +395,28 @@ TOOLS = [
 
 # Tool field names -> the game's (decklink agent state FIELD...). Position always brings the world
 # position too: the database sorts by it, and it's 5 bytes.
-FIELDS = {"position": ["pos", "world"], "zone": ["zone"], "who": ["who"], "combat": ["combat"]}
+FIELDS = {"position": ["pos", "world"], "zone": ["zone"], "who": ["who"], "combat": ["combat"], "target": ["target"]}
+
+
+def target_line(t, db_path=None):
+    """The game's target field with its name from the database: a dict, or None."""
+    if not t:
+        return None
+    out = dict(t)
+    if t.get("npc_id") and os.path.exists(db_path or common.DB_PATH):
+        db = gamedb.connect(db_path or common.DB_PATH)
+        try:
+            r = db.execute("SELECT name, title FROM npc WHERE id = ?", (t["npc_id"],)).fetchone()
+            if r:
+                out["name"], out["title"] = r["name"], r["title"]
+            drops = [d["name"] for d in db.execute(
+                "SELECT i.name FROM item_source s JOIN item i ON i.id = s.item WHERE s.kind = 'npc' AND s.id = ? "
+                "LIMIT 6", (t["npc_id"],))]
+            if drops:
+                out["quest_items_it_drops"] = drops
+        finally:
+            db.close()
+    return out
 
 
 def tool_get_player_state(args):
@@ -347,10 +431,218 @@ def tool_get_player_state(args):
     for k in ("zone", "faction", "level", "class", "in_combat"):
         if k in s:
             out[k] = s[k]
+    if "target" in asked and "target" in s:
+        out["target"] = target_line(s["target"]) or "none"
     missing = [f for f in asked if not any(g in s.get("fields", []) for g in FIELDS[f])]
     if missing:
         out["unavailable"] = missing
     return out
+
+
+def _money(copper):
+    g, rest = divmod(int(copper or 0), 10000)
+    return "%dg %ds %dc" % (g, rest // 100, rest % 100)
+
+
+def _names(ids):
+    """{item ID: name} from the game database (QuestieDB's Forever items)."""
+    if not ids or not os.path.exists(common.DB_PATH):
+        return {}
+    db = gamedb.connect(common.DB_PATH)
+    try:
+        q = ",".join("?" * len(ids))
+        return {r["id"]: r["name"] for r in db.execute("SELECT id, name FROM item WHERE id IN (%s)" % q, list(ids))}
+    finally:
+        db.close()
+
+
+def lookup_items(pairs, known=None, sleep=time.sleep, tries=8):
+    """[(item ID, suffix)] -> {(id, suffix): info}: remembered answers first (items.db), then the game,
+    for IDs the database knows only (`known`: {id: name}; None skips the check, for items the game
+    itself named). Items still loading after about 8 seconds come back as such."""
+    out, want = {}, []
+    idb = items.connect()
+    try:
+        for key in pairs:
+            hit = items.get(idb, *key)
+            if hit:
+                out[key] = hit
+            elif known is not None and key[0] not in known:
+                out[key] = {"item_id": key[0], "status": "not in the database (not asked: it may not exist)"}
+            else:
+                want.append(key)
+        for attempt in range(tries):
+            if not want:
+                break
+            batch = want[:30]
+            reply = common.game("item-info", *["%d:%d" % k for k in batch])
+            if not reply.get("ok"):
+                break
+            loading = False
+            for key, e in zip(batch, reply.get("items", [])):
+                if e["status"] == "ok":
+                    items.put(idb, key[0], key[1], e)
+                    out[key] = e
+                elif e["status"] == "loading":
+                    loading = True
+                else:
+                    out[key] = e
+            want = [k for k in want if k not in out]
+            if loading and attempt < tries - 1:
+                sleep(1.0)
+        for key in want:
+            out[key] = {"item_id": key[0], "status": "still loading from the server: ask again in a moment"}
+    finally:
+        idb.close()
+    return out
+
+
+def tool_get_character(args):
+    c = common.game("character")
+    if not c.get("ok"):
+        raise common.GameError(c.get("reason") or c.get("error") or "the game said no")
+    pairs = [(e["item_id"], e["suffix_id"] or 0) for e in c["equipped"]]
+    names = _names([p[0] for p in pairs])
+    info = lookup_items(pairs)  # equipped items are in the game's cache: no server requests
+    gear = []
+    for e, key in zip(c["equipped"], pairs):
+        i = info.get(key, {})
+        g = {"slot": e["slot"], "item_id": e["item_id"], "name": names.get(e["item_id"]), "quality": i.get("quality"),
+             "item_level": i.get("item_level"), "stats": i.get("stats")}
+        if e["durability_pct"] is not None:
+            g["durability_pct"] = e["durability_pct"]
+        if e["enchant_id"]:
+            g["enchanted"] = True
+        if e["suffix_id"]:
+            g["suffix_id"] = e["suffix_id"]
+        gear.append(g)
+    worn = [g["slot"] for g in gear if g.get("durability_pct") is not None and g["durability_pct"] < 25]
+    out = {"level": c["level"], "spec_id": c["spec_id"], "money": _money(c["money_copper"]), "stats": c["stats"],
+           "bags": "%d of %d slots free" % (c["bag_free"], c["bag_slots"]), "equipped": gear}
+    if worn:
+        out["needs_repair"] = worn
+    return out
+
+
+def price_view(p):
+    """A PRICES entry in words: auction now / market, vendor, disenchant, and the best way to sell it."""
+    out = {}
+    if p.get("auction_now"):
+        out["auction_now"] = _money(p["auction_now"]) + " (%d up)" % p["quantity_up"]
+    if p.get("market") and p.get("days_of_history", 0) >= 2:
+        out["auction_market"] = "%s (%d days)" % (_money(p["market"]), p["days_of_history"])
+    if p.get("vendor"):
+        out["vendor"] = _money(p["vendor"])
+    if p.get("disenchant"):
+        out["disenchant"] = "~" + _money(p["disenchant"])
+    ah = p.get("market") or p.get("auction_now") or 0
+    ah = int(ah * 0.95)  # the auction house keeps 5% of a sale
+    options = {"auction house": ah, "vendor": p.get("vendor") or 0, "disenchant": p.get("disenchant") or 0}
+    best = max(options, key=options.get)
+    if options[best]:
+        out["best"] = best
+    return out
+
+
+def _prices(ids):
+    """{item ID: price_view} from the game (MarketDeck), or {} when it isn't installed."""
+    out = {}
+    ids = list(ids)
+    while ids:
+        batch, ids = ids[:60], ids[60:]
+        r = common.game("prices", *batch)
+        if not r.get("ok") or not r.get("market_installed"):
+            return out
+        got = r.get("prices", [])
+        for p in got:
+            out[p["item_id"]] = price_view(p)
+        if len(got) < len(batch):  # cut at one strip frame: ask again for the rest
+            ids = batch[len(got):] + ids
+            if not got:
+                break
+    return out
+
+
+def tool_find_items(args):
+    if not os.path.exists(common.DB_PATH):
+        raise common.GameError("no game database yet: run deckagent-update")
+    words = [w for w in args["name"].lower().split() if w]
+    limit = int(args.get("limit") or 8)
+    db = gamedb.connect(common.DB_PATH)
+    try:
+        where = " AND ".join("lower(name) LIKE ?" for _ in words)
+        rows = db.execute("SELECT id, name FROM item WHERE " + where + " ORDER BY lower(name) = ? DESC, length(name), name "
+                          "LIMIT ?", ["%" + w + "%" for w in words] + [args["name"].lower(), limit]).fetchall()
+    finally:
+        db.close()
+    return {"items": [{"item_id": r["id"], "name": r["name"]} for r in rows]}
+
+
+def tool_flag_items(args):
+    ids = [int(i) for i in args["item_ids"]][:40]
+    reply = common.game("mark", args["label"], *ids)
+    if not reply.get("ok"):
+        raise common.GameError(reply.get("reason") or reply.get("error") or "the game said no")
+    if not reply.get("packpad_installed"):
+        return {"flagged": False, "note": "flags need DeckKit's PackPad addon (it isn't installed)"}
+    names = _names(ids)
+    carried = reply.get("carried", [])
+    items = [{"item_id": i, "name": names.get(i), "carried": carried[k] if k < len(carried) else None}
+             for k, i in enumerate(ids)]
+    return {"flagged": True, "label": args["label"], "items": items,
+            "missing": [it["name"] or it["item_id"] for it in items if not it["carried"]]}
+
+
+def tool_clear_flags(args):
+    label = (args.get("label") or "").strip()
+    reply = common.game("unmark", *([label] if label else []))
+    if not reply.get("ok"):
+        raise common.GameError(reply.get("reason") or reply.get("error") or "the game said no")
+    return {"cleared": label or "all"}
+
+
+def tool_get_prices(args):
+    ids = [int(i) for i in args["item_ids"]][:60]
+    r = common.game("prices", *ids)
+    if r.get("ok") and not r.get("market_installed"):
+        return {"note": "auction prices need DeckKit's MarketDeck addon (it isn't installed); vendor prices only via "
+                        "get_item_info"}
+    names = _names(ids)
+    views = _prices(ids)
+    scans = [p.get("hours_since_scan") for p in r.get("prices", []) if p.get("hours_since_scan") is not None]
+    out = {"items": [dict({"item_id": i, "name": names.get(i)}, **views.get(i, {})) for i in ids]}
+    if not scans:
+        out["note"] = "no auction snapshot yet: prices fill in after he opens the auction house once"
+    elif min(scans) > 48:
+        out["note"] = "the newest auction snapshot is %d hours old" % min(scans)
+    return out
+
+
+def tool_get_bags(args):
+    bank = bool(args.get("bank"))
+    b = common.game("bags", *(["bank"] if bank else []))
+    if not b.get("ok"):
+        raise common.GameError(b.get("reason") or b.get("error") or "the game said no")
+    if b.get("bank_never_seen"):
+        return {"bank": "not seen yet: it's only readable while he has it open, so ask him to visit the bank once"}
+    ids = [i["item_id"] for i in b["items"]]
+    names = _names(ids)
+    prices = _prices(ids)  # with MarketDeck: auction, vendor, disenchant and the best way to sell each
+    out = {"items": [dict({"item_id": i["item_id"], "name": names.get(i["item_id"]), "count": i["count"]},
+                          **prices.get(i["item_id"], {})) for i in b["items"]],
+           "free_slots": b["free"], "slots": b["slots"]}
+    if bank:
+        out["as_of_minutes_ago"] = b["minutes_old"]
+    if b.get("more"):
+        out["note"] = "more items than fit in one reply: the list is cut short"
+    return out
+
+
+def tool_get_item_info(args):
+    ids = [int(i) for i in args["item_ids"]][:30]
+    names = _names(ids)
+    info = lookup_items([(i, 0) for i in ids], known=names if os.path.exists(common.DB_PATH) else None)
+    return {"items": [dict(info[(i, 0)], name=names.get(i)) for i in ids]}
 
 
 def tool_find_npc(args):
@@ -738,7 +1030,9 @@ HANDLERS = {"get_player_state": tool_get_player_state, "find_npc": tool_find_npc
             "remember": tool_remember, "remember_fact": tool_remember_fact, "recall": tool_recall,
             "forget_fact": tool_forget_fact, "get_quests": tool_get_quests, "find_quests": tool_find_quests,
             "respond": tool_respond, "track_checklist": tool_track_checklist,
-            "set_hook": tool_set_hook, "list_hooks": tool_list_hooks, "remove_hook": tool_remove_hook,
+            "set_hook": tool_set_hook, "get_character": tool_get_character, "get_bags": tool_get_bags,
+            "get_item_info": tool_get_item_info, "get_prices": tool_get_prices, "find_items": tool_find_items, "flag_items": tool_flag_items,
+            "clear_flags": tool_clear_flags, "list_hooks": tool_list_hooks, "remove_hook": tool_remove_hook,
             "clear_checklist": tool_clear_checklist, "get_waypoints": tool_get_waypoints, "remove_waypoints": tool_remove_waypoints, "show_card": tool_show_card, "show_reading": tool_show_reading}
 
 
