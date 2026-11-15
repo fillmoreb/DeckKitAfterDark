@@ -33,6 +33,8 @@ class Keeper:
         self._make = make_link or self._real_link
         self.voice = None  # voice.Voice, with --voice
         self.dictation_keys = None  # set in serve(): one key sender for dictation states
+        self.quiet = False  # the game's "Quiet" setting, from the last reply that carried it
+        self.shown_at = 0  # time.monotonic() of the last card or reading view the assistant put up
 
     def _real_link(self):
         self.grabber = strip.Grabber()
@@ -88,15 +90,25 @@ class Keeper:
                 if cmd == "warm":
                     self._ensure()
                     return {"ok": True, "open": True}
-                if cmd in ("state", "way", "chat", "friends", "prompt"):
+                if cmd in ("state", "way", "chat", "friends", "prompt", "show", "quests", "quest-status", "waypoints"):
                     if cmd == "state" and any(f not in agent.FIELDS for f in req.get("fields") or agent.FIELDS):
                         return {"ok": False, "error": "unknown field"}
                     # Packets are built (and checked) before the link opens: a bad request shouldn't cost one.
                     {"chat": lambda: agent.build_chat(req["channel"], req.get("target", ""), req["text"]),
                      "friends": lambda: agent.build_friends(req.get("lists") or agent.LISTS),
                      "prompt": lambda: agent.build_ask(req["question"], req["options"], req.get("list", False),
-                                                       req.get("seconds", 30))}.get(cmd, lambda: None)()
-                    return agent.handle(self._ensure(), req)
+                                                       req.get("seconds", 30)),
+                     "waypoints": lambda: agent.build_waypoints(req.get("action", "list"), req.get("id", 0)),
+                     "quest-status": lambda: agent.build_quest_status(req["ids"]),
+                     "show": lambda: agent.build_show(req["kind"], req.get("title", ""), req.get("text", ""),
+                                                      req.get("seconds", 0), req.get("item", 0))
+                     }.get(cmd, lambda: None)()
+                    reply = agent.handle(self._ensure(), req)
+                    if cmd == "show" and req.get("kind") != "echo" and reply.get("ok"):
+                        self.shown_at = time.monotonic()
+                    if "quiet" in reply:  # remembered for the voice: speak answers or only show them
+                        self.quiet = reply["quiet"]
+                    return reply
                 return {"ok": False, "error": "unknown cmd %r" % cmd}
             except (link.LinkError, keys.SendError, strip.NoStrip, agent.Malformed, KeyError, ValueError) as e:
                 # A link that failed mid-request may be in any state: start clean next time.
@@ -202,7 +214,7 @@ def main(argv=None):
     keeper.dictation_keys = keys.Keys("xdotool", gap_ms=0)
     if a.voice:
         from . import voice
-        keeper.voice = voice.Voice()
+        keeper.voice = voice.Voice(game=keeper)
     serve(keeper, a.socket)
 
 

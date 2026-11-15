@@ -204,8 +204,12 @@ ns.AddSettings({
           .. "Off: they go straight out.",
       get = Preview,
       set = function(on) DeckAgentDB.previewChat = on end },
+    { type = "toggle", label = "Quiet: show answers instead of speaking them",
+      hint = "For voice chat or a quiet room: answers go on a card and in chat, nothing is said out loud.",
+      get = function() return DeckAgentDB.quiet == true end,
+      set = function(on) DeckAgentDB.quiet = on or nil end },
     { type = "choice", label = "Model",
-      values = { { false, "Default (Haiku)" }, { "haiku", "Haiku" }, { "sonnet", "Sonnet" }, { "opus", "Opus" } },
+      values = { { false, "Default (Sonnet)" }, { "haiku", "Haiku" }, { "sonnet", "Sonnet" }, { "opus", "Opus" } },
       hint = "Which Claude model answers. Haiku is quickest; Sonnet and Opus think harder but take a few "
           .. "seconds longer and use more of your plan. Takes effect on the next question.",
       get = function() return DeckAgentDB.model or false end,

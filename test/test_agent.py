@@ -27,15 +27,15 @@ def ask(packet, setup="", seq=7):
 class GameSide(unittest.TestCase):
     def test_state_request_is_two_bytes(self):
         self.assertEqual(host.build_state(["pos", "world"]), b"\x41\x03")
-        self.assertEqual(host.build_state(), b"\x41\x3f")
+        self.assertEqual(host.build_state(), b"\x41\x7f")
 
     def test_state_all_fields(self):
         data, _ = ask(host.build_state())
-        self.assertEqual(data[:4], b"\x41\x07\x00\x3f")  # op, seq, ok, every field given
+        self.assertEqual(data[:4], b"\x41\x07\x00\x7f")  # op, seq, ok, every field given
         self.assertEqual(host.parse_reply(data), {
             "op": 1, "seq": 7, "ok": True, "status": "ok", "fields": host.FIELDS, "map": 1458, "x": 49.0, "y": 18.3, "cont": 0,
             "wx": 1636, "wy": 240, "zone": "Undercity", "faction": "H", "level": 20, "class": "PRIEST",
-            "in_combat": False, "model": None})
+            "in_combat": False, "model": None, "quiet": False})
 
     def test_state_brain_is_the_menu_model(self):
         for setup, model in (("", None), ('DeckAgentDB = { model = "sonnet" }', "sonnet"),
@@ -234,8 +234,10 @@ class MCPServer(unittest.TestCase):
         self.assertEqual(r["result"]["protocolVersion"], "2025-03-26")
         self.assertIsNone(mcp_server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}))
         names = [t["name"] for t in mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]]
-        self.assertEqual(names, ["get_player_state", "find_npc", "set_waypoint", "send_chat", "get_online",
-                                 "ask_player", "remember", "remember_fact", "recall", "forget_fact"])
+        self.assertEqual(names, ["get_player_state", "find_npc", "set_waypoint", "get_waypoints",
+                                 "remove_waypoints", "send_chat", "get_online",
+                                 "ask_player", "get_quests", "find_quests", "respond", "show_card", "show_reading", "remember", "remember_fact",
+                                 "recall", "forget_fact"])
         self.assertEqual(mcp_server.handle({"jsonrpc": "2.0", "id": 3, "method": "nope"})["error"]["code"], -32601)
 
     def test_player_state_asks_only_for_its_fields(self):
@@ -433,7 +435,7 @@ class VoiceAnswers(unittest.TestCase):
 
         def run(cmd, **kw):
             self.ran.append(cmd)
-            return mock.Mock(stdout="[tool] ...\nWaypoint set: Doras, Orgrimmar.\n", stderr="", returncode=0)
+            return mock.Mock(stdout="Waypoint set: Doras, Orgrimmar.\n", stderr="", returncode=0)
         self.v = voice.Voice(indicator=indicator, run=run, say=self.said.append)
 
     def wait(self):
@@ -860,3 +862,353 @@ class Transcripts(Conversation):
         with open(os.path.join(la.TRANSCRIPTS, name)) as f:
             records = [json.loads(line) for line in f]
         self.assertEqual([r["question"] for r in records], ["nearest innkeeper", "thanks"])
+
+
+class Showing(unittest.TestCase):
+    """SHOW (addons/DeckAgent/Show.lua <-> decklink/agent.py), speak or show (decklink/voice.py) and the
+    show_card / show_reading tools."""
+
+    def test_packet(self):
+        self.assertEqual(host.build_show("card", "Hi", "two\nlines", seconds=20, item=6948),
+                         b"\x47\x02\x14" + struct.pack(">I", 6948) + b"\x02Hi" + struct.pack(">H", 9) + b"two\nlines")
+        echo = host.build_show("echo", "q", "x" * 5000)  # an echo is cut, not refused
+        self.assertEqual(struct.unpack(">H", echo[9:11])[0], 1000)
+        self.assertTrue(echo.endswith("\u2026".encode()))
+        with self.assertRaises(ValueError):
+            host.build_show("card", "t", "x" * 601)
+        with self.assertRaises(ValueError):
+            host.build_show("poster", "t", "x")
+        self.assertLessEqual(len(codec.build(host.CHANNEL, 1, host.build_show("reading", "t" * 120, "x" * host.SHOW_TEXT["reading"]))),
+                             codec.MAX_IN + 16)
+        self.assertEqual(mcp_server.SHOW_TEXT, {k: v for k, v in host.SHOW_TEXT.items() if k != "echo"})
+
+    def test_echo_goes_to_chat_and_reply_says_quiet(self):
+        data, lines = ask(host.build_show("echo", "where's the |cff bank", "Waypoint set: the bank."))
+        self.assertIn("ECHO You asked: where's the ||cff bank", lines)
+        self.assertTrue(any(l.startswith("ECHO ") and l.endswith("Decky:|r Waypoint set: the bank.") for l in lines))
+        reply = host.parse_reply(data)
+        self.assertEqual((reply["ok"], reply["result"], reply["quiet"]), (True, "shown", False))
+        data, _ = ask(host.build_show("echo", "", "hi"), "DeckAgentDB.quiet = true")
+        self.assertTrue(host.parse_reply(data)["quiet"])
+        data, _ = ask(host.build_state(["voice"]), "DeckAgentDB.quiet = true")
+        self.assertEqual(host.parse_reply(data, ["voice"])["quiet"], True)
+
+    def test_card_shows_and_b_or_time_closes_it(self):
+        packet = host.build_show("card", "SFK", "Missing 2 quests", seconds=10, item=6948)
+        show = 'print("CARD", tostring(DeckAgentCard.shown), DeckAgentCard.title.text, DeckAgentCard.text.text) '
+        press = 'local c = DeckAgentCardButtons; c.OnGamePadButtonDown(c, "PAD2") c.OnGamePadButtonUp(c, "PAD2") '
+        lines, _ = Game.run("login() " + hello() + ' taps("%s") frame() ' % bitstr(codec.build(host.CHANNEL, 7, packet))
+                            + show + press + show)
+        self.assertIn("CARD\ttrue\tSFK\tMissing 2 quests", lines)
+        self.assertIn("CARD\tfalse\tSFK\tMissing 2 quests", lines)
+        lines, _ = Game.run("login() " + hello() + ' taps("%s") frame() ' % bitstr(codec.build(host.CHANNEL, 7, packet))
+                            + "fireTimers() " + show)
+        self.assertIn("CARD\tfalse\tSFK\tMissing 2 quests", lines)
+
+    def test_reading_waits_for_combat_and_takes_its_buttons(self):
+        packet = host.build_show("reading", "Walkthrough", "# Step one\n- go there\nthen here")
+        data, lines = ask(packet, "combat(true)", 7)
+        self.assertEqual(host.parse_reply(data)["result"], "queued")
+        lines, _ = Game.run("login() combat(true) " + hello() + ' taps("%s") frame() ' % bitstr(
+            codec.build(host.CHANNEL, 7, packet)) + 'print("BEFORE", tostring(DeckAgentReader)) combat(false) '
+            'print("AFTER", tostring(DeckAgentReader.shown), DeckAgentReader.body.text) '
+            'local c = DeckAgentReaderButtons; c.OnGamePadButtonDown(c, "PAD2") c.OnGamePadButtonUp(c, "PAD2") '
+            'print("CLOSED", tostring(DeckAgentReader.shown))')
+        self.assertIn("BEFORE\tnil", lines)
+        i = lines.index("AFTER\ttrue\t|cffffd100Step one|r")
+        self.assertEqual(lines[i + 1:i + 3], ["  \u2022 go there", "then here"])
+        self.assertIn("CLOSED\tfalse", lines)
+
+    def test_bad_packets_are_refused(self):
+        data, _ = ask(bytes([host.op_byte(host.OP_SHOW), 2, 0, 0, 0, 0, 0, 5]) + b"ab")
+        self.assertEqual(host.parse_reply(data)["status"], "bad arguments")
+        data, _ = ask(host.build_show("echo", "q", "a")[:1] + b"\x09" + host.build_show("echo", "q", "a")[2:])
+        self.assertEqual(host.parse_reply(data)["reason"], "unknown kind 9")
+
+    def test_cli(self):
+        self.assertEqual(host._request_for(["show", "card", "--seconds", "5", "--item", "12", "T", "body"]),
+                         {"cmd": "show", "kind": "card", "seconds": 5, "item": 12, "title": "T", "text": "body"})
+        self.assertIsNone(host._request_for(["show", "card", "only title"]))
+
+
+class SpeakOrShow(unittest.TestCase):
+    def deliver(self, answer, quiet=False, shown_at=0, heard=""):
+        from decklink import voice
+        said, shown = [], []
+
+        class Game:
+            def handle(self, req):
+                shown.append(req)
+                return {"ok": True}
+        g = Game()
+        g.quiet, g.shown_at = quiet, shown_at
+        v = voice.Voice(indicator=mock.Mock(), run=mock.Mock(), say=said.append, game=g)
+        with mock.patch("threading.Thread", lambda target, daemon=None, args=(): mock.Mock(start=lambda: target(*args))):
+            v.deliver("the question", answer, asked_at=10, heard=heard)
+        return said, shown
+
+    def test_short_answer_is_said_and_echoed(self):
+        said, shown = self.deliver("Waypoint set: the bank.")
+        self.assertEqual(said, ["Waypoint set: the bank."])
+        self.assertEqual([r["kind"] for r in shown], ["echo"])
+        self.assertEqual((shown[0]["title"], shown[0]["text"]), ("the question", "Waypoint set: the bank."))
+
+    def test_long_answer_says_the_first_sentence_and_shows_it_all(self):
+        long = "You need three things. First the key from Silverpine. Then the robe. Then a group."
+        said, shown = self.deliver(long)
+        self.assertEqual(said, ["You need three things. The rest is on screen."])
+        self.assertEqual([r["kind"] for r in shown], ["echo", "card"])
+        self.assertEqual(shown[1]["text"], long)
+
+    def test_quiet_says_nothing_and_shows_a_card(self):
+        said, shown = self.deliver("Waypoint set.", quiet=True)
+        self.assertEqual(said, [])
+        self.assertEqual([r["kind"] for r in shown], ["echo", "card"])
+
+    def test_no_second_card_when_the_assistant_showed_one(self):
+        answer = "Route's on screen. Four stops. Start at the bank. Then the inn."
+        said, shown = self.deliver(answer, shown_at=11)
+        self.assertEqual(said, ["Route's on screen."])  # shown already: her first sentence only
+        said, _ = self.deliver("Done. Four stops. Start at the bank. Then the inn.", shown_at=11)
+        self.assertEqual(said, ["Done. It's on screen."])
+        said, _ = self.deliver("Waypoint set and the list is up.", shown_at=11)
+        self.assertEqual(said, ["Waypoint set and the list is up."])  # short: as is
+
+    def test_heard_as_goes_to_chat_only(self):
+        from decklink import voice
+        spoken, heard = voice.split_heard("Waypoint set: Ragefire Chasm.\nHeard as: \"rage fire\" is Ragefire Chasm")
+        self.assertEqual((spoken, heard), ("Waypoint set: Ragefire Chasm.", 'Heard as: "rage fire" is Ragefire Chasm'))
+        said, shown = self.deliver("Waypoint set.", heard=heard)
+        self.assertEqual(said, ["Waypoint set."])
+        self.assertEqual(shown[0]["text"], 'Waypoint set. (Heard as: "rage fire" is Ragefire Chasm)')
+        self.assertEqual([r["kind"] for r in shown], ["echo"])
+
+    def test_answers_are_cleaned_of_sources_and_links(self):
+        from decklink import voice
+        raw = ("There are four gather quests for Ragefire Chasm: the Satchel and the Heart. "
+               "The list is on your screen with sources.\n\nSources:\n"
+               "- [Warcrafttavern guide](https://www.warcrafttavern.com/forever/guides/rfc/)\n"
+               "- [Gameskinny](https://www.gameskinny.com/tips/rfc/)\n")
+        self.assertEqual(voice.clean_answer(raw), "There are four gather quests for Ragefire Chasm: the Satchel "
+                         "and the Heart. The list is on your screen with sources.")
+        self.assertEqual(voice.clean_answer("See **[Wowhead](https://wowhead.com/x)** for more"), "See Wowhead for more.")
+        self.assertEqual(voice.clean_answer("Two options:\n- **Satchel**\n- Heart"), "Two options: Satchel. Heart.")
+        self.assertEqual(voice.clean_answer("Waypoint set: the bank."), "Waypoint set: the bank.")
+
+
+QUEST_LUA = """QuestieDB.questData = [[return {
+[5728] = {"Hidden Enemies",{{1}},{{1}},13,16,nil,nil,{"Kill Bazzalan and Jergosh."},nil,{{{2,nil},{3,"Jergosh the Invoker slain"}}},nil,nil,{5727},nil,nil,nil,2437},
+[5727] = {"Hidden Enemies (part 1)",{{1}},{{1}},10,12,178,nil,{"Talk to Thrall."},nil,nil,nil,nil,nil,nil,nil,nil,2437},
+[5900] = {"Alliance Only",{{3}},{{3}},10,12,77,nil,{"Nope."},nil,nil,nil,nil,nil,nil,nil,nil,2437},
+[5725] = {"The Power to Destroy...",{{1}},{{5}},14,16,nil,nil,{"Bring the books."},nil,{nil,nil,{{900}}}},
+}]]"""
+ITEM_LUA = """QuestieDB.itemData = [[return {
+[900] = {'Spells of Shadow',{2,3},nil,nil,nil,nil,nil,nil,1,0,0,12,0,{5}},
+}]]"""
+OBJECT_LUA = """QuestieDB.objectData = [[return {
+[31] = {"Old Lion Statue",nil,nil,{[1497]={{50,50}}},1497},
+}]]"""
+
+
+class Quests(unittest.TestCase):
+    """QUESTS (addons/DeckAgent/Quests.lua <-> decklink/agent.py), the quest database and get_quests."""
+
+    def test_game_sends_ids_and_counts_only(self):
+        data, _ = ask(host.build_quests())
+        self.assertEqual(data[3:], b"\x00\x02" + struct.pack(">IBB", 5728, 0, 2) + b"\x81\x01\x01\x01\x00\x01"
+                         + struct.pack(">IBB", 5725, 1, 1) + b"\x82\xff\xff")
+        self.assertNotIn(b"Orgrimmar", data)
+        reply = host.parse_reply(data)
+        self.assertEqual(reply["quests"][0], {"id": 5728, "complete": False, "failed": False, "objectives": [
+            {"kind": "monster", "done": True, "have": 1, "need": 1}, {"kind": "monster", "done": False, "have": 0, "need": 1}]})
+        self.assertEqual((reply["quests"][1]["complete"], reply["more"]), (True, False))
+
+    def db(self):
+        db = gamedb.connect(":memory:")
+        gamedb.load_maps(db, UIMAP_CSV, UMA_CSV)
+        gamedb.load_npcs(db, NPC_LUA, ZONES_LUA)
+        gamedb.load_quests(db, QUEST_LUA)
+        gamedb.load_items(db, ITEM_LUA)
+        gamedb.load_objects(db, OBJECT_LUA, ZONES_LUA)
+        return db
+
+    def test_database(self):
+        db = self.db()
+        self.assertEqual(db.execute("SELECT name, level, req_level, text FROM quest WHERE id = 5728").fetchone()[:],
+                         ("Hidden Enemies", 16, 13, "Kill Bazzalan and Jergosh."))
+        self.assertEqual([tuple(r) for r in db.execute("SELECT kind, id, role FROM quest_giver WHERE quest = 5725")],
+                         [("npc", 1, "start"), ("npc", 5, "end")])
+        self.assertEqual([tuple(r) for r in db.execute("SELECT kind, id FROM item_source WHERE item = 900")],
+                         [("npc", 2), ("npc", 3), ("vendor", 5)])
+        self.assertEqual(db.execute("SELECT map, x FROM object_spawn WHERE object = 31").fetchone()[:], (1458, 50))
+
+    def test_quest_log_names_the_ids(self):
+        game = host.parse_reply(ask(host.build_quests())[0])["quests"]
+        log = gamedb.quest_log(self.db(), game, {"map": 1458, "x": 0.49, "y": 0.18})
+        hidden, books = log
+        self.assertEqual(hidden["name"], "Hidden Enemies")
+        self.assertEqual([(o["what"], o["have"], o["done"]) for o in hidden["objectives"]],
+                         [("Far Trainer", 1, True), ("Jergosh the Invoker slain", 0, False)])
+        self.assertEqual(hidden["turn_in"]["name"], "Aelthalyste")
+        self.assertEqual(books["objectives"][0]["from"], ["Far Trainer", "Alliance Priest", "Kalimdor Priest (vendor)"])
+        self.assertEqual((books["complete"], books["turn_in"]["zone"]), (True, "Orgrimmar"))
+
+    def test_cli(self):
+        self.assertEqual(host._request_for(["quests"]), {"cmd": "quests"})
+
+
+class CardMarkup(unittest.TestCase):
+    def test_checklists_and_bullets(self):
+        packet = host.build_show("card", "RFC", "[ ] Heart (Taragaman)\n[x] Satchel\n- note")
+        lines, _ = Game.run("login() " + hello() + ' taps("%s") frame() ' % bitstr(codec.build(host.CHANNEL, 7, packet))
+                            + 'print("TEXT", DeckAgentCard.text.text)')
+        i = lines.index("TEXT\t|A:checkbox-minimal:14:14|a Heart (Taragaman)")
+        self.assertEqual(lines[i + 1:i + 3], ["|A:Tracker-Check:14:14|a |cff9d9d9dSatchel|r", "  \u2022 note"])
+
+
+DUNGEONS_LUA = """local isHorde = UnitFactionGroup("Player") == "Horde"
+local dungeons = {
+    [2437] = {"Ragefire Chasm",nil,1637,{{1637, 52.6, 49}}},
+    [209] = {"Shadowfang Keep",{10014,10015},130,{{130, 44.8, 67.8}}},
+}"""
+
+
+class FindQuests(unittest.TestCase):
+    def db(self):
+        db = Quests.db(self)
+        gamedb.load_areas(db, DUNGEONS_LUA, ZONES_LUA)
+        return db
+
+    def test_areas(self):
+        db = self.db()
+        self.assertEqual(sorted(tuple(r) for r in db.execute("SELECT id, name FROM area WHERE kind = 'dungeon'")),
+                         [(209, "Shadowfang Keep"), (2437, "Ragefire Chasm"), (10014, "Shadowfang Keep"),
+                          (10015, "Shadowfang Keep")])
+        self.assertIn((1497, "Undercity"), [tuple(r) for r in db.execute("SELECT id, name FROM area WHERE kind = 'zone'")])
+
+    def test_by_place_with_faction_and_prerequisites(self):
+        found = gamedb.find_quests(self.db(), place="ragefire", faction="H")
+        self.assertEqual([q["name"] for q in found], ["Hidden Enemies (part 1)", "Hidden Enemies"])  # level order
+        self.assertEqual(found[1]["prerequisites"], [{"id": 5727, "name": "Hidden Enemies (part 1)"}])
+        self.assertEqual(found[1]["filed_under"], "Ragefire Chasm")
+        self.assertEqual(found[1]["givers"][0]["name"], "Aelthalyste")
+        self.assertIn("Alliance Only", [q["name"] for q in gamedb.find_quests(self.db(), place="ragefire", faction="A")])
+        self.assertEqual([q["id"] for q in gamedb.find_quests(self.db(), name="part 1")], [5727])
+        self.assertEqual(gamedb.find_quests(self.db()), [])
+
+    def test_game_status_is_a_number_per_id(self):
+        packet = host.build_quest_status([5728, 5725, 1, 99])
+        self.assertEqual(packet[:2], b"\x49\x04")
+        setup = ('C_QuestLog.IsQuestFlaggedCompleted = function(id) return id == 1 end '
+                 'C_QuestLog.IsOnQuest = function(id) return id == 5728 or id == 5725 end')
+        data, _ = ask(packet, setup)
+        self.assertEqual(data[3:], b"\x04\x01\x02\x03\x00")
+        self.assertEqual(host.parse_reply(data)["status"], ["in log", "ready to turn in", "done", "not taken"])
+        self.assertEqual(host._request_for(["quest-status", "5", "6"]), {"cmd": "quest-status", "ids": [5, 6]})
+
+
+class CardItems(unittest.TestCase):
+    def test_items_become_checklist_and_bullets(self):
+        self.assertEqual(mcp_server.card_text([{"text": "Heart", "done": False}, {"text": "Satchel  ", "done": True},
+                                               {"text": "Rahauro, Thunder Bluff"}], "From the quest log."),
+                         "[ ] Heart\n[x] Satchel\n- Rahauro, Thunder Bluff\n\nFrom the quest log.")
+
+    def test_text_cards_stay_paragraphs(self):
+        self.assertEqual(mcp_server.card_text([], "Wowhead.", "Take the lift down.\n- not a bullet"),
+                         "Take the lift down.\nnot a bullet\n\nWowhead.")
+        with mock.patch.object(mcp_server.common, "game", return_value={"ok": True, "result": "shown"}) as game:
+            mcp_server.tool_show_card({"title": "Getting there", "text": "Take the lift down."})
+            self.assertEqual(game.call_args[0][0:2], ("show", "card"))
+            self.assertEqual(game.call_args[0][-1], "Take the lift down.")
+            with self.assertRaises(common.GameError):
+                mcp_server.tool_show_card({"title": "Both", "text": "a", "items": [{"text": "b"}]})
+            with self.assertRaises(common.GameError):
+                mcp_server.tool_show_card({"title": "Neither"})
+
+
+class Respond(unittest.TestCase):
+    """The respond tool (her answer: what's said + one display) and the launcher reading it."""
+
+    def call(self, **args):
+        with mock.patch.object(mcp_server.common, "game", return_value={"ok": True, "result": "shown"}) as game:
+            out = mcp_server.tool_respond(dict({"say": "Two left; they're on screen."}, **args))
+        return out, game
+
+    def test_displays(self):
+        out, game = self.call(display="none")
+        self.assertEqual((out["spoken"], game.called), ("Two left; they're on screen.", False))
+        out, game = self.call(display="checklist", title="RFC", items=[{"text": "Satchel", "done": False}],
+                              note="From the database.")
+        self.assertEqual(game.call_args[0][1], "card")
+        self.assertEqual(game.call_args[0][-1], "[ ] Satchel\n\nFrom the database.")
+        _, game = self.call(display="list", title="Givers", items=[{"text": "Rahauro", "done": True}])
+        self.assertEqual(game.call_args[0][-1], "- Rahauro")  # a list never shows checks
+        _, game = self.call(display="text", title="How", text="Take the lift.")
+        self.assertEqual(game.call_args[0][-1], "Take the lift.")
+        _, game = self.call(display="reading", title="Guide", text="# Boss\n- dodge")
+        self.assertEqual(game.call_args[0][1], "reading")
+
+    def test_refusals_she_can_fix(self):
+        for args in ({"display": "checklist", "items": [{"text": "a"}]}, {"display": "list"},
+                     {"display": "text"}, {"display": "none", "say": "x" * 161},
+                     {"display": "list", "items": [{"text": "x" * 80}] * 12}):
+            with self.assertRaises(common.GameError, msg=args):
+                self.call(**args)
+
+    def test_launcher_speaks_the_accepted_respond(self):
+        import importlib.machinery, importlib.util, io
+        path = os.path.join(HERE, "..", "agent", "deckagent")
+        loader = importlib.machinery.SourceFileLoader("deckagent_launcher3", path)
+        spec = importlib.util.spec_from_loader("deckagent_launcher3", loader)
+        la = importlib.util.module_from_spec(spec)
+        loader.exec_module(la)
+
+        def use(i, say, heard=None):
+            inp = {"say": say, "display": "none"}
+            if heard:
+                inp["heard"] = heard
+            return {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": i, "name": "mcp__deckagent__respond", "input": inp}]}}
+
+        def result(i, err):
+            return {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": i, "content": "x", "is_error": err}]}}
+        events = [use("a", "a long one"), result("a", True), use("b", "Short.", "rage fire is Ragefire"),
+                  result("b", False), {"type": "result", "result": "Some trailing text."}]
+        proc = mock.Mock(stdout=io.StringIO("".join(json.dumps(e) + "\n" for e in events)), returncode=0)
+        with mock.patch.object(la.subprocess, "Popen", return_value=proc), \
+                mock.patch.object(la, "save_session"), mock.patch.object(la, "write_transcript"):
+            answer, rc = la.run_claude("q", "mcp.json", "sonnet", False)
+        self.assertEqual((answer, rc), ("Short.\nHeard as: rage fire is Ragefire", 0))
+
+
+WAYPAD = ('PTS = { { id = 3, mapID = 1454, x = 0.5, y = 0.25 }, { id = 7, mapID = 1456, x = 0.7, y = 0.3 } } ACT = 2 '
+          'WayPad_GetPoints = function() return PTS, ACT end '
+          'WayPad_Remove = function(id) for i, p in ipairs(PTS) do if p.id == id then table.remove(PTS, i) '
+          'if ACT and ACT >= i then ACT = (#PTS > 0) and math.max(1, ACT - 1) or nil end return true end end '
+          'return false end ')
+
+
+class Waypoints(unittest.TestCase):
+    def test_list(self):
+        data, _ = ask(host.build_waypoints(), WAYPAD)
+        reply = host.parse_reply(data)
+        self.assertEqual(reply["removed"], 0)
+        self.assertEqual(reply["waypoints"], [
+            {"id": 3, "map": 1454, "x": 50.0, "y": 25.0, "active": False},
+            {"id": 7, "map": 1456, "x": 70.0, "y": 30.0, "active": True}])
+
+    def test_remove_by_id_active_and_all(self):
+        reply = host.parse_reply(ask(host.build_waypoints("remove", 3), WAYPAD)[0])
+        self.assertEqual((reply["removed"], [w["id"] for w in reply["waypoints"]]), (1, [7]))
+        reply = host.parse_reply(ask(host.build_waypoints("remove-active"), WAYPAD)[0])
+        self.assertEqual((reply["removed"], [w["id"] for w in reply["waypoints"]]), (1, [3]))
+        reply = host.parse_reply(ask(host.build_waypoints("remove-all"), WAYPAD)[0])
+        self.assertEqual((reply["removed"], reply["waypoints"]), (2, []))
+        reply = host.parse_reply(ask(host.build_waypoints("remove", 99), WAYPAD)[0])
+        self.assertEqual((reply["status"], reply["reason"]), ("refused", "no waypoint with id 99"))
+
+    def test_cli(self):
+        self.assertEqual(host._request_for(["waypoints", "remove", "7"]), {"cmd": "waypoints", "action": "remove", "id": 7})
+        self.assertEqual(host._request_for(["waypoints", "remove-all"]), {"cmd": "waypoints", "action": "remove-all"})
+        self.assertIsNone(host._request_for(["waypoints", "bogus"]))

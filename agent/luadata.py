@@ -108,3 +108,21 @@ def _table(toks, i):
 def blocks(text):
     """QuestieDB files hold their data as `Name.field = [[return {...}]]`: {field: chunk text}."""
     return {m.group(1): m.group(2) for m in re.finditer(r"([\w.]+)\s*=\s*\[\[(.*?)\]\]", text, re.S)}
+
+
+_ROW = re.compile(r"^[A-Za-z_]\w*\[(\d+)\]\s*=\s*(\{.*\})\s*$", re.M)
+
+
+def rows(text):
+    """QuestieDB's export (tools/export-forever.lua) writes one entity per line, `quest[2]={...}`:
+    {id: row}. Comments and the `local quest = {}` / `return quest` lines around them are skipped."""
+    return {int(m.group(1)): loads(m.group(2)) for m in _ROW.finditer(text)}
+
+
+def entities(text, block):
+    """The entities in a QuestieDB file, either form: the raw data files' `block = [[return {...}]]`
+    or the export's one-line rows."""
+    found = blocks(text)
+    if block in found:
+        return loads(found[block])
+    return rows(text)

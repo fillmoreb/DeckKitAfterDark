@@ -4,12 +4,20 @@ Tables:
   npc     id, name, title, faction ("A", "H", "AH" or NULL: whom it's friendly to), flags, levels
   spawn   npc, map (UiMapID), x, y (0-100, like /way), cont (continent), wx, wy (world yards)
   map     id, name, parent, cont, the world rectangle (for map <-> world)
+  quest   id, name, level, required level, objectives text (its one-line summary), next in chain,
+          zone (QuestieDB zoneOrSort: an area ID when > 0), races (bitmask, 0/NULL any), pre (JSON list of
+          prerequisite quest IDs)
+  area    id, name, kind ("dungeon"/"zone"): area IDs quests are filed under, with names
+  quest_giver   quest, kind ("npc"/"object"), id, role ("start"/"end")
+  quest_goal    quest, n (order within its kind), kind ("monster"/"object"/"item"), target id, text
+  item    id, name;  item_source  item, kind ("npc" drop, "object" container, "vendor"), id
+  object  id, name;  object_spawn  object, map, x, y, cont, wx, wy (like spawn)
   meta    key, value (sources and when they were fetched)
 
 World position from a map position (WoW's maps put world +X up and +Y left):
   wx = max_x - y * (max_x - min_x),  wy = max_y - x * (max_y - min_y)   (x, y 0-1)
 """
-import csv, io, math, sqlite3, time
+import csv, io, json, math, re, sqlite3, time
 
 from . import luadata
 
@@ -21,10 +29,76 @@ CREATE INDEX IF NOT EXISTS spawn_npc ON spawn (npc);
 CREATE TABLE IF NOT EXISTS map (id INTEGER PRIMARY KEY, name TEXT, parent INTEGER, cont INTEGER,
     min_x REAL, min_y REAL, max_x REAL, max_y REAL);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS quest (id INTEGER PRIMARY KEY, name TEXT, level INTEGER, req_level INTEGER, text TEXT,
+    next INTEGER, zone INTEGER, races INTEGER, pre TEXT);
+CREATE INDEX IF NOT EXISTS quest_zone ON quest (zone);
+CREATE TABLE IF NOT EXISTS area (id INTEGER, name TEXT, kind TEXT);
+CREATE TABLE IF NOT EXISTS quest_giver (quest INTEGER, kind TEXT, id INTEGER, role TEXT);
+CREATE INDEX IF NOT EXISTS quest_giver_quest ON quest_giver (quest);
+CREATE TABLE IF NOT EXISTS quest_goal (quest INTEGER, n INTEGER, kind TEXT, target INTEGER, text TEXT);
+CREATE INDEX IF NOT EXISTS quest_goal_quest ON quest_goal (quest);
+CREATE TABLE IF NOT EXISTS item (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE IF NOT EXISTS item_source (item INTEGER, kind TEXT, id INTEGER);
+CREATE INDEX IF NOT EXISTS item_source_item ON item_source (item);
+CREATE TABLE IF NOT EXISTS object (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE IF NOT EXISTS object_spawn (object INTEGER, map INTEGER, x REAL, y REAL, cont INTEGER, wx REAL,
+    wy REAL);
+CREATE INDEX IF NOT EXISTS object_spawn_object ON object_spawn (object);
 """
 
 # QuestieDB npcKeys (positions, 0-based here)
 N_NAME, N_MINLVL, N_MAXLVL, N_SPAWNS, N_FRIENDLY, N_TITLE, N_FLAGS = 0, 3, 4, 6, 12, 13, 14
+# questKeys, itemKeys, objectKeys (0-based)
+Q_NAME, Q_STARTS, Q_ENDS, Q_REQLVL, Q_LEVEL, Q_RACES, Q_TEXT, Q_GOALS, Q_PREGROUP, Q_PRESINGLE, Q_ZONE, Q_NEXT = (
+    0, 1, 2, 3, 4, 5, 7, 9, 11, 12, 16, 21)
+HORDE_RACES, ALLIANCE_RACES = 2 | 16 | 32 | 128, 1 | 4 | 8 | 64  # orc undead tauren troll / human dwarf nelf gnome
+I_NAME, I_NPCS, I_OBJECTS, I_VENDORS = 0, 1, 2, 13
+O_NAME, O_SPAWNS = 0, 3
+
+
+def _getter(e):
+    """Field k (0-based) of a QuestieDB entry, which luadata reads as a list or (with holes) a dict."""
+    if isinstance(e, list):
+        return lambda k: e[k] if k < len(e) else None
+    return lambda k: e.get(k + 1)
+
+
+def _plain(v):
+    """A field meant to be a string or number (the export writes some missing ones as {})."""
+    return None if isinstance(v, (list, dict)) else v
+
+
+def _ids(v):
+    """A QuestieDB id list (list, or dict with holes) -> [int]."""
+    if isinstance(v, dict):
+        v = [v[k] for k in sorted(v)]
+    return [x for x in (v or []) if isinstance(x, int)]
+
+
+def _area_maps(zones_lua):
+    zb = luadata.blocks(zones_lua)
+    area_to_map = {}
+    for key in ("ZoneDB.private.areaIdToUiMapId", "ZoneDB.private.areaIdToUiMapIdOverride"):  # override last
+        if key in zb:
+            area_to_map.update(luadata.loads(zb[key]))
+    return area_to_map
+
+
+def _spawns(spawns, area_to_map, rects):
+    """QuestieDB spawns {areaId: [[x, y], ...]} -> [(map, x, y, cont, wx, wy)], skipping instance ones."""
+    out = []
+    for area, coords in (spawns or {}).items() if isinstance(spawns, dict) else []:
+        mid = area_to_map.get(area)
+        if not mid:
+            continue
+        for c in coords if isinstance(coords, list) else []:
+            if not (isinstance(c, list) and len(c) >= 2) or c[0] < 0:  # -1,-1: inside an instance
+                continue
+            cont = wx = wy = None
+            if mid in rects:
+                cont, wx, wy = to_world(rects[mid], c[0] / 100, c[1] / 100)
+            out.append((mid, c[0], c[1], cont, wx, wy))
+    return out
 
 
 def connect(path):
@@ -67,32 +141,97 @@ def to_world(rect, x, y):
 
 def load_npcs(db, npc_lua, zones_lua):
     """QuestieDB's Forever NPC file + its areaId -> UiMapID table."""
-    zb = luadata.blocks(zones_lua)
-    area_to_map = {}
-    for key in ("ZoneDB.private.areaIdToUiMapId", "ZoneDB.private.areaIdToUiMapIdOverride"):  # override last
-        if key in zb:
-            area_to_map.update(luadata.loads(zb[key]))
-    npcs = luadata.loads(luadata.blocks(npc_lua)["QuestieDB.npcData"])
+    area_to_map = _area_maps(zones_lua)
+    npcs = luadata.entities(npc_lua, "QuestieDB.npcData")
     rects = map_rects(db)
     db.execute("DELETE FROM npc")
     db.execute("DELETE FROM spawn")
     for nid, e in npcs.items():
         if not isinstance(e, (list, dict)):
             continue
-        get = (lambda k: e[k] if k < len(e) else None) if isinstance(e, list) else (lambda k: e.get(k + 1))
+        get = _getter(e)
         db.execute("INSERT INTO npc VALUES (?,?,?,?,?,?,?)",
-                   (nid, get(N_NAME), get(N_TITLE), get(N_FRIENDLY), get(N_FLAGS), get(N_MINLVL), get(N_MAXLVL)))
-        for area, coords in (get(N_SPAWNS) or {}).items():
-            mid = area_to_map.get(area)
-            if not mid:
+                   (nid,) + tuple(_plain(get(k)) for k in (N_NAME, N_TITLE, N_FRIENDLY, N_FLAGS, N_MINLVL, N_MAXLVL)))
+        for sp in _spawns(get(N_SPAWNS), area_to_map, rects):
+            db.execute("INSERT INTO spawn VALUES (?,?,?,?,?,?,?)", (nid,) + sp)
+
+
+def load_quests(db, quest_lua):
+    """QuestieDB's Forever quest file: names, levels, who starts and ends them, and their goals."""
+    quests = luadata.entities(quest_lua, "QuestieDB.questData")
+    for t in ("quest", "quest_giver", "quest_goal"):
+        db.execute("DELETE FROM " + t)
+    for qid, e in quests.items():
+        if not isinstance(e, (list, dict)):
+            continue
+        get = _getter(e)
+        text = get(Q_TEXT)
+        text = " ".join(t for t in _ids_or_strs(text)) or None
+        pre = _ids(get(Q_PREGROUP)) + _ids(get(Q_PRESINGLE))
+        db.execute("INSERT INTO quest VALUES (?,?,?,?,?,?,?,?,?)",
+                   (qid, _plain(get(Q_NAME)), _plain(get(Q_LEVEL)), _plain(get(Q_REQLVL)), text,
+                    _plain(get(Q_NEXT)) or None, _plain(get(Q_ZONE)), _plain(get(Q_RACES)),
+                    json.dumps(pre) if pre else None))
+        for field, role in ((Q_STARTS, "start"), (Q_ENDS, "end")):
+            by = get(field)
+            by = by if isinstance(by, list) else [by.get(k) for k in (1, 2, 3)] if isinstance(by, dict) else []
+            for kind, ids in zip(("npc", "object", "item"), by):
+                for i in _ids(ids):
+                    db.execute("INSERT INTO quest_giver VALUES (?,?,?,?)", (qid, kind, i, role))
+        goals = get(Q_GOALS)
+        goals = goals if isinstance(goals, list) else [goals.get(k) for k in range(1, 6)] if isinstance(goals, dict) else []
+        for kind, entries in zip(("monster", "object", "item", None, "monster"), goals):
+            if kind is None or not entries:
                 continue
-            for c in coords if isinstance(coords, list) else []:
-                if not (isinstance(c, list) and len(c) >= 2) or c[0] < 0:  # -1,-1: inside an instance
+            entries = entries if isinstance(entries, list) else [entries[k] for k in sorted(entries)]
+            n = db.execute("SELECT count(*) FROM quest_goal WHERE quest = ? AND kind = ?", (qid, kind)).fetchone()[0]
+            for g in entries:
+                if not isinstance(g, list) or not g:
                     continue
-                cont = wx = wy = None
-                if mid in rects:
-                    cont, wx, wy = to_world(rects[mid], c[0] / 100, c[1] / 100)
-                db.execute("INSERT INTO spawn VALUES (?,?,?,?,?,?,?)", (nid, mid, c[0], c[1], cont, wx, wy))
+                if isinstance(g[0], list):  # kill credit: {{creature, ...}, baseCreature, baseText}
+                    target, text = (g[1] if len(g) > 1 else None), (g[2] if len(g) > 2 else None)
+                else:
+                    target, text = g[0], (g[1] if len(g) > 1 and isinstance(g[1], str) else None)
+                n += 1
+                db.execute("INSERT INTO quest_goal VALUES (?,?,?,?,?)", (qid, n, kind, target, text))
+
+
+def _ids_or_strs(v):
+    if isinstance(v, dict):
+        v = [v[k] for k in sorted(v)]
+    if isinstance(v, str):
+        return [v]
+    return [x for x in (v or []) if isinstance(x, str)]
+
+
+def load_items(db, item_lua):
+    """QuestieDB's Forever item file: names and where they come from (drops, containers, vendors)."""
+    items = luadata.entities(item_lua, "QuestieDB.itemData")
+    db.execute("DELETE FROM item")
+    db.execute("DELETE FROM item_source")
+    for iid, e in items.items():
+        if not isinstance(e, (list, dict)):
+            continue
+        get = _getter(e)
+        db.execute("INSERT INTO item VALUES (?,?)", (iid, _plain(get(I_NAME))))
+        for field, kind in ((I_NPCS, "npc"), (I_OBJECTS, "object"), (I_VENDORS, "vendor")):
+            for i in _ids(get(field)):
+                db.execute("INSERT INTO item_source VALUES (?,?,?)", (iid, kind, i))
+
+
+def load_objects(db, object_lua, zones_lua):
+    """QuestieDB's Forever object file: names and spawns."""
+    objects = luadata.entities(object_lua, "QuestieDB.objectData")
+    area_to_map, rects = _area_maps(zones_lua), map_rects(db)
+    db.execute("DELETE FROM object")
+    db.execute("DELETE FROM object_spawn")
+    for oid, e in objects.items():
+        if not isinstance(e, (list, dict)):
+            continue
+        get = _getter(e)
+        db.execute("INSERT INTO object VALUES (?,?)", (oid, _plain(get(O_NAME))))
+        for sp in _spawns(get(O_SPAWNS), area_to_map, rects):
+            db.execute("INSERT INTO object_spawn VALUES (?,?,?,?,?,?,?)", (oid,) + sp)
 
 
 def set_meta(db, **values):
@@ -182,4 +321,138 @@ def find_npc_once(db, where, args, state=None, faction=None, limit=5):
         out.append({"id": r["id"], "name": r["name"], "title": r["title"], "friendly_to": r["faction"],
                     "zone": r["zone"], "map_id": r["map"], "x": round(r["x"], 1), "y": round(r["y"], 1),
                     "distance_yards": None if dist is None else round(dist)})
+    return out
+
+
+SOURCES_SHOWN = 4  # drop sources per item objective
+
+
+def _name(db, kind, target):
+    table = {"monster": "npc", "object": "object", "item": "item"}.get(kind)
+    if not table or target is None:
+        return None
+    r = db.execute("SELECT name FROM %s WHERE id = ?" % table, (target,)).fetchone()
+    return r["name"] if r else None
+
+
+def _item_sources(db, item):
+    out = []
+    for r in db.execute("SELECT s.kind, coalesce(n.name, o.name) AS name FROM item_source s "
+                        "LEFT JOIN npc n ON s.kind != 'object' AND n.id = s.id "
+                        "LEFT JOIN object o ON s.kind = 'object' AND o.id = s.id WHERE s.item = ? "
+                        "ORDER BY s.kind = 'vendor', s.kind = 'object'", (item,)):
+        name = r["name"] and (r["name"] + (" (vendor)" if r["kind"] == "vendor" else ""))
+        if name and name not in out:
+            out.append(name)
+        if len(out) >= SOURCES_SHOWN:
+            break
+    return out
+
+
+def quest_log(db, game_quests, state=None):
+    """The game's QUESTS reply (IDs and counts only) with names from the database: each quest's name,
+    level, summary, objectives (what, have/need, done; for items, who drops or sells them) and who
+    takes it in (nearest spawn when `state` has a position). The game lists objectives kills and objects
+    first, then items, each in the quest's order: they're matched to the database's by kind, in order."""
+    out = []
+    for q in game_quests:
+        row = db.execute("SELECT * FROM quest WHERE id = ?", (q["id"],)).fetchone()
+        entry = {"id": q["id"], "name": row["name"] if row else None, "level": row["level"] if row else None,
+                 "complete": q["complete"], "failed": q["failed"]}
+        if row and row["text"]:
+            entry["summary"] = row["text"]
+        if not row:
+            entry["note"] = "not in the quest database (new in Forever?): only its progress is known"
+        goals = {}
+        for g in db.execute("SELECT * FROM quest_goal WHERE quest = ? ORDER BY kind, n", (q["id"],)):
+            goals.setdefault(g["kind"], []).append(g)
+        objectives = []
+        for o in q["objectives"]:
+            pool = goals.get(o["kind"]) or []
+            g = pool.pop(0) if pool else None
+            obj = {"kind": o["kind"], "have": o["have"], "need": o["need"], "done": o["done"]}
+            if g is not None:
+                obj["what"] = g["text"] or _name(db, g["kind"], g["target"])
+                if g["kind"] == "item" and g["target"] is not None:
+                    obj["from"] = _item_sources(db, g["target"])
+            objectives.append(obj)
+        entry["objectives"] = objectives
+        ender = db.execute("SELECT kind, id FROM quest_giver WHERE quest = ? AND role = 'end' ORDER BY kind = 'npc' DESC",
+                           (q["id"],)).fetchone()
+        if ender and ender["kind"] == "npc":
+            spot = find_npc_once(db, "n.id = ?", [ender["id"]], state, None, 1)
+            entry["turn_in"] = ({k: spot[0][k] for k in ("name", "zone", "map_id", "x", "y", "distance_yards")}
+                                if spot else {"name": _name(db, "monster", ender["id"])})
+        elif ender:
+            entry["turn_in"] = {"name": _name(db, ender["kind"], ender["id"])}
+        out.append(entry)
+    return out
+
+
+_DUNGEON = re.compile(r'^\s*\[(\d+)\]\s*=\s*\{"((?:[^"\\]|\\.)+)",(nil|\{[\d,\s]*\})', re.M)
+
+
+def load_areas(db, dungeons_lua, zones_lua):
+    """Names for the area IDs quests are filed under: QuestieDB's dungeons (with their other area IDs;
+    read by pattern, as the file has a little code in it) and, for zones, the UiMap each area maps to."""
+    db.execute("DELETE FROM area")
+    for m in _DUNGEON.finditer(dungeons_lua):
+        name = m.group(2)
+        ids = [int(m.group(1))] + [int(x) for x in re.findall(r"\d+", m.group(3))]
+        for i in ids:
+            db.execute("INSERT INTO area VALUES (?,?,?)", (i, name, "dungeon"))
+    seen = {r[0] for r in db.execute("SELECT id FROM area")}
+    for area, mid in _area_maps(zones_lua).items():
+        if area in seen:
+            continue
+        r = db.execute("SELECT name FROM map WHERE id = ?", (mid,)).fetchone()
+        if r:
+            db.execute("INSERT INTO area VALUES (?,?,?)", (area, r["name"], "zone"))
+
+
+def quest_givers(db, qid, role, state=None):
+    """Who starts (or ends) a quest: [{name, zone, map_id, x, y, distance_yards}] (or just a name)."""
+    out = []
+    for g in db.execute("SELECT kind, id FROM quest_giver WHERE quest = ? AND role = ?", (qid, role)):
+        if g["kind"] == "npc":
+            spot = find_npc_once(db, "n.id = ?", [g["id"]], state, None, 1)
+            if spot:
+                out.append({k: spot[0][k] for k in ("name", "zone", "map_id", "x", "y", "distance_yards")})
+                continue
+        name = _name(db, {"npc": "monster"}.get(g["kind"], g["kind"]), g["id"])
+        if name:
+            out.append({"name": name + (" (an item: it starts the quest)" if g["kind"] == "item" else "")})
+    return out
+
+
+def find_quests(db, place="", name="", faction=None, state=None, limit=30):
+    """Quests filed under a place (dungeon or zone name words) and/or with words in their name, for
+    `faction` ("A"/"H": others' race-locked quests left out), lowest level first. Each: id, name,
+    level, required level, where it's filed, summary, givers (nearest spawn when `state` has a
+    position), prerequisites (id and name)."""
+    where, args = [], []
+    for w in (place or "").lower().split():
+        where.append("q.zone IN (SELECT id FROM area WHERE lower(name) LIKE ?)")
+        args.append("%" + w + "%")
+    for w in (name or "").lower().split():
+        where.append("lower(q.name) LIKE ?")
+        args.append("%" + w + "%")
+    if not where:
+        return []
+    if faction in ("A", "H"):
+        mask = HORDE_RACES if faction == "H" else ALLIANCE_RACES
+        where.append("(coalesce(q.races, 0) = 0 OR (q.races & ?) != 0)")
+        args.append(mask)
+    out = []
+    for q in db.execute("SELECT q.*, (SELECT name FROM area WHERE id = q.zone LIMIT 1) AS place FROM quest q WHERE "
+                        + " AND ".join(where) + " ORDER BY coalesce(q.level, 0), q.name LIMIT ?", args + [limit]):
+        pre = []
+        for pid in json.loads(q["pre"] or "[]"):
+            r = db.execute("SELECT name FROM quest WHERE id = ?", (pid,)).fetchone()
+            pre.append({"id": pid, "name": r["name"] if r else None})
+        entry = {"id": q["id"], "name": q["name"], "level": q["level"], "required_level": q["req_level"],
+                 "filed_under": q["place"], "summary": q["text"], "givers": quest_givers(db, q["id"], "start", state)}
+        if pre:
+            entry["prerequisites"] = pre
+        out.append(entry)
     return out

@@ -11,3 +11,5 @@ Agent.lua
 Prompt.lua
 Chat.lua
 Ask.lua
+Show.lua
+Quests.lua

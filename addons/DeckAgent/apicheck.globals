@@ -3,3 +3,5 @@ DeckKit
 DeckLink
 # Optional: WayPad's waypoint API (DeckKit's WayPad addon).
 WayPad_Add
+WayPad_GetPoints
+WayPad_Remove

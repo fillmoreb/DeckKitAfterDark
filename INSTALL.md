@@ -79,3 +79,64 @@ rm -rf ~/.local/lib/decklink ~/.local/bin/decklink ~/.local/bin/decklink-decktat
   ~/.config/systemd/user/decklink-cover.service ~/.config/systemd/user/decklink-telemetry.service
 ```
 Put Decktation's settings back from the backup (step 3), or run step 3's python command with `d.pop("statusHookCommand", None)` in place of the assignment, then delete the addon folders.
+
+## DeckAgent: notes for the install steps (still to be written up)
+
+A running list of everything a DeckAgent install needs, kept as we build it so nothing is lost. Fold
+it into numbered steps above once DeckAgent settles. "Done by the installer" means
+`install-on-deck.sh` (or `install.sh`) already does it.
+
+**Addons:** also copy **DeckAgent** (needs DeckLink; WayPad from DeckKit is optional, for waypoints).
+
+**Done by the installer**
+- `~/.local/lib/deckagent` (launcher, MCP server, database tools), `~/.local/bin/deckagent`,
+  `~/.local/bin/deckagent-update`, `~/.local/bin/decklink-agent-ask` (Decktation's agent binding
+  command).
+- The `decklink-agent` user service: the link keeper, which also answers voice questions (`--voice`).
+- Decktation's WoW hotwords (`wow-vocabulary.txt` into its `profiles.json`, `wow.hotwords` only).
+- **The game database** (`~/.deckagent/deckagent.db`): the first install starts a build in the
+  background (a minute or two, needs internet). The `deckagent-update.timer` checks QuestieDB once
+  a day and rebuilds only when it has a new commit. If the Deck was asleep or off, the check runs
+  as it wakes; a failed run (no Wi-Fi yet) retries every 5 minutes, up to 6 times. A database
+  built without QuestieDB's corrections never counts as current, so the next check tries again.
+  - It downloads the QuestieDB repository (~96 MB; ~112 MB unpacked, deleted after) and runs
+    QuestieDB's own `tools/export-forever.lua` with **Lua 5.1**: an installed `lua5.1`, else the
+    static Lua 5.1.5 QuestieDB ships for Linux x64. **Not LuaJIT** (SteamOS has it at
+    /usr/bin/luajit): it fails on QuestieDB's biggest files ("more than 65536 constants").
+  - Without a working Lua it falls back to QuestieDB's raw `data/Forever` files. Those are only
+    Forever's own rows, uncorrected: about two thirds of the quests (4,244 vs 5,914) and a third
+    of the spawns (55k vs 141k). The build log says `corrections: no`.
+  - By hand: `deckagent-update` (rebuild now) or `deckagent-update --if-changed`. Status:
+    `journalctl --user -u deckagent-update`, `systemctl --user list-timers deckagent-update.timer`.
+  - Never commit or redistribute the data (QuestieDB has no license file): download only.
+
+**Manual today (to automate or document)**
+- **Claude Code** on the Deck (`~/.local/bin/claude`) and signed in to a Claude plan (`claude`,
+  then log in). `deckagent` warns if it ever runs on an API key instead.
+- **Piper** (text to speech) for spoken answers: the `piper` binary and the
+  `en_US-lessac-medium.onnx` + `.onnx.json` voice in `~/.local/share/deckagent/piper/`.
+- **Decktation**: Ben's fork, with an **agent binding** (L5+R5) that hands its transcript to a
+  command. In `button_config.json` (root-owned, like step 3):
+  `"agentBinding": {"buttons": ["L5", "R5"], "command": "/home/deck/.local/bin/decklink-agent-ask"}`,
+  `"exactBindingMs": 150`, and `"statusHookCommand"` as in step 3. Then restart Decky
+  (`sudo systemctl restart plugin_loader`). This can drop the game's controller focus, so do it
+  outside the game or expect to refocus.
+- The speech model in Decktation's settings: **parakeet-v3** recommended (Ben, 2026-11-14: "has
+  been working much better" than Whisper). It runs on the CPU and takes no hotwords, so the WoW
+  hotwords above only help the Whisper models (base, small ~465 MB, medium).
+- In DeckKit's menu: put **DeckKit Assistant** (`DECKKIT_ASSISTANT`) on the L5+R5 grip chord, so the
+  dictation box says "Starting" and game sound fades while you ask. Tools › DeckAgent has the model
+  pick, Quiet, and chat preview.
+- First use: tell Decky who your friends are; she writes them under People in
+  `~/.deckagent/CLAUDE.md`. Her facts go in `~/.deckagent/memory.db`. Both are personal and stay
+  out of the repo.
+
+**Requirements already on SteamOS** (checked 2026-11-14): Python 3.13, GStreamer with PyGObject,
+PipeWire tools (`pw-dump`, `pw-play`), `xdotool`. The paste route needs `xclip`, which SteamOS
+lacks: DeckLink uses `~/.local/bin/xclip` if present, else the copy Decktation ships.
+
+**Gotchas met while building**
+- SteamOS sets `KillUserProcesses=True`: anything started over SSH dies when the login ends unless
+  it's a systemd user service (or started under `systemd-run --user --scope`).
+- The screen reader asks gamescope's stream for BGRx by name: with a crop in the pipeline it would
+  otherwise fall back to NV12, whose colors fail the strip's checksum.

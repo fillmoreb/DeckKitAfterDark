@@ -5,7 +5,9 @@
 #   statusHookCommand) into ~/.local/bin; and the decklink-cover, decklink-telemetry and decklink-agent
 #   (DeckAgent's link keeper) systemd user services, enabled, so they start with the Deck. DeckAgent
 #   itself (../agent: the assistant's launcher, MCP server and database tools) goes into
-#   ~/.local/lib/deckagent, with `deckagent` in ~/.local/bin.
+#   ~/.local/lib/deckagent, with `deckagent` and `deckagent-update` in ~/.local/bin, and the
+#   deckagent-update timer: once a day it rebuilds the game database when QuestieDB has changed
+#   (agent/update_data.py; the first build starts right after an install that has no database yet).
 set -euo pipefail
 cd "$(dirname "$0")"
 [ "$(id -un)" = deck ] || { echo "run this as the deck user (not root)" >&2; exit 1; }
@@ -29,6 +31,39 @@ if [ -d "$AGENT" ]; then
 exec python3 /home/deck/.local/lib/deckagent/agent/deckagent "$@"
 SH
   chmod +x ~/.local/bin/deckagent
+  cat > ~/.local/bin/deckagent-update <<'SH'
+#!/bin/sh
+# Rebuilds DeckAgent's game database from QuestieDB now (add --if-changed to skip when it hasn't changed).
+cd /home/deck/.local/lib/deckagent && exec python3 -m agent.update_data "$@"
+SH
+  chmod +x ~/.local/bin/deckagent-update
+  cat > ~/.config/systemd/user/deckagent-update.service <<'UNIT'
+[Unit]
+Description=DeckAgent game database: rebuild from QuestieDB when it has changed
+After=network-online.target
+# The timer catches up on a missed day as the Deck wakes, often before Wi-Fi is back: a failed run
+# tries again every 5 minutes, up to 6 times.
+StartLimitIntervalSec=2h
+StartLimitBurst=6
+[Service]
+Type=oneshot
+WorkingDirectory=/home/deck/.local/lib/deckagent
+ExecStart=/usr/bin/python3 -m agent.update_data --if-changed
+Restart=on-failure
+RestartSec=5min
+Nice=10
+UNIT
+  cat > ~/.config/systemd/user/deckagent-update.timer <<'UNIT'
+[Unit]
+Description=DeckAgent game database: check QuestieDB for changes once a day
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+  UPDATER=1
 fi
 cat > ~/.local/bin/decklink-agent-ask <<'SH'
 #!/bin/sh
@@ -97,4 +132,11 @@ systemctl --user daemon-reload
 systemctl --user enable decklink-cover decklink-telemetry decklink-agent >/dev/null 2>&1
 systemctl --user restart decklink-cover decklink-telemetry decklink-agent
 systemctl --user is-active decklink-cover decklink-telemetry decklink-agent
+if [ -n "${UPDATER:-}" ]; then
+  systemctl --user enable --now deckagent-update.timer >/dev/null 2>&1
+  # No database yet: build one now, in the background (a minute or two; `journalctl --user -u
+  # deckagent-update` shows how it went).
+  [ -f ~/.deckagent/deckagent.db ] || systemctl --user start --no-block deckagent-update.service
+  echo "deckagent-update timer: $(systemctl --user is-active deckagent-update.timer)"
+fi
 echo "decklink installed, with the decklink-cover, decklink-telemetry and decklink-agent user services"

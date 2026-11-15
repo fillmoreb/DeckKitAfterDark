@@ -19,10 +19,11 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 from agent import common, memory  # noqa: E402
 
-TOOLS = ["mcp__deckagent__get_player_state", "mcp__deckagent__find_npc", "mcp__deckagent__set_waypoint",
+TOOLS = ["mcp__deckagent__get_player_state", "mcp__deckagent__find_npc", "mcp__deckagent__set_waypoint", "mcp__deckagent__get_waypoints",
+         "mcp__deckagent__remove_waypoints",
          "mcp__deckagent__send_chat", "mcp__deckagent__get_online", "mcp__deckagent__ask_player",
          "mcp__deckagent__remember", "mcp__deckagent__remember_fact", "mcp__deckagent__recall",
-         "mcp__deckagent__forget_fact"]
+         "mcp__deckagent__forget_fact", "mcp__deckagent__get_quests", "mcp__deckagent__find_quests", "mcp__deckagent__respond"]
 # Built-in tools: the web, and its own notes. Read/Edit/Write are allowed only inside its folder (the
 # working directory, ~/.deckagent): anything elsewhere would need an approval -p can't give, so it's denied.
 BUILTIN = "WebSearch,WebFetch,Read,Edit,Write"
@@ -230,6 +231,7 @@ def run_claude(question, mcp, model, verbose, resume=None):
     proc = subprocess.Popen(cmd, cwd=common.HOME, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True, env=env)
     answer, auth, session, cost, turns = None, None, None, None, None
     steps = []  # for the transcript: tool calls and their results, in order
+    pending, responded = {}, None  # respond calls by id; the last one the tool accepted (her answer)
     for line in proc.stdout:
         try:
             ev = json.loads(line)
@@ -244,6 +246,8 @@ def run_claude(question, mcp, model, verbose, resume=None):
         elif ev.get("type") == "assistant":
             for block in ev.get("message", {}).get("content", []):
                 if block.get("type") == "tool_use":
+                    if block["name"].endswith("__respond"):
+                        pending[block.get("id")] = block.get("input") or {}
                     steps.append({"t": round(time.monotonic() - start, 2), "tool": block["name"].split("__")[-1],
                                   "input": block.get("input")})
                     if verbose:
@@ -253,6 +257,8 @@ def run_claude(question, mcp, model, verbose, resume=None):
         elif ev.get("type") == "user":
             for block in ev.get("message", {}).get("content", []):
                 if isinstance(block, dict) and block.get("type") == "tool_result":
+                    if block.get("tool_use_id") in pending and not block.get("is_error"):
+                        responded = pending.pop(block["tool_use_id"])
                     text = block.get("content")
                     text = text if isinstance(text, str) else json.dumps(text)
                     steps.append({"t": round(time.monotonic() - start, 2), "result": text[:2000],
@@ -266,11 +272,17 @@ def run_claude(question, mcp, model, verbose, resume=None):
                 print("[done] %.1f s, %s turns, cost estimate $%s" % (time.monotonic() - start, ev.get("num_turns"),
                       ev.get("total_cost_usd")), file=sys.stderr)
     proc.wait()
+    final_text = answer
+    if responded and responded.get("say"):  # the answer is what she gave respond, not trailing text
+        answer = responded["say"].strip()
+        if (responded.get("heard") or "").strip():
+            answer += "\nHeard as: " + responded["heard"].strip()
     if proc.returncode == 0:
         save_session(session)
     write_transcript({"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "question": question, "model": model,
                       "session": session, "resumed": bool(resume), "auth": auth, "steps": steps,
-                      "answer": answer, "exit": proc.returncode, "seconds": round(time.monotonic() - start, 1),
+                      "answer": answer, "final_text": final_text, "respond": responded, "exit": proc.returncode,
+                      "seconds": round(time.monotonic() - start, 1),
                       "turns": turns, "cost_estimate": cost})
     if auth not in (None, "none"):
         print("deckagent: note: this ran on an API key (%s), not your Claude plan" % auth, file=sys.stderr)
@@ -281,10 +293,10 @@ def main():
     p = argparse.ArgumentParser(prog="deckagent", description="Ask your gaming assistant.")
     p.add_argument("question", nargs="+")
     p.add_argument("--engine", choices=["claude", "codex"], default=os.environ.get("DECKAGENT_ENGINE", "claude"))
-    # Haiku by default: about 2.5 s faster per question than Opus (2026-11-14) and right on the
-    # lookups; when a question needs more judgment, say --model sonnet (or set DECKAGENT_MODEL).
+    # Sonnet by default (Ben, 2026-11-14): Haiku was quicker and fine on lookups, but ignored how to
+    # answer (prose cards, long spoken answers). Haiku and Opus are a pick in the game's menu.
     p.add_argument("--model", help="haiku, sonnet, opus... (default: the game menu's pick, else "
-                   "$DECKAGENT_MODEL, else haiku)")
+                   "$DECKAGENT_MODEL, else sonnet)")
     p.add_argument("-v", "--verbose", action="store_true")
     p.add_argument("--no-prefetch", action="store_true", help="don't fetch his position before asking")
     a = p.parse_args()
@@ -300,7 +312,7 @@ def main():
     if state:
         question = state + "\n\n" + question
     resume = None if FRESH.match(" ".join(a.question)) else last_session()
-    model = a.model or PICKED.get("model") or os.environ.get("DECKAGENT_MODEL") or "haiku"
+    model = a.model or PICKED.get("model") or os.environ.get("DECKAGENT_MODEL") or "sonnet"
     answer, rc = run_claude(question, mcp, model, a.verbose, resume)
     if rc and resume:  # the old session couldn't be resumed (cleaned up?): ask again, fresh
         answer, rc = run_claude(question, mcp, model, a.verbose)

@@ -15,8 +15,12 @@
 --                    bit 4 COMBAT  uint8 (1 in combat)
 --                    bit 5 BRAIN   uint8, the model picked in the DeckKit menu (Tools > DeckAgent):
 --                                  0 the default, 1 Haiku, 2 Sonnet, 3 Opus
+--                    bit 6 VOICE   uint8, answers: 0 spoken, 1 quiet (shown only; DeckKit menu)
 --   WAY (op 2):    bytes 1-2 map uint16, 3-4 x uint16, 5-6 y uint16: a WayPad waypoint, made active
 --                  (the game's own map pin when WayPad is missing)
+--   WAYPOINTS (op 10): byte 1 action: 1 list, 2 remove the one with id (bytes 2-3, uint16), 3 remove
+--                  the active one, 4 remove all. WayPad's waypoints (without WayPad: the game's map pin,
+--                  which "active" and "all" clear)
 --
 -- Reply (game -> host, on the strip):
 --   byte 0      the request's op byte
@@ -27,11 +31,14 @@
 --               zeroed, and its bit is cleared in the echoed mask at byte 3)
 --               WAY: byte 3 how it was set (1 WayPad, 2 map pin), bytes 4-5 WayPad's id for the
 --               waypoint, uint16 (stable, for later requests about it; 0 for the map pin)
+--               WAYPOINTS: byte 3 how many were removed, then the list as it is now: count uint8,
+--               active id uint16 (0 none), then each: id uint16, map uint16, x uint16, y uint16
+--               (no labels: names come from the assistant's own database)
 --               CHAT, FRIENDS: see Chat.lua
 --               any failure: length uint8, a short reason (UTF-8)
 --
--- CHAT (op 3) and FRIENDS (op 4) are in Chat.lua, ASK (op 5) in Ask.lua; they use the helpers shared
--- below (ns.Bytes, ns.OPS). Ops get (payload, seq).
+-- CHAT (op 3) and FRIENDS (op 4) are in Chat.lua, ASK (op 5) in Ask.lua, SHOW (op 7) in Show.lua,
+-- QUESTS (op 8) in Quests.lua; they use the helpers shared below (ns.Bytes, ns.OPS). Ops get (payload, seq).
 --
 -- Replies need the link open (the host says hello first): DeckLink.Send refuses otherwise.
 local ADDON, ns = ...
@@ -40,8 +47,8 @@ DeckKit.NewModule(ns, ADDON, "|cffe8b04bDeckAgent|r")
 
 local CHANNEL = 3
 local VERSION = 1
-local OP_STATE, OP_WAY = 1, 2
-local POS, WORLD, ZONE, WHO, COMBAT, BRAIN = 1, 2, 4, 8, 16, 32
+local OP_STATE, OP_WAY, OP_WAYPOINTS = 1, 2, 10
+local POS, WORLD, ZONE, WHO, COMBAT, BRAIN, VOICE = 1, 2, 4, 8, 16, 32, 64
 local MODELS = { haiku = 1, sonnet = 2, opus = 3 }
 ns.MODELS = MODELS
 local OK, UNKNOWN_OP, BAD_ARGS, REFUSED, FAILED, UNKNOWN_VERSION = 0, 1, 2, 3, 4, 5
@@ -140,6 +147,10 @@ local function State(p)
         sent = sent + BRAIN
         parts[#parts + 1] = U8(MODELS[DeckAgentDB and DeckAgentDB.model or ""] or 0)
     end
+    if mask % 128 >= 64 then -- VOICE
+        sent = sent + VOICE
+        parts[#parts + 1] = U8(DeckAgentDB and DeckAgentDB.quiet and 1 or 0)
+    end
     return OK, U8(sent) .. table.concat(parts)
 end
 
@@ -159,7 +170,50 @@ local function Way(p)
     return OK, U8(VIA_MAPPIN) .. U16(0)
 end
 
-local OPS = { [OP_STATE] = State, [OP_WAY] = Way }
+local LIST, REMOVE_ID, REMOVE_ACTIVE, REMOVE_ALL = 1, 2, 3, 4
+
+local function Waypoints(p)
+    local action = p:byte(2)
+    if not action or action < LIST or action > REMOVE_ALL then return BAD_ARGS, Str("WAYPOINTS needs an action 1-4") end
+    if action == REMOVE_ID and #p < 4 then return BAD_ARGS, Str("remove needs a waypoint id") end
+    local removed = 0
+    if WayPad_GetPoints and WayPad_Remove then
+        local points, active = WayPad_GetPoints()
+        local ids = {}
+        if action == REMOVE_ID then
+            ids[1] = ReadU16(p, 3)
+        elseif action == REMOVE_ACTIVE and active and points[active] then
+            ids[1] = points[active].id
+        elseif action == REMOVE_ALL then
+            for i, pt in ipairs(points) do ids[i] = pt.id end
+        end
+        for _, id in ipairs(ids) do
+            if WayPad_Remove(id) then removed = removed + 1 end
+        end
+        if action == REMOVE_ID and removed == 0 then return REFUSED, Str("no waypoint with id " .. ids[1]) end
+        points, active = WayPad_GetPoints()
+        local budget = math.floor((DeckLink.MaxPayload() - 8) / 8)
+        local parts, activeID = {}, active and points[active] and points[active].id or 0
+        for i = 1, math.min(#points, budget, 255) do
+            local pt = points[i]
+            parts[i] = U16(pt.id or 0) .. U16(pt.mapID or 0) .. U16(Fraction(pt.x or 0)) .. U16(Fraction(pt.y or 0))
+        end
+        return OK, U8(removed) .. U8(#parts) .. U16(activeID) .. table.concat(parts)
+    end
+    -- No WayPad: the game's own map pin is the only waypoint (id 0 when it's there).
+    local pin = C_Map.HasUserWaypoint and C_Map.HasUserWaypoint() and C_Map.GetUserWaypoint and C_Map.GetUserWaypoint()
+    if pin and (action == REMOVE_ACTIVE or action == REMOVE_ALL or (action == REMOVE_ID and ReadU16(p, 3) == 0)) then
+        C_Map.ClearUserWaypoint()
+        return OK, U8(1) .. U8(0) .. U16(0)
+    end
+    if action == REMOVE_ID then return REFUSED, Str("no waypoint with that id") end
+    if not pin then return OK, U8(0) .. U8(0) .. U16(0) end
+    local pos = pin.position
+    return OK, U8(0) .. U8(1) .. U16(0) .. U16(0) .. U16(pin.uiMapID or 0) .. U16(Fraction(pos and pos.x or 0))
+        .. U16(Fraction(pos and pos.y or 0))
+end
+
+local OPS = { [OP_STATE] = State, [OP_WAY] = Way, [OP_WAYPOINTS] = Waypoints }
 
 -- For Chat.lua (loaded after this file).
 ns.OPS = OPS

@@ -131,6 +131,23 @@ function fireTimers() for _, t in ipairs(TIMERS) do if not t.cancelled then t.fn
 function fireEvent(event, ...) for _, fn in ipairs(EVENTS[event] or {}) do fn(...) end end
 UnitClass = function() return "Priest", PLAYER.class, 5 end
 UnitLevel = function() return PLAYER.level end
+-- For DeckAgent's Show.lua.
+DEFAULT_CHAT_FRAME = { AddMessage = function(_, msg) print("ECHO " .. msg) end }
+C_Item = { GetItemIconByID = function(id) return 1000 + id end }
+-- The quest log, for Quests.lua: QUESTLOG = { header or {id, complete, failed, objectives}, ... }.
+QUESTLOG = { { header = "Orgrimmar" },
+    { id = 5728, objectives = { { type = "monster", numFulfilled = 1, numRequired = 1, finished = true },
+                                { type = "monster", numFulfilled = 0, numRequired = 1, finished = false } } },
+    { id = 5725, complete = true, objectives = { { type = "item", numFulfilled = 300, numRequired = 300,
+                                                   finished = true } } } }
+C_QuestLog = {
+    GetNumQuestLogEntries = function() return #QUESTLOG end,
+    GetInfo = function(i) local q = QUESTLOG[i]; return q and { isHeader = q.header ~= nil, title = q.header,
+        questID = q.id } end,
+    IsComplete = function(id) for _, q in ipairs(QUESTLOG) do if q.id == id then return q.complete end end end,
+    IsFailed = function(id) for _, q in ipairs(QUESTLOG) do if q.id == id then return q.failed end end end,
+    GetQuestObjectives = function(id) for _, q in ipairs(QUESTLOG) do if q.id == id then return q.objectives end end end,
+}
 
 -- The addons on top of DeckLink, after it (they register their channels).
 for _, name in ipairs({ "DeckTelemetry", "DeckDictation", "DeckAgent" }) do
