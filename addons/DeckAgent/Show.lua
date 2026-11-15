@@ -35,7 +35,7 @@ local U8, Str, ReadU16, ReadU32 = B.U8, B.Str, B.ReadU16, B.ReadU32
 local OP_SHOW = 7
 local ECHO, CARD, READING, LAYOUT = 1, 2, 3, 4
 local SHOWN, QUEUED = 1, 2
-local DECKY = "|cffe8b04bDecky:|r " -- the assistant's name (agent/SYSTEM.md), in DeckAgent's color
+local DECKY = "|cffe8b04b" .. ns.NAME .. ":|r " -- the assistant's name (Agent.lua), in DeckAgent's color
 
 DeckAgentDB = DeckAgentDB or {}
 local function Quiet() return DeckAgentDB.quiet == true end
@@ -306,7 +306,7 @@ local function OpenLayout(q)
         if q.waits then ns.SendAnswer(q.seq, choice) end
     end
     return DeckKit.UI.ShowLayout(q.spec, {
-        title = "Decky", ticks = TicksFor(q.spec),
+        title = ns.NAME, ticks = TicksFor(q.spec),
         onReply = function(v)
             Answer(tonumber(v) or 0)
             DeckKit.UI.HideLayout()

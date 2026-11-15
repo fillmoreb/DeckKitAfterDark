@@ -88,6 +88,7 @@ function DeckKit.NewModule(ns)
     return ns
 end
 DeckKit.Dictation = { SetState = function(state, binding) print("DICTATION " .. state .. " " .. tostring(binding)) end,
+    SetAssistant = function(name) print("ASSISTANT " .. name) end,
     Claim = function() print("DICTATION claimed") end }
 local function fire(event, ...) for _, fn in ipairs(events[event] or {}) do fn(...) end end
 

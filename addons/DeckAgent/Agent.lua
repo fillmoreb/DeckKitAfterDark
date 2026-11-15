@@ -51,6 +51,11 @@ local ADDON, ns = ...
 
 DeckKit.NewModule(ns, ADDON, "|cffe8b04bDeckAgent|r")
 
+-- The assistant's name (agent/SYSTEM.md): in chat, on her windows, and on her grip chord (DeckKit shows it
+-- with the headphones on the cheat sheet and in the menu).
+ns.NAME = "Decky"
+if DeckKit.Dictation and DeckKit.Dictation.SetAssistant then DeckKit.Dictation.SetAssistant(ns.NAME) end
+
 local CHANNEL = 3
 local VERSION = 1
 local OP_STATE, OP_WAY, OP_WAYPOINTS = 1, 2, 10

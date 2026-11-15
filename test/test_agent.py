@@ -1121,6 +1121,12 @@ class Transcripts(Conversation):
         self.assertEqual([r["question"] for r in records], ["nearest innkeeper", "thanks"])
 
 
+class Naming(unittest.TestCase):
+    def test_deckagent_names_its_chord_for_deckkit(self):
+        lines, _ = Game.run("login()")
+        self.assertIn("ASSISTANT Decky", lines)
+
+
 class Layouts(unittest.TestCase):
     """SHOW kind layout (Show.lua <-> decklink/agent.py layout_packet) and the show_layout tool."""
 

@@ -1,3 +1,5 @@
+<p align="center"><img src="media/deckkitafterdark-logo-400.png" width="200" alt="DeckKitAfterDark logo"></p>
+
 # DeckKitAfterDark
 
 A companion suite to [DeckKit](https://github.com/fillmoreb/DeckKit) (controller-first addons for WoW:
@@ -210,3 +212,8 @@ so it costs next to nothing.
 - `./deploy.sh DeckLink` deploys through AddonTools' `deckctl` (like DeckKit's), `deploy.local` as there.
 - `test/run.sh` runs the tests: the Python host side against the real addon code, through
   `test/harness.lua` (a stub WoW API; needs `lua5.1`).
+
+## License
+
+MIT, see [`LICENSE`](LICENSE). The logo in `media/` is AI-generated and not covered by the MIT License.
+DeckKitAfterDark is an unofficial fan project, not affiliated with Blizzard Entertainment.
