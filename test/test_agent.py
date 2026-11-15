@@ -9,7 +9,7 @@ from unittest import mock
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "deck-setup"))
 sys.path.insert(0, os.path.join(HERE, ".."))
-from decklink import agent as host, codec  # noqa: E402
+from decklink import agent as host, codec, strip  # noqa: E402
 from agent import common, gamedb, luadata, mcp_server  # noqa: E402
 from test_decklink import Game, bitstr, hello  # noqa: E402
 
@@ -236,7 +236,7 @@ class MCPServer(unittest.TestCase):
         names = [t["name"] for t in mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]]
         self.assertEqual(names, ["get_player_state", "find_npc", "set_waypoint", "get_waypoints",
                                  "remove_waypoints", "send_chat", "get_online",
-                                 "ask_player", "get_quests", "find_quests", "respond", "show_card", "show_reading", "remember", "remember_fact",
+                                 "ask_player", "get_quests", "find_quests", "set_hook", "list_hooks", "remove_hook", "track_checklist", "clear_checklist", "respond", "show_card", "show_reading", "remember", "remember_fact",
                                  "recall", "forget_fact"])
         self.assertEqual(mcp_server.handle({"jsonrpc": "2.0", "id": 3, "method": "nope"})["error"]["code"], -32601)
 
@@ -883,7 +883,7 @@ class Showing(unittest.TestCase):
         self.assertEqual(mcp_server.SHOW_TEXT, {k: v for k, v in host.SHOW_TEXT.items() if k != "echo"})
 
     def test_echo_goes_to_chat_and_reply_says_quiet(self):
-        data, lines = ask(host.build_show("echo", "where's the |cff bank", "Waypoint set: the bank."))
+        data, lines = ask(host.build_show("echo", "You asked: where's the |cff bank", "Waypoint set: the bank."))
         self.assertIn("ECHO You asked: where's the ||cff bank", lines)
         self.assertTrue(any(l.startswith("ECHO ") and l.endswith("Decky:|r Waypoint set: the bank.") for l in lines))
         reply = host.parse_reply(data)
@@ -951,14 +951,25 @@ class SpeakOrShow(unittest.TestCase):
         said, shown = self.deliver("Waypoint set: the bank.")
         self.assertEqual(said, ["Waypoint set: the bank."])
         self.assertEqual([r["kind"] for r in shown], ["echo"])
-        self.assertEqual((shown[0]["title"], shown[0]["text"]), ("the question", "Waypoint set: the bank."))
+        self.assertEqual((shown[0]["title"], shown[0]["text"]), ("You asked: the question", "Waypoint set: the bank."))
 
-    def test_long_answer_says_the_first_sentence_and_shows_it_all(self):
-        long = "You need three things. First the key from Silverpine. Then the robe. Then a group."
+    def test_long_answer_says_what_fits_and_shows_it_all(self):
+        long = ("You need three things for this run. First the key from the Silverpine camp, which drops off the "
+                "ogres there. Then the robe from the vendor in Undercity, near the bank. Then a group of five for the "
+                "dungeon itself, ideally with a healer.")
         said, shown = self.deliver(long)
-        self.assertEqual(said, ["You need three things. The rest is on screen."])
+        self.assertTrue(said[0].endswith(". The rest is on screen.") and len(said[0]) <= 200, said)
+        self.assertTrue(long.startswith(said[0][:-len(" The rest is on screen.")]), said)  # whole sentences
         self.assertEqual([r["kind"] for r in shown], ["echo", "card"])
         self.assertEqual(shown[1]["text"], long)
+
+    def test_respond_sized_answers_are_said_whole(self):
+        # Ben, 2026-11-14: this came out as "Not quite. It's on screen." (cut by sentence count).
+        say = ("Not quite. Rahauro still has two for you, and both show as not taken. Only the satchel follow-up "
+               "is inside, so grab those two first.")
+        said, shown = self.deliver(say, shown_at=11)
+        self.assertEqual(said, [say])
+        self.assertEqual([r["kind"] for r in shown], ["echo"])
 
     def test_quiet_says_nothing_and_shows_a_card(self):
         said, shown = self.deliver("Waypoint set.", quiet=True)
@@ -966,18 +977,16 @@ class SpeakOrShow(unittest.TestCase):
         self.assertEqual([r["kind"] for r in shown], ["echo", "card"])
 
     def test_no_second_card_when_the_assistant_showed_one(self):
-        answer = "Route's on screen. Four stops. Start at the bank. Then the inn."
-        said, shown = self.deliver(answer, shown_at=11)
-        self.assertEqual(said, ["Route's on screen."])  # shown already: her first sentence only
-        said, _ = self.deliver("Done. Four stops. Start at the bank. Then the inn.", shown_at=11)
-        self.assertEqual(said, ["Done. It's on screen."])
-        said, _ = self.deliver("Waypoint set and the list is up.", shown_at=11)
-        self.assertEqual(said, ["Waypoint set and the list is up."])  # short: as is
+        answer = "Route's on screen. " + "Then the next stop, and the one after that, all along the road. " * 4
+        said, shown = self.deliver(answer.strip(), shown_at=11)
+        self.assertEqual([r["kind"] for r in shown], ["echo"])  # she showed the full version
+        self.assertTrue(said[0].startswith("Route's on screen.") and len(said[0]) <= 200, said)
 
     def test_heard_as_goes_to_chat_only(self):
         from decklink import voice
         spoken, heard = voice.split_heard("Waypoint set: Ragefire Chasm.\nHeard as: \"rage fire\" is Ragefire Chasm")
         self.assertEqual((spoken, heard), ("Waypoint set: Ragefire Chasm.", 'Heard as: "rage fire" is Ragefire Chasm'))
+        self.assertEqual(voice.split_heard("Done.\nNote: from warcrafttavern.com"), ("Done.", "Note: from warcrafttavern.com"))
         said, shown = self.deliver("Waypoint set.", heard=heard)
         self.assertEqual(said, ["Waypoint set."])
         self.assertEqual(shown[0]["text"], 'Waypoint set. (Heard as: "rage fire" is Ragefire Chasm)')
@@ -1212,3 +1221,214 @@ class Waypoints(unittest.TestCase):
         self.assertEqual(host._request_for(["waypoints", "remove", "7"]), {"cmd": "waypoints", "action": "remove", "id": 7})
         self.assertEqual(host._request_for(["waypoints", "remove-all"]), {"cmd": "waypoints", "action": "remove-all"})
         self.assertIsNone(host._request_for(["waypoints", "bogus"]))
+
+
+CHECK_SETUP = ('BAGS = { [6948] = 1 } C_Item.GetItemCount = function(id) return BAGS[id] or 0 end '
+               'PlaySound = function(kit) print("SOUND " .. kit) end UnitXP = function() return XPNOW or 100 end '
+               'UnitXPMax = function() return 1000 end '
+               'C_QuestLog.IsOnQuest = function(id) return id == 5728 or id == 5725 end '
+               'C_QuestLog.IsQuestFlaggedCompleted = function(id) return id == 1 end ')
+SHOWN = ('print("PANEL", tostring(DeckAgentChecklist and DeckAgentChecklist.shown)) '
+         'for i, it in ipairs(DeckAgentDB.checklist and DeckAgentDB.checklist.items or {}) do '
+         'print("ITEM", i, tostring(it.state)) end ')
+
+
+class Checklists(unittest.TestCase):
+    """CHECKLIST (addons/DeckAgent/Checklist.lua <-> decklink/agent.py) and track_checklist."""
+
+    ITEMS = [{"label": "Pick up Hidden Enemies", "track": "quest_taken", "quest_id": 5728},
+             {"label": "Bazzalan", "track": "objective", "quest_id": 5728, "objective": 2},
+             {"label": "Hearthstone", "track": "item_count", "item_id": 6948, "count": 2},
+             {"label": "Level 20", "track": "level", "level": 20},
+             {"label": "Old quest done", "track": "quest_turned_in", "quest_id": 1},
+             {"label": "Ask Edna", "track": "manual", "done": True},
+             {"label": "Earn 500 XP", "track": "xp", "xp": 500}]
+
+    def run_list(self, after=""):
+        packet = host.build_checklist("RFC prep", self.ITEMS)
+        frame = codec.build(host.CHANNEL, 7, packet)
+        lines, s = Game.run("login() " + CHECK_SETUP + hello() + ' taps("%s") frame() ' % bitstr(frame)
+                            + 'fireEvent("PLAYER_ENTERING_WORLD") ' + after + SHOWN)
+        return host.parse_reply(codec.parse(s.out)[2]) if s and s.out else None, lines
+
+    def test_set_says_what_is_done_already(self):
+        reply, lines = self.run_list()
+        # taken yes, objective 2 not finished, 1 of 2 hearthstones, level 20 vs 20, turned in yes, manual yes, xp 0
+        self.assertEqual(reply["done"], [True, False, False, True, True, True, False])
+        self.assertIn("PANEL\ttrue", lines)
+        self.assertNotIn("SOUND 878", lines)  # the starting state ticks quietly
+
+    def test_ticks_itself_with_a_sound(self):
+        _, lines = self.run_list('BAGS[6948] = 2 fireEvent("BAG_UPDATE_DELAYED") fireTimers() '
+                                 'XPNOW = 400 fireEvent("PLAYER_XP_UPDATE") XPNOW = 650 fireEvent("PLAYER_XP_UPDATE") '
+                                 'fireTimers() ')
+        self.assertIn("SOUND 878", lines)
+        self.assertIn("ITEM\t3\ttrue", lines)  # 2 hearthstones now
+        self.assertIn("ITEM\t7\ttrue", lines)  # 300 + 250 XP since it went up
+
+    def test_clear_and_bad_items(self):
+        lines, s = Game.run("login() " + CHECK_SETUP + hello() + ' taps("%s") frame() ' % bitstr(codec.build(
+            host.CHANNEL, 7, host.build_checklist(clear=True))) + SHOWN)
+        self.assertEqual(host.parse_reply(codec.parse(s.out)[2])["done"], [])
+        with self.assertRaises(ValueError):
+            host.build_checklist("x", [{"label": "a", "track": "objective", "quest_id": 1}])  # no objective
+        with self.assertRaises(ValueError):
+            host.build_checklist("x", [{"label": "a", "track": "dance"}])
+        self.assertEqual(host._request_for(["checklist", "clear"]), {"cmd": "checklist", "clear": True})
+
+
+HOOK_SETUP = CHECK_SETUP + 'login() fireEvent("PLAYER_ENTERING_WORLD") '
+
+
+class GameHooks(unittest.TestCase):
+    """HOOKS / EVENTS (addons/DeckAgent/Hooks.lua <-> decklink/agent.py) and DeckLink's attention flag."""
+
+    def frames(self, *packets):
+        return "".join(' taps("%s") frame() ' % bitstr(codec.build(host.CHANNEL, 7 + n, p))
+                       for n, p in enumerate(packets))
+
+    def test_add_and_already_true(self):
+        data, _ = ask(host.build_hooks("add", {"track": "quest_turned_in", "quest_id": 79192}, 30), HOOK_SETUP)
+        self.assertEqual((host.parse_reply(data)["id"], host.parse_reply(data)["already"]), (1, False))
+        data, _ = ask(host.build_hooks("add", {"track": "quest_taken", "quest_id": 5728}), HOOK_SETUP)
+        self.assertTrue(host.parse_reply(data)["already"])  # already on it: not set, act now
+        lines, _ = Game.run(HOOK_SETUP + hello() + self.frames(host.build_hooks("add", {"track": "level", "level": 30}, 30))
+                            + 'for _, h in ipairs(DeckAgentDB.hooks.list) do print("HOOK", h.id, h.kind, h.a) end')
+        self.assertIn("HOOK\t1\t6\t30", lines)
+        with self.assertRaises(ValueError):
+            host.build_hooks("add", {"track": "manual"})
+
+    def test_list_and_remove_replies(self):
+        setup = HOOK_SETUP + ('DeckAgentDB.hooks = { nextId = 3, events = {}, list = { '
+                              '{ id = 1, kind = 6, a = 30, base = 0, expires = SERVERTIME + 600 }, '
+                              '{ id = 2, kind = 3, a = 79192, base = 0, expires = SERVERTIME + 120 } } } ')
+        reply = host.parse_reply(ask(host.build_hooks("list"), setup)[0])
+        self.assertEqual(reply["hooks"], [{"id": 1, "track": "level", "not": False, "minutes_left": 10},
+                                          {"id": 2, "track": "quest_turned_in", "not": False, "minutes_left": 2}])
+        self.assertEqual(host.parse_reply(ask(host.build_hooks("remove", hid=2), setup)[0])["removed"], 1)
+        self.assertEqual(host.parse_reply(ask(host.build_hooks("remove-all"), setup)[0])["removed"], 2)
+        empty = host.parse_reply(ask(host.build_hooks("list"), HOOK_SETUP)[0])
+        self.assertEqual(empty["hooks"], [])  # an empty list isn't mistaken for a remove reply
+
+    def test_fires_raises_attention_and_events_collect_it(self):
+        add = host.build_hooks("add", {"track": "item_count", "item_id": 6948, "count": 2})
+        lines, s = Game.run(HOOK_SETUP + hello() + self.frames(add) + 'BAGS[6948] = 2 fireEvent("BAG_UPDATE_DELAYED") '
+                            'fireTimers() frame() print("EVENTS", #DeckAgentDB.hooks.events, #DeckAgentDB.hooks.list) ')
+        self.assertIn("EVENTS\t1\t0", lines)  # fired once, then gone
+        self.assertTrue(s.flags & strip.FLAG_ATTENTION)
+        queued = (HOOK_SETUP + 'DeckAgentDB.hooks = { nextId = 2, list = {}, '
+                  'events = { { id = 1, kind = 5, at = SERVERTIME - 12 } } } ')
+        data, _ = ask(host.build_events(), queued)
+        self.assertEqual(host.parse_reply(data)["events"], [{"id": 1, "track": "item_count", "not": False, "seconds_ago": 12}])
+
+    def test_attention_shows_the_strip_with_the_link_closed(self):
+        lines, s = Game.run('login() DeckLink.SetAttention("DeckAgent", true) frame()')
+        self.assertIsNotNone(s)
+        self.assertEqual(s.flags & (strip.FLAG_ATTENTION | strip.FLAG_OPEN), strip.FLAG_ATTENTION)
+        lines, s = Game.run('login() DeckLink.SetAttention("DeckAgent", true) frame() '
+                            'DeckLink.SetAttention("DeckAgent", false) frame()')
+        self.assertIsNone(s)  # nothing waiting, link closed: no strip
+
+    def test_expired_hooks_go_quietly(self):
+        lines, _ = Game.run(HOOK_SETUP + hello() + self.frames(host.build_hooks("add", {"track": "level", "level": 30}, 1))
+                            + 'SERVERTIME = SERVERTIME + 61 for _, fn in ipairs(TICKERS) do fn() end '
+                            'print("LEFT", #DeckAgentDB.hooks.list, #DeckAgentDB.hooks.events)')
+        self.assertIn("LEFT\t0\t0", lines)
+
+
+class DeckHooks(unittest.TestCase):
+    """decklink/hooks.py and the link keeper's glance and dispatch (agentd.py)."""
+
+    def setUp(self):
+        from decklink import hooks
+        self.hooks_mod = hooks
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.now = [1000.0]
+        self.store = hooks.Hooks(os.path.join(self.tmp.name, "hooks.json"), clock=lambda: self.now[0])
+
+    def test_registry_survives_and_timers_fire(self):
+        self.store.add_game(3, "Set the waypoint to Pocket Litter.", "wake", "Stepping Stones turned in", 30)
+        tid = self.store.add_timer(20, "Check the auction house.", "say")
+        again = self.hooks_mod.Hooks(self.store.path, clock=lambda: self.now[0])
+        self.assertTrue(again.any_game())
+        self.assertEqual(again.due_timers(), [])
+        self.now[0] += 20 * 60
+        self.assertEqual([t for t, _ in again.due_timers()], [tid])
+        self.now[0] += 31 * 60
+        self.assertEqual(again.expire(), ["3"])
+        self.assertIn("Stepping Stones turned in", self.hooks_mod.wake_prompt("Stepping Stones turned in", "next"))
+
+    def test_glance_collects_and_dispatches(self):
+        from decklink import agentd
+
+        class Lk:
+            status = strip.Status(strip.FLAG_OPEN | strip.FLAG_ATTENTION, 1, 0, 0, 0, None)
+
+            def read(self):
+                return self.status
+        self.store.add_game(3, "Set the waypoint to Pocket Litter.", "wake", "Stepping Stones turned in", 30)
+        self.store.add_game(4, "Train your new spells.", "say", "level 20 reached", 30)
+        k = agentd.Keeper(25, hook_store=self.store)
+        k.lk = Lk()
+        with mock.patch.object(agentd.agent, "events", return_value={"ok": True, "events": [
+                {"id": 3, "track": "quest_turned_in", "seconds_ago": 2}, {"id": 4, "track": "level", "seconds_ago": 1},
+                {"id": 9, "track": "zone", "seconds_ago": 1}]}):
+            fired = k.glance()
+        self.assertEqual([e["action"] for e, _ in fired], ["wake", "say"])  # 9 has no note: skipped
+        self.assertFalse(self.store.any_game())
+        k.voice = mock.Mock()
+        k.dispatch(fired)
+        k.voice.wake.assert_called_once()
+        self.assertIn("Pocket Litter", k.voice.wake.call_args[0][0])
+        k.voice.remind.assert_called_once_with("Train your new spells.", "Hook: level 20 reached")
+
+    def test_glance_does_nothing_without_attention_or_hooks(self):
+        from decklink import agentd
+        k = agentd.Keeper(25, hook_store=self.store)
+        self.assertEqual(k.glance(), [])  # no hooks: doesn't even look
+        self.store.add_game(3, "n", "wake", "d", 30)
+        k.lk = mock.Mock(read=mock.Mock(return_value=strip.Status(strip.FLAG_OPEN, 1, 0, 0, 0, None)))
+        with mock.patch.object(agentd.agent, "events") as events:
+            self.assertEqual(k.glance(), [])
+        events.assert_not_called()
+
+    def test_wake_waits_for_a_busy_question(self):
+        from decklink import voice
+        started = []
+        v = voice.Voice(indicator=mock.Mock(), run=mock.Mock(), say=mock.Mock())
+        v.busy = True
+        with mock.patch("threading.Thread", lambda target, args=(), daemon=None: mock.Mock(
+                start=lambda: started.append(args))):
+            v.wake("[A hook you set fired: x]", "Hook: x")
+            self.assertEqual((started, v.waiting), ([], [("[A hook you set fired: x]", "Hook: x")]))
+            v.busy = False
+            v.wake("second", "Hook: y")
+            self.assertEqual(started, [("second", 0, "Hook: y")])
+
+    def test_cli_and_describe(self):
+        self.assertEqual(host._request_for(["hook", "add", '{"when": {"track": "level", "level": 20}, "note": "n", '
+                                                            '"action": "say"}']),
+                         {"cmd": "hook", "op": "add", "when": {"track": "level", "level": 20}, "note": "n", "action": "say"})
+        self.assertEqual(host._request_for(["hook", "remove", "t2"]), {"cmd": "hook", "op": "remove", "id": "t2"})
+        with mock.patch.object(mcp_server.common, "DB_PATH", "/nonexistent.db"):
+            self.assertEqual(mcp_server.describe({"track": "level", "level": 20}), "level 20 reached")
+            self.assertEqual(mcp_server.describe({"track": "timer", "minutes": 20}), "20 minutes passed")
+
+
+class NotConditions(unittest.TestCase):
+    def test_left_a_zone_fires_but_a_loading_screen_does_not(self):
+        add = host.build_hooks("add", {"track": "zone", "map_id": 1458, "not": True})
+        self.assertEqual(add[2], 7 | 0x80)
+        base = HOOK_SETUP + hello() + ' taps("%s") frame() ' % bitstr(codec.build(host.CHANNEL, 7, add))
+        lines, _ = Game.run(base + 'PLAYER.map = nil fireEvent("ZONE_CHANGED") fireTimers() '
+                            'print("LOADING", #DeckAgentDB.hooks.events) PLAYER.map = 1454 fireEvent("ZONE_CHANGED") '
+                            'fireTimers() print("LEFT", #DeckAgentDB.hooks.events)')
+        self.assertIn("LOADING\t0", lines)  # no map: can't tell, not "left"
+        self.assertIn("LEFT\t1", lines)
+        reply = host.parse_reply(ask(add, HOOK_SETUP + "PLAYER.map = 1454")[0])
+        self.assertTrue(reply["already"])  # already out of Undercity
+        with self.assertRaises(ValueError):
+            host.build_hooks("add", {"track": "manual", "not": True})
+        with mock.patch.object(mcp_server.common, "DB_PATH", "/nonexistent.db"):
+            self.assertEqual(mcp_server.describe({"track": "zone", "map_id": 1454, "not": True}), "left #1454")

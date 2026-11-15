@@ -22,6 +22,10 @@ Tools:
   find_quests(place, name, ...)       (database + game) quests for a dungeon/zone or by name, with his status
   get_quests(near)                    (game + database) his quest log: names, objectives with his progress,
                                       what drops the items, who takes each quest in
+  set_hook(when, note, action, ...)   (game or timer) "tell me when...": wakes her (or says a reminder)
+  list_hooks() / remove_hook(id)      her hooks
+  track_checklist(title, items)       (game) a checklist that stays up and ticks itself off from the game
+  clear_checklist()                   (game) takes it down
   respond(say, display, ...)          (game) her answer, always last: what's spoken, and the one display
                                       that fits (none, text card, list, checklist, reading view)
   show_card(title, text, ...)         (game) a small card on screen: a few lines Ben can glance at
@@ -144,8 +148,9 @@ TOOLS = [
     {"name": "find_quests",
      "description": "Quests from the local database (QuestieDB Forever, corrected): those filed under a "
                     "dungeon or zone (`place`: 'Ragefire Chasm', 'Silverpine'), and/or with words in their "
-                    "name (`name`). Each comes with level, summary, who gives it and where (nearest spawn "
-                    "to `near`), prerequisites, and Ben's status from the game: 'not taken', 'in log', "
+                    "name (`name`). Each comes with level, summary, who gives it and where it's turned in "
+                    "(each at its spawn nearest `near`; some exist in two places, and chains can cross zones), "
+                    "prerequisites, and Ben's status from the game: 'not taken', 'in log', "
                     "'ready to turn in' or 'done'. Use it for 'which quests are there for X', 'what can I "
                     "still pick up', 'where do I get Y': before the web. Pass `faction` to leave out the "
                     "other faction's quests.",
@@ -157,6 +162,71 @@ TOOLS = [
                   "properties": {"map_id": {"type": "integer"}, "x": {"type": "number"}, "y": {"type": "number"}},
                   "required": ["map_id", "x", "y"], "additionalProperties": False}},
          "additionalProperties": False}},
+    {"name": "set_hook",
+     "description": "Be told when something happens, so you can act on it later without Ben asking: a "
+                    "reminder ('remind me at level 20 to train', 'in 20 minutes check the auction') or the "
+                    "next step of a plan ('when he takes quest X, set the waypoint to the next giver'). "
+                    "`when`: what fires it: `track` quest_taken / quest_ready / quest_turned_in (quest_id), "
+                    "objective (quest_id + objective), item_count (item_id + count), level, zone (map_id), "
+                    "xp (XP gained from now), or timer (minutes, 1-1440); `not` turns any but timer around "
+                    "(leaving a zone, dropping an item, abandoning a quest). `action`: say (when it fires, your "
+                    "`note` is spoken to him as is: write it as the reminder he should hear) or wake (you're "
+                    "woken with the event and your `note`: write it as instructions to yourself, with every "
+                    "ID and detail you'll need, since you may not remember this conversation). It fires "
+                    "once; game hooks expire after `expires_minutes` (default 240). Use real IDs from "
+                    "get_quests / find_quests / find_npc. If the condition is already true it isn't set: "
+                    "act now instead.",
+     "inputSchema": {"type": "object", "properties": {
+         "when": {"type": "object", "properties": {
+             "track": {"type": "string", "enum": ["quest_taken", "quest_ready", "quest_turned_in", "objective",
+                                                  "item_count", "level", "zone", "xp", "timer"]},
+             "quest_id": {"type": "integer"}, "objective": {"type": "integer", "minimum": 1},
+             "item_id": {"type": "integer"}, "count": {"type": "integer", "minimum": 1},
+             "level": {"type": "integer", "minimum": 1, "maximum": 255}, "map_id": {"type": "integer"},
+             "xp": {"type": "integer", "minimum": 1}, "minutes": {"type": "number", "minimum": 1, "maximum": 1440},
+             "not": {"type": "boolean", "description": "turn it around: fires when it stops being true ('left "
+                                                       "Orgrimmar' = zone 1454 with not; 'no longer carrying "
+                                                       "it' = item_count with not)"}},
+             "required": ["track"], "additionalProperties": False},
+         "note": {"type": "string", "minLength": 1, "maxLength": 600},
+         "action": {"type": "string", "enum": ["say", "wake"]},
+         "expires_minutes": {"type": "integer", "minimum": 1, "maximum": 10080}},
+         "required": ["when", "note", "action"], "additionalProperties": False}},
+    {"name": "list_hooks",
+     "description": "Your hooks that haven't fired yet: id, what fires them, your note, what they do, time left.",
+     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "remove_hook",
+     "description": "Remove one hook by its id (from set_hook or list_hooks), or all of them with id 'all'.",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "string", "minLength": 1}},
+                     "required": ["id"], "additionalProperties": False}},
+    {"name": "track_checklist",
+     "description": "Put up a checklist that STAYS on Ben's screen and ticks itself off as he plays (no "
+                    "need to ask you again): for a plan he'll work through over time, like the quests to "
+                    "gather before a dungeon, a prep list, or a route of quest givers. It replaces any list "
+                    "up, survives a reload, and fades a minute after everything's done. Each item: a short "
+                    "`label` and what ticks it (`track`): quest_taken / quest_ready / quest_turned_in "
+                    "(quest_id), objective (quest_id + objective, 1-based, in the quest log's order), "
+                    "item_count (item_id + count), level, zone (map_id: in it or a place inside it), xp "
+                    "(XP gained from now), or manual (`done` as given; nothing ticks it). Use real IDs from "
+                    "get_quests / find_quests. Returns which are already done. For a one-off look ('what "
+                    "do I still need?') use respond's checklist display instead.",
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string", "maxLength": 60},
+         "items": {"type": "array", "minItems": 1, "maxItems": 12, "items": {
+             "type": "object", "properties": {
+                 "label": {"type": "string", "minLength": 1, "maxLength": 80},
+                 "track": {"type": "string", "enum": ["quest_taken", "quest_ready", "quest_turned_in", "objective",
+                                                      "item_count", "level", "zone", "xp", "manual"]},
+                 "quest_id": {"type": "integer"}, "objective": {"type": "integer", "minimum": 1},
+                 "item_id": {"type": "integer"}, "count": {"type": "integer", "minimum": 1},
+                 "level": {"type": "integer", "minimum": 1, "maximum": 255}, "map_id": {"type": "integer"},
+                 "xp": {"type": "integer", "minimum": 1}, "done": {"type": "boolean"}},
+             "required": ["label", "track"], "additionalProperties": False}}},
+         "required": ["title", "items"], "additionalProperties": False}},
+    {"name": "clear_checklist",
+     "description": "Take down the checklist you put up with track_checklist (when he's done with it or "
+                    "asks).",
+     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
     {"name": "respond",
      "description": "Your answer to Ben. ALWAYS finish by calling this, exactly once, after any other "
                     "tools; write nothing after it. `say` is all he hears: one or two short sentences, at "
@@ -504,6 +574,90 @@ def tool_show_card(args):
     return _show("card", args.get("title", ""), text, seconds, args.get("item_id"))
 
 
+def describe(when):
+    """A hook's condition in words, with names from the database ("Stepping Stones turned in")."""
+    track = when.get("track")
+    db = gamedb.connect(common.DB_PATH) if os.path.exists(common.DB_PATH) else None
+
+    def name(table, i):
+        r = db.execute("SELECT name FROM %s WHERE id = ?" % table, (i,)).fetchone() if db and i else None
+        return r["name"] if r else "#%s" % i
+    try:
+        q = name("quest", when.get("quest_id")) if when.get("quest_id") else None
+        if when.get("not"):
+            return {
+                "quest_taken": lambda: "%s no longer in the log" % q,
+                "quest_ready": lambda: "%s no longer ready" % q,
+                "quest_turned_in": lambda: "%s not turned in" % q,
+                "objective": lambda: "%s objective %s no longer done" % (q, when.get("objective")),
+                "item_count": lambda: "fewer than %s %s in bags" % (when.get("count"), name("item", when.get("item_id"))),
+                "level": lambda: "below level %s" % when.get("level"),
+                "zone": lambda: "left %s" % name("map", when.get("map_id")),
+                "xp": lambda: "under %s XP gained" % when.get("xp"),
+            }.get(track, lambda: "not " + (track or "something"))()
+        return {
+            "quest_taken": lambda: "%s taken" % q,
+            "quest_ready": lambda: "%s ready to turn in" % q,
+            "quest_turned_in": lambda: "%s turned in" % q,
+            "objective": lambda: "%s objective %s done" % (q, when.get("objective")),
+            "item_count": lambda: "%s of %s in bags" % (when.get("count"), name("item", when.get("item_id"))),
+            "level": lambda: "level %s reached" % when.get("level"),
+            "zone": lambda: "arrived in %s" % name("map", when.get("map_id")),
+            "xp": lambda: "%s XP gained" % when.get("xp"),
+            "timer": lambda: "%g minutes passed" % float(when.get("minutes") or 0),
+        }.get(track, lambda: track or "something")()
+    finally:
+        if db:
+            db.close()
+
+
+def tool_set_hook(args):
+    when = args["when"]
+    if when.get("not") and when.get("track") == "timer":
+        raise common.GameError("a timer can't be turned around")
+    req = {"when": when, "note": args["note"], "action": args["action"], "desc": describe(when),
+           "minutes": int(args.get("expires_minutes") or 0)}
+    reply = common.game("hook", "add", json.dumps(req))
+    if not reply.get("ok"):
+        raise common.GameError(reply.get("reason") or reply.get("error") or "the game said no")
+    if reply.get("already"):
+        return {"set": False, "already_true": True, "what": req["desc"],
+                "note": "that's already true right now: act on it now instead"}
+    return {"set": True, "id": str(reply["id"]), "what": req["desc"], "action": args["action"]}
+
+
+def tool_list_hooks(args):
+    reply = common.game("hook", "list")
+    if not reply.get("ok"):
+        raise common.GameError(reply.get("error") or "couldn't list hooks")
+    return {"hooks": reply.get("hooks", [])}
+
+
+def tool_remove_hook(args):
+    hid = args["id"].strip()
+    reply = common.game("hook", "clear") if hid == "all" else common.game("hook", "remove", hid)
+    if not reply.get("ok"):
+        raise common.GameError(reply.get("error") or "no hook with id %s" % hid)
+    return {"removed": hid}
+
+
+def tool_track_checklist(args):
+    items = args["items"]
+    reply = common.game("checklist", json.dumps({"title": args.get("title", ""), "items": items}))
+    if not reply.get("ok"):
+        raise common.GameError(reply.get("reason") or reply.get("error") or "the game said no")
+    done = reply.get("done") or []
+    return {"shown": True, "items": [{"label": it["label"], "done": bool(done[i]) if i < len(done) else None}
+                                     for i, it in enumerate(items)]}
+
+
+def tool_clear_checklist(args):
+    reply = common.game("checklist", "clear")
+    if not reply.get("ok"):
+        raise common.GameError(reply.get("reason") or reply.get("error") or "the game said no")
+    return {"cleared": True}
+
+
 def tool_respond(args):
     """Shows the display (the spoken part is the launcher's: it reads `say` from this call)."""
     say, display = " ".join(args["say"].split()), args["display"]
@@ -583,7 +737,9 @@ HANDLERS = {"get_player_state": tool_get_player_state, "find_npc": tool_find_npc
             "send_chat": tool_send_chat, "get_online": tool_get_online, "ask_player": tool_ask_player,
             "remember": tool_remember, "remember_fact": tool_remember_fact, "recall": tool_recall,
             "forget_fact": tool_forget_fact, "get_quests": tool_get_quests, "find_quests": tool_find_quests,
-            "respond": tool_respond, "get_waypoints": tool_get_waypoints, "remove_waypoints": tool_remove_waypoints, "show_card": tool_show_card, "show_reading": tool_show_reading}
+            "respond": tool_respond, "track_checklist": tool_track_checklist,
+            "set_hook": tool_set_hook, "list_hooks": tool_list_hooks, "remove_hook": tool_remove_hook,
+            "clear_checklist": tool_clear_checklist, "get_waypoints": tool_get_waypoints, "remove_waypoints": tool_remove_waypoints, "show_card": tool_show_card, "show_reading": tool_show_reading}
 
 
 def handle(msg):

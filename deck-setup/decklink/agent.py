@@ -6,6 +6,10 @@ addons/DeckAgent/Agent.lua answers and documents the packet layout; keep the two
                                          (default: all)
     decklink agent way MAP X Y           a waypoint (X, Y 0-100, like /way), made active
     decklink agent waypoints [remove ID | remove-active | remove-all]   list (or remove) waypoints
+    decklink agent hook add JSON | list | remove ID | clear   the assistant's hooks (through the link
+                                         keeper only: it keeps their notes; see hooks.py)
+    decklink agent checklist JSON | clear   put up a self-ticking checklist ({"title", "items": [{"label",
+                                         "track", its fields, "done"}]}; see CHECK_KINDS), or take it down
     decklink agent chat CHANNEL TARGET TEXT   send chat for you (CHANNEL: say yell party raid guild
                                          whisper bnet instance; TARGET "" unless whisper/bnet)
     decklink agent friends [LIST ...]    who's online; LISTs: bnet friends guild (default: all)
@@ -24,7 +28,8 @@ from . import codec
 
 CHANNEL = 3
 VERSION = 1
-OP_STATE, OP_WAY, OP_CHAT, OP_FRIENDS, OP_ASK, OP_ANSWER, OP_SHOW, OP_QUESTS, OP_QUEST_STATUS, OP_WAYPOINTS = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+OP_STATE, OP_WAY, OP_CHAT, OP_FRIENDS, OP_ASK, OP_ANSWER, OP_SHOW, OP_QUESTS, OP_QUEST_STATUS, OP_WAYPOINTS, OP_CHECKLIST, OP_HOOKS, OP_EVENTS = (
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)
 ASK_RESULT = {1: "shown", 2: "queued"}
 NO_ANSWER = 255
 KEEPALIVE_S = 10  # the game closes the link after 30 s without a frame
@@ -135,6 +140,70 @@ def build_show(kind, title, text, seconds=0, item=0):
             + bytes([len(t)]) + t + struct.pack(">H", len(body)) + body)
 
 
+# CHECKLIST item kinds: name -> (kind byte, the item fields packed after it, struct format).
+CHECK_KINDS = {
+    "manual": (0, (), ""), "quest_taken": (1, ("quest_id",), "I"), "quest_ready": (2, ("quest_id",), "I"),
+    "quest_turned_in": (3, ("quest_id",), "I"), "objective": (4, ("quest_id", "objective"), "IB"),
+    "item_count": (5, ("item_id", "count"), "IH"), "level": (6, ("level",), "B"), "zone": (7, ("map_id",), "H"),
+    "xp": (8, ("xp",), "I"),
+}
+
+
+def _condition(it, n):
+    """A condition dict ({track, its fields, "not": true to turn it around}) -> its bytes (Conditions.lua:
+    the kind byte + 128 for NOT)."""
+    track = it.get("track") or "manual"
+    if track not in CHECK_KINDS:
+        raise ValueError("item %d: track is one of %s" % (n, " ".join(CHECK_KINDS)))
+    kind, fields, fmt = CHECK_KINDS[track]
+    missing = [f for f in fields if it.get(f) is None]
+    if missing:
+        raise ValueError("item %d (%s) needs %s" % (n, track, ", ".join(missing)))
+    if it.get("not") and track == "manual":
+        raise ValueError("item %d: manual can't be turned around" % n)
+    return bytes([kind | (0x80 if it.get("not") else 0)]) + (
+        struct.pack(">" + fmt, *[int(it[f]) for f in fields]) if fmt else b"")
+
+
+KIND_NAMES = {v[0]: k for k, v in CHECK_KINDS.items()}
+HOOK_ACTIONS = {"add": 1, "remove": 2, "remove-all": 3, "list": 4}
+
+
+def build_hooks(action, when=None, minutes=0, hid=0):
+    """HOOKS: add (when: a condition dict, not manual; minutes until it expires, 0 = 240), remove (hid),
+    remove-all, list."""
+    if action not in HOOK_ACTIONS:
+        raise ValueError("action is one of: " + " ".join(HOOK_ACTIONS))
+    out = bytes([op_byte(OP_HOOKS), HOOK_ACTIONS[action]])
+    if action == "add":
+        if (when or {}).get("track", "manual") == "manual":
+            raise ValueError("a hook needs a condition the game can see (not manual)")
+        out += _condition(when, 1) + struct.pack(">H", max(0, min(65535, int(minutes))))
+    elif action == "remove":
+        out += struct.pack(">H", int(hid))
+    return out
+
+
+def build_events():
+    return bytes([op_byte(OP_EVENTS)])
+
+
+def build_checklist(title=None, items=None, clear=False):
+    """CHECKLIST: set (title + items: {label, track: a CHECK_KINDS name, its fields, done}) or clear."""
+    if clear:
+        return bytes([op_byte(OP_CHECKLIST), 2])
+    items = items or []
+    if not 1 <= len(items) <= 12:
+        raise ValueError("a checklist has 1-12 items")
+    out = bytes([op_byte(OP_CHECKLIST), 1]) + _pstr(title or "", 60) + bytes([len(items)])
+    for n, it in enumerate(items, 1):
+        cond = _condition(it, n)
+        if not (it.get("label") or "").strip():
+            raise ValueError("item %d needs a label" % n)
+        out += cond + bytes([1 if it.get("done") else 0]) + _pstr(it["label"].strip(), 80)
+    return out
+
+
 WAYPOINT_ACTIONS = {"list": 1, "remove": 2, "remove-active": 3, "remove-all": 4}
 
 
@@ -237,6 +306,32 @@ def parse_reply(p, asked=FIELDS):
                               "have": have, "need": need})
             quests.append({"id": qid, "complete": bool(qflags & 1), "failed": bool(qflags & 2), "objectives": goals})
         out["quests"], out["more"] = quests, bool(flags & 1)
+    elif out["op"] == OP_HOOKS:
+        (action,), i = _unpack(">B", p, i)
+        if action == 1:  # add: id, already true
+            (hid, already), i = _unpack(">HB", p, i)
+            out["id"], out["already"] = hid, already == 1
+        elif action in (2, 3):  # remove / remove-all
+            (out["removed"],), i = _unpack(">B", p, i)
+        else:  # list
+            (n,), i = _unpack(">B", p, i)
+            hooks = []
+            for _ in range(n):
+                (hid, kind, mins), i = _unpack(">HBH", p, i)
+                hooks.append({"id": hid, "track": KIND_NAMES.get(kind & 0x7F, kind), "not": bool(kind & 0x80),
+                              "minutes_left": mins})
+            out["hooks"] = hooks
+    elif out["op"] == OP_EVENTS:
+        (n,), i = _unpack(">B", p, i)
+        events = []
+        for _ in range(n):
+            (hid, kind, ago), i = _unpack(">HBH", p, i)
+            events.append({"id": hid, "track": KIND_NAMES.get(kind & 0x7F, kind), "not": bool(kind & 0x80),
+                           "seconds_ago": ago})
+        out["events"] = events
+    elif out["op"] == OP_CHECKLIST:
+        (n,), i = _unpack(">B", p, i)
+        out["done"] = [b == 1 for b in _unpack(">%dB" % n, p, i)[0]]
     elif out["op"] == OP_WAYPOINTS:
         (removed, n, active), i = _unpack(">BBH", p, i)
         points = []
@@ -347,6 +442,18 @@ def friends(lk, lists=LISTS):
     return parse_reply(request(lk, build_friends(lists)))
 
 
+def hooks(lk, action, when=None, minutes=0, hid=0):
+    return parse_reply(request(lk, build_hooks(action, when, minutes, hid)))
+
+
+def events(lk):
+    return parse_reply(request(lk, build_events()))
+
+
+def checklist(lk, title=None, items=None, clear=False):
+    return parse_reply(request(lk, build_checklist(title, items, clear)))
+
+
 def waypoints(lk, action="list", wid=0):
     return parse_reply(request(lk, build_waypoints(action, wid)))
 
@@ -404,6 +511,19 @@ def _request_for(argv):
         if len(rest) < 3:
             return None
         return {"cmd": "prompt", "question": rest[0], "options": rest[1:], "list": as_list, "seconds": seconds}
+    if argv[0] == "hook" and len(argv) >= 2:
+        if argv[1] == "add" and len(argv) == 3:
+            return dict(json.loads(argv[2]), cmd="hook", op="add")
+        if argv[1] in ("list", "clear") and len(argv) == 2:
+            return {"cmd": "hook", "op": argv[1]}
+        if argv[1] == "remove" and len(argv) == 3:
+            return {"cmd": "hook", "op": "remove", "id": argv[2]}
+        return None
+    if argv[0] == "checklist" and len(argv) == 2:
+        if argv[1] == "clear":
+            return {"cmd": "checklist", "clear": True}
+        spec = json.loads(argv[1])
+        return {"cmd": "checklist", "title": spec.get("title", ""), "items": spec.get("items", [])}
     if argv[0] == "waypoints":
         if len(argv) == 1:
             return {"cmd": "waypoints", "action": "list"}
@@ -443,6 +563,10 @@ def handle(lk, req):
         return chat(lk, req["channel"], req.get("target", ""), req["text"])
     if cmd == "friends":
         return friends(lk, req.get("lists") or LISTS)
+    if cmd == "hook":
+        raise ValueError("hooks go through the link keeper (the decklink-agent service), which keeps their notes")
+    if cmd == "checklist":
+        return checklist(lk, req.get("title"), req.get("items"), req.get("clear", False))
     if cmd == "waypoints":
         return waypoints(lk, req.get("action", "list"), req.get("id", 0))
     if cmd == "quests":

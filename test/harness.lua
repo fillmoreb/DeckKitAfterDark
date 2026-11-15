@@ -126,7 +126,10 @@ GetNumGuildMembers = function() return #ROSTER end
 GetGuildRosterInfo = function(i) local r = ROSTER[i]; return r[1], "", 0, r[2], r[3], r[4], "", "", r[5] end
 TIMERS = {}
 C_Timer = { NewTimer = function(s, fn) local t = { fn = fn, Cancel = function(self) self.cancelled = true end }
-    table.insert(TIMERS, t); return t end, After = function(s, fn) end }
+    table.insert(TIMERS, t); return t end, After = function(s, fn) end,
+    NewTicker = function(s, fn) TICKERS = TICKERS or {}; table.insert(TICKERS, fn); return { Cancel = function() end } end }
+SERVERTIME = 1000000
+GetServerTime = function() return SERVERTIME end
 function fireTimers() for _, t in ipairs(TIMERS) do if not t.cancelled then t.fn() end end TIMERS = {} end
 function fireEvent(event, ...) for _, fn in ipairs(EVENTS[event] or {}) do fn(...) end end
 UnitClass = function() return "Priest", PLAYER.class, 5 end

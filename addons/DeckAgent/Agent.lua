@@ -38,7 +38,8 @@
 --               any failure: length uint8, a short reason (UTF-8)
 --
 -- CHAT (op 3) and FRIENDS (op 4) are in Chat.lua, ASK (op 5) in Ask.lua, SHOW (op 7) in Show.lua,
--- QUESTS (op 8) in Quests.lua; they use the helpers shared below (ns.Bytes, ns.OPS). Ops get (payload, seq).
+-- QUESTS (op 8) in Quests.lua, CHECKLIST (op 11) in Checklist.lua, HOOKS (op 12) and EVENTS (op 13)
+-- in Hooks.lua; they use the helpers shared below (ns.Bytes, ns.OPS). Ops get (payload, seq).
 --
 -- Replies need the link open (the host says hello first): DeckLink.Send refuses otherwise.
 local ADDON, ns = ...

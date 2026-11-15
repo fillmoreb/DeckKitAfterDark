@@ -14,13 +14,14 @@ interrupt() on the hook's "recording" state), so you can just ask again.
 
 Speak or show (through the link keeper's "show", addons/DeckAgent/Show.lua):
   - every answer is echoed into chat with its question, so it can be read again (the chat peek);
-  - a long one (over SPOKEN_MAX characters or two sentences) is spoken as its first sentence plus
-    "The rest is on screen", and shown in full on a card;
+  - a long one (over SPOKEN_MAX characters; never one through respond, which caps `say` at 160) is
+    spoken as the sentences that fit plus "The rest is on screen", and shown in full on a card;
   - with Quiet on (the game's DeckKit menu), nothing is spoken: the answer goes on a card;
   - if the assistant already put a card or reading view up for this question (show_card,
-    show_reading), that's the full version: no second card, and a long spoken part is cut to its
-    first sentence plus "It's on screen";
-  - a last line starting "Heard as:" (how she read misheard words) goes into chat only, never spoken.
+    show_reading, respond), that's the full version: no second card, and a long spoken part is cut
+    to the sentences that fit;
+  - last lines starting "Heard as:" (how she read misheard words) or "Note:" (a source or caveat with
+    nothing on screen to carry it) go into chat only, never spoken.
 """
 import os, re, subprocess, threading, time
 
@@ -105,7 +106,7 @@ def clean_answer(text):
     return re.sub(r"\s+", " ", " ".join(lines)).strip()
 
 
-HEARD = re.compile(r"^\s*heard as:", re.I)
+HEARD = re.compile(r"^\s*(heard as|note):", re.I)  # chat-only lines (the launcher writes them)
 
 
 def split_heard(text):
@@ -120,12 +121,22 @@ def sentences(text):
     return [p for p in re.split(r"(?<=[.!?])\s+", text.strip()) if p]
 
 
+def leading(answer, limit=SPOKEN_MAX):
+    """As many whole sentences from the start as fit in `limit` characters (at least the first)."""
+    parts, out = sentences(answer), ""
+    for p in parts:
+        if out and len(out) + 1 + len(p) > limit:
+            break
+        out = (out + " " + p).strip()
+    return out
+
+
 def spoken_part(answer):
-    """(what to say, whether the full answer needs showing)."""
-    parts = sentences(answer)
-    if len(answer) <= SPOKEN_MAX and len(parts) <= 2:
+    """(what to say, whether the full answer needs showing). Only length counts: an answer through
+    respond is at most 160 characters and is said whole, however many sentences it has."""
+    if len(answer) <= SPOKEN_MAX:
         return answer, False
-    return parts[0] + " " + ON_SCREEN, True
+    return leading(answer, SPOKEN_MAX - len(ON_SCREEN) - 1) + " " + ON_SCREEN, True
 
 
 def card_seconds(text):
@@ -152,6 +163,7 @@ class Voice:
         self.busy = False
         self.gen = 0  # bumped by interrupt(): an answer from an older question is dropped
         self.proc = None  # the running deckagent (the default runner)
+        self.waiting = []  # hook wake-ups that came while a question was being answered: (prompt, title)
 
     def _run(self, cmd, timeout=120, **kw):
         """subprocess.run, but interrupt() can kill it."""
@@ -200,10 +212,28 @@ class Voice:
         threading.Thread(target=self._answer, args=(text, gen), daemon=True).start()
         return True
 
-    def _answer(self, text, gen=0):
+    def wake(self, prompt, title):
+        """A hook fired: the assistant gets its note (hooks.wake_prompt) and does the next step, and the
+        answer is spoken like any other (no dictation box: nothing was asked). One question at a time:
+        a wake-up during a question waits for it."""
+        with self.lock:
+            if self.busy:
+                self.waiting.append((prompt, title))
+                return
+            self.busy = True
+            gen = self.gen
+        threading.Thread(target=self._answer, args=(prompt, gen, title), daemon=True).start()
+
+    def remind(self, note, title):
+        """A "say" hook: its note, spoken and in chat, with no model call."""
+        log("reminder %r" % note)
+        self.deliver(title, note, time.monotonic(), heading=True)
+
+    def _answer(self, text, gen=0, title=None):
         t0 = time.monotonic()
-        log("asked %r" % text)
-        self.indicator.show("thinking")
+        log("asked %r" % (title or text))
+        if title is None:
+            self.indicator.show("thinking")
         try:
             out = self.run([DECKAGENT, text], capture_output=True, text=True, timeout=120)
             if gen != self.gen:
@@ -214,11 +244,12 @@ class Voice:
             if not answer or out.returncode:
                 log("deckagent exit %s: %s" % (out.returncode, (out.stderr or "").strip()[-500:]))
             log("answered %r (%.1f s)" % (answer, time.monotonic() - t0))
-            self.indicator.show("done")
+            if title is None:
+                self.indicator.show("done")
             if not answer:
                 self.say("Sorry, I didn't get an answer.")
                 return
-            self.deliver(text, answer, t0, heard)
+            self.deliver(title or text, answer, t0, heard, heading=title is not None)
         except Exception as e:
             if gen != self.gen:
                 return
@@ -226,11 +257,17 @@ class Voice:
             self.indicator.show("error")
             self.say("Sorry, that didn't work.")
         finally:
+            nxt = None
             with self.lock:
                 if gen == self.gen:
                     self.busy = False
+                    if self.waiting:
+                        nxt = self.waiting.pop(0)
+                        self.busy = True
+            if nxt:
+                threading.Thread(target=self._answer, args=(nxt[0], self.gen, nxt[1]), daemon=True).start()
 
-    def deliver(self, question, answer, asked_at, heard=""):
+    def deliver(self, question, answer, asked_at, heard="", heading=False):
         """Speak or show (module docstring). The showing runs beside the speech: it may have to open
         the link first (~1 s), and the answer shouldn't wait for that."""
         game = self.game
@@ -241,7 +278,8 @@ class Voice:
 
         def show():
             echo = answer + ((" (" + heard + ")") if heard else "")
-            for req in [{"cmd": "show", "kind": "echo", "title": question, "text": echo}] + (
+            line = question if heading else "You asked: " + question
+            for req in [{"cmd": "show", "kind": "echo", "title": line, "text": echo}] + (
                     [{"cmd": "show", "kind": "card", "title": "Decky", "text": answer[:600],
                       "seconds": card_seconds(answer)}] if card else []):
                 try:
@@ -255,7 +293,6 @@ class Voice:
         if quiet:
             log("quiet: shown, not spoken")
             return
-        if shown_already and long:
-            first = sentences(answer)[0]
-            say = first if re.search(r"\bscreen\b", first, re.I) else first + " It's on screen."
+        if shown_already and long:  # she showed the full version: say what fits of hers
+            say = leading(answer)
         self.say(say)

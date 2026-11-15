@@ -13,3 +13,6 @@ Chat.lua
 Ask.lua
 Show.lua
 Quests.lua
+Conditions.lua
+Checklist.lua
+Hooks.lua

@@ -419,17 +419,44 @@ def quest_givers(db, qid, role, state=None):
             if spot:
                 out.append({k: spot[0][k] for k in ("name", "zone", "map_id", "x", "y", "distance_yards")})
                 continue
+        if g["kind"] == "object":
+            spot = nearest_object(db, g["id"], state)
+            if spot:
+                out.append(spot)
+                continue
         name = _name(db, {"npc": "monster"}.get(g["kind"], g["kind"]), g["id"])
         if name:
             out.append({"name": name + (" (an item: it starts the quest)" if g["kind"] == "item" else "")})
     return out
 
 
+def nearest_object(db, oid, state=None):
+    """An object's spawn nearest to `state` (same continent), else its first: {name, zone, map_id, x, y,
+    distance_yards}, or None when it has no spawn outside an instance. Objects often exist once per
+    faction's side of the world (a note in the Barrens and one in Westfall), so nearest matters."""
+    here = player_world(db, state) if state else None
+    best = None
+    for r in db.execute("SELECT o.name, s.map, s.x, s.y, s.cont, s.wx, s.wy, m.name AS zone FROM object_spawn s "
+                        "JOIN object o ON o.id = s.object LEFT JOIN map m ON m.id = s.map WHERE s.object = ?", (oid,)):
+        dist = None
+        if here and r["cont"] is not None and r["cont"] == here[0]:
+            dist = math.hypot(r["wx"] - here[1], r["wy"] - here[2])
+        key = (dist is None, dist or 0)
+        if best is None or key < best[0]:
+            best = (key, r, dist)
+    if not best:
+        return None
+    _, r, dist = best
+    return {"name": r["name"], "zone": r["zone"], "map_id": r["map"], "x": round(r["x"], 1), "y": round(r["y"], 1),
+            "distance_yards": None if dist is None else round(dist)}
+
+
 def find_quests(db, place="", name="", faction=None, state=None, limit=30):
     """Quests filed under a place (dungeon or zone name words) and/or with words in their name, for
     `faction` ("A"/"H": others' race-locked quests left out), lowest level first. Each: id, name,
-    level, required level, where it's filed, summary, givers (nearest spawn when `state` has a
-    position), prerequisites (id and name)."""
+    level, required level, where it's filed, summary, givers and turned_in_at (each with its nearest
+    spawn when `state` has a position; a chain can start in one zone and end in another), prerequisites
+    (id and name)."""
     where, args = [], []
     for w in (place or "").lower().split():
         where.append("q.zone IN (SELECT id FROM area WHERE lower(name) LIKE ?)")
@@ -451,7 +478,8 @@ def find_quests(db, place="", name="", faction=None, state=None, limit=30):
             r = db.execute("SELECT name FROM quest WHERE id = ?", (pid,)).fetchone()
             pre.append({"id": pid, "name": r["name"] if r else None})
         entry = {"id": q["id"], "name": q["name"], "level": q["level"], "required_level": q["req_level"],
-                 "filed_under": q["place"], "summary": q["text"], "givers": quest_givers(db, q["id"], "start", state)}
+                 "filed_under": q["place"], "summary": q["text"], "givers": quest_givers(db, q["id"], "start", state),
+                 "turned_in_at": quest_givers(db, q["id"], "end", state)}
         if pre:
             entry["prerequisites"] = pre
         out.append(entry)

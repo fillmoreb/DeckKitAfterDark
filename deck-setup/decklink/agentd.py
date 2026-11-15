@@ -11,7 +11,12 @@ request and answers with one JSON line:
   {"cmd": "status"}     whether the link is open, and how long it's been idle
   {"cmd": "dictation", "state": "recording", "binding": "agent"}   post a dictation state (the hook)
   {"cmd": "ask", "text": "..."}   answer a question by voice: run deckagent, speak the answer (voice.py)
+  {"cmd": "hook", "op": "add" | "list" | "remove" | "clear", ...}   the assistant's hooks (hooks.py)
 Errors come back as {"ok": false, "error": "..."}.
+
+Hooks: while any game hook is set, the keeper glances at the strip about once a second (one paused
+capture pipeline, ~2% of a core) for DeckLink's attention flag; when it's up it opens the link,
+collects the events (EVENTS) and hands each fired hook to the voice. Timers fire from here.
 
 The link opens on the first request and closes after --idle seconds without one (the game closes its
 end after 30 s without a frame anyway). While it's closed nothing reads the screen: the GStreamer
@@ -19,13 +24,15 @@ reader costs ~16% of a core while it runs (AddonTools lab E7), so it's stopped t
 """
 import argparse, json, os, socket, socketserver, sys, threading, time
 
-from . import agent, dictation, keys, link, strip
+from . import agent, dictation, hooks, keys, link, strip
+
+GLANCE_S = 1.0  # seconds between glances at the strip while game hooks are set
 
 SOCKET = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid(), "deckagent.sock")
 
 
 class Keeper:
-    def __init__(self, idle, make_link=None, clock=time.monotonic):
+    def __init__(self, idle, make_link=None, clock=time.monotonic, hook_store=None):
         self.idle, self.clock = idle, clock
         self.lock = threading.Lock()
         self.lk = self.grabber = None
@@ -35,10 +42,22 @@ class Keeper:
         self.dictation_keys = None  # set in serve(): one key sender for dictation states
         self.quiet = False  # the game's "Quiet" setting, from the last reply that carried it
         self.shown_at = 0  # time.monotonic() of the last card or reading view the assistant put up
+        self._hooks = hook_store  # hooks.Hooks, made when first needed
+
+    @property
+    def hooks(self):
+        if self._hooks is None:
+            self._hooks = hooks.Hooks()
+        return self._hooks
+
+    def _grabber(self):
+        """The one screen reader (two at once garble each other's colors): the link's, and the glances'."""
+        if self.grabber is None:
+            self.grabber = strip.Grabber()
+        return self.grabber
 
     def _real_link(self):
-        self.grabber = strip.Grabber()
-        return link.Link(sender=keys.Keys(), reader=self.grabber.frame)
+        return link.Link(sender=keys.Keys(), reader=self._grabber().frame)
 
     def _ensure(self):
         if self.lk is None:
@@ -61,12 +80,16 @@ class Keeper:
                 self.lk.close()
             except Exception:
                 pass
+        self.lk = None
         if self.grabber is not None:
             try:
+                if self._hooks is not None and self.hooks.any_game():
+                    self.grabber.pause()  # glances still need it
+                    return
                 self.grabber.close()
             except Exception:
                 pass
-        self.lk = self.grabber = None
+            self.grabber = None
 
     def handle(self, req):
         cmd = req.get("cmd")
@@ -82,6 +105,8 @@ class Keeper:
             if self.voice is None:
                 return {"ok": False, "error": "voice is off (start with --voice)"}
             return {"ok": self.voice.ask(req.get("text", "")), "started": True}
+        if cmd == "hook":
+            return self.hook(req)
         with self.lock:
             if cmd == "status":
                 return {"ok": True, "open": self.lk is not None,
@@ -90,7 +115,7 @@ class Keeper:
                 if cmd == "warm":
                     self._ensure()
                     return {"ok": True, "open": True}
-                if cmd in ("state", "way", "chat", "friends", "prompt", "show", "quests", "quest-status", "waypoints"):
+                if cmd in ("state", "way", "chat", "friends", "prompt", "show", "quests", "quest-status", "waypoints", "checklist"):
                     if cmd == "state" and any(f not in agent.FIELDS for f in req.get("fields") or agent.FIELDS):
                         return {"ok": False, "error": "unknown field"}
                     # Packets are built (and checked) before the link opens: a bad request shouldn't cost one.
@@ -98,6 +123,8 @@ class Keeper:
                      "friends": lambda: agent.build_friends(req.get("lists") or agent.LISTS),
                      "prompt": lambda: agent.build_ask(req["question"], req["options"], req.get("list", False),
                                                        req.get("seconds", 30)),
+                     "checklist": lambda: agent.build_checklist(req.get("title"), req.get("items"),
+                                                                req.get("clear", False)),
                      "waypoints": lambda: agent.build_waypoints(req.get("action", "list"), req.get("id", 0)),
                      "quest-status": lambda: agent.build_quest_status(req["ids"]),
                      "show": lambda: agent.build_show(req["kind"], req.get("title", ""), req.get("text", ""),
@@ -117,6 +144,91 @@ class Keeper:
             finally:
                 if self.lk is not None:
                     self.last = self.clock()
+
+    # Hooks ---------------------------------------------------------------------------------------------
+
+    def hook(self, req):
+        op = req.get("op")
+        try:
+            if op == "add":
+                when, note, action = req.get("when") or {}, req.get("note", ""), req.get("action", "wake")
+                if action not in hooks.ACTIONS:
+                    return {"ok": False, "error": "action is say or wake"}
+                if when.get("track") == "timer":
+                    minutes = float(when.get("minutes") or 0)
+                    if not 0 < minutes <= 24 * 60:
+                        return {"ok": False, "error": "a timer is 1 minute to 24 hours"}
+                    return {"ok": True, "id": self.hooks.add_timer(minutes, note, action, req.get("desc", ""))}
+                agent.build_hooks("add", when, req.get("minutes", 0))  # a bad one is refused before the link opens
+                with self.lock:
+                    reply = agent.hooks(self._ensure(), "add", when, req.get("minutes", 0))
+                if reply.get("ok") and not reply.get("already"):
+                    self.hooks.add_game(reply["id"], note, action, req.get("desc", ""), req.get("minutes", 0))
+                return reply
+            if op == "list":
+                game = None
+                if self.hooks.any_game():
+                    with self.lock:
+                        r = agent.hooks(self._ensure(), "list")
+                    game = r.get("hooks") if r.get("ok") else None
+                return {"ok": True, "hooks": self.hooks.listing(game)}
+            if op == "remove":
+                hid = str(req.get("id", ""))
+                kind = self.hooks.remove(hid)
+                if hid.isdigit():
+                    with self.lock:
+                        agent.hooks(self._ensure(), "remove", hid=int(hid))
+                    kind = kind or "game"
+                return {"ok": kind is not None, "removed": hid if kind else None}
+            if op == "clear":
+                self.hooks.clear()
+                with self.lock:
+                    agent.hooks(self._ensure(), "remove-all")
+                return {"ok": True}
+            return {"ok": False, "error": "hook op is add, list, remove or clear"}
+        except (link.LinkError, keys.SendError, strip.NoStrip, agent.Malformed, KeyError, ValueError) as e:
+            with self.lock:
+                self._drop()
+            return {"ok": False, "error": str(e) or e.__class__.__name__}
+
+    def glance(self):
+        """Fires due timers; if game hooks are set, looks at the strip for DeckLink's attention flag and
+        collects the events. Called about once a second. Returns the fired [(entry, seconds_ago)]."""
+        fired = [(e, 0) for _, e in self.hooks.due_timers()]
+        self.hooks.expire()
+        if not self.hooks.any_game():
+            return fired
+        try:
+            with self.lock:
+                status = self.lk.read() if self.lk is not None else self._grabber().glance()
+                if status is None or not status.flags & strip.FLAG_ATTENTION:
+                    return fired
+                reply = agent.events(self._ensure())
+                self.last = self.clock()
+        except (link.LinkError, keys.SendError, strip.NoStrip, agent.Malformed, OSError) as e:
+            print("hooks: glance failed: %s" % e, flush=True)
+            with self.lock:
+                self._drop()
+            return fired
+        for ev in reply.get("events", []):
+            e = self.hooks.pop_game(ev["id"])
+            if e is None:
+                print("hooks: game hook %s fired, but there's no note for it here" % ev["id"], flush=True)
+                continue
+            fired.append((e, ev.get("seconds_ago", 0)))
+        return fired
+
+    def dispatch(self, fired):
+        """Each fired hook to the voice: a reminder said, or the assistant woken with its note."""
+        for e, ago in fired:
+            print("hooks: fired (%s) %s" % (e["action"], e.get("desc") or e["note"][:60]), flush=True)
+            if self.voice is None:
+                continue
+            title = "Hook: " + (e.get("desc") or "something happened")
+            if e["action"] == "say":
+                self.voice.remind(e["note"] or e.get("desc") or "Reminder.", title)
+            else:
+                self.voice.wake(hooks.wake_prompt(e.get("desc"), e["note"], ago), title)
 
     def tick(self):
         """Closes the link once it's been idle long enough, else marks it open (for the cover, and so
@@ -172,6 +284,15 @@ def serve(keeper, path=SOCKET):
             time.sleep(1)
             keeper.tick()
     threading.Thread(target=ticker, daemon=True).start()
+
+    def glancer():
+        while True:
+            time.sleep(GLANCE_S)
+            try:
+                keeper.dispatch(keeper.glance())
+            except Exception as e:  # never let one bad glance stop hooks for good
+                print("hooks: %s" % e, flush=True)
+    threading.Thread(target=glancer, daemon=True).start()
     print("deckagent link keeper on %s (idle close after %d s)" % (path, keeper.idle), flush=True)
     try:
         server.serve_forever()

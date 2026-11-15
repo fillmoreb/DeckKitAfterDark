@@ -5,12 +5,13 @@
 --   byte 1      kind: 1 chat echo, 2 card, 3 reading view
 --   byte 2      card: seconds on screen, 0 until you close it (other kinds ignore it)
 --   bytes 3-6   card: an item ID whose icon goes by the title, uint32 (0 none)
---   then        title: length uint8 + UTF-8 (chat echo: the question you asked, may be empty)
+--   then        title: length uint8 + UTF-8 (chat echo: the gray line above the answer, as it should
+--               read, e.g. "You asked: ..." or "Hook: ..."; may be empty)
 --   then        text: length uint16 + UTF-8 (chat echo: the answer)
 -- reply body:   byte 3: 1 shown, 2 queued (a reading view in combat shows when the fight ends)
 --               byte 4: voice: 0 speak answers, 1 quiet (show them only; DeckKit menu)
 --
---   chat echo   "You asked: ..." in gray, then "Decky: ..." in the chat frame (local only, nobody
+--   chat echo   the title line in gray, then "Decky: ..." in the chat frame (local only, nobody
 --               else sees it), so answers can be read again in the chat peek and chat history.
 --   card        a small panel at the top left: title, a few lines (lists as below). It goes after its
 --               seconds, or on {B}. In combat it still shows, but without {B} (a window can't take buttons
@@ -133,7 +134,7 @@ end
 local function Echo(question, answer)
     local cf = DEFAULT_CHAT_FRAME or ChatFrame1
     if not cf then return end
-    if question ~= "" then cf:AddMessage("You asked: " .. Clean(question), 0.6, 0.6, 0.6) end
+    if question ~= "" then cf:AddMessage(Clean(question), 0.6, 0.6, 0.6) end
     if answer ~= "" then cf:AddMessage(DECKY .. Clean(answer), 1, 1, 1) end
 end
 
@@ -149,9 +150,22 @@ local function HideCard()
     if cardCatch then cardCatch:Take(false) end
 end
 
+-- The card sits at the top left, or to the right of Decky's checklist while that's up (Checklist.lua).
+local function Reanchor()
+    if not card then return end
+    card:ClearAllPoints()
+    local list = ns.Checklist and ns.Checklist.Anchor()
+    if list then
+        card:SetPoint("TOPLEFT", list, "TOPRIGHT", 10, 0)
+    else
+        card:SetPoint("TOPLEFT", UIParent, "TOPLEFT", 24, -70)
+    end
+end
+ns.Card = { Reanchor = Reanchor }
+
 local function BuildCard()
     card = Panel("DeckAgentCard", 400, "HIGH")
-    card:SetPoint("TOPLEFT", 24, -70)
+    Reanchor()
     card.icon = card:CreateTexture(nil, "ARTWORK")
     card.icon:SetSize(28, 28)
     card.icon:SetPoint("TOPLEFT", 14, -12)

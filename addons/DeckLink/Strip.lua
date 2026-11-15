@@ -6,6 +6,9 @@
 --   status   8 format | 8 flags | 16 heartbeat | 8 last good inbound seq | 16 inbound frames received |
 --            16 bad inbound frames | 16 outbound frame length L (0: none) | 16 CRC-16 of those 11 bytes
 --   outbound L bytes: the frame at the head of the queue, until the host acks it
+--   flags    1 open, 2 ready, 4 bound, 8 focus (a text box has the keyboard), 16 attention (an addon
+--            has something for the host: shown even while the link is closed, so a host that only
+--            glances at the screen knows to open the link)
 --
 -- DeckDev's strip encoding (AddonTools addons/DeckDev/Strip.lua) cut down to one row: 6 bits per
 -- channel reads back exactly on the Deck. The bottom edge keeps clear of DeckDev's strip (top rows) and
@@ -19,7 +22,7 @@ local SYNC = { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 }, { 1, 1, 1 } }
 local FIRST = #SYNC + 1 + LEVELS + 1 -- first stream cell
 local STATUS_BITS = 11 * 8 + 16
 
-ns.FLAG_OPEN, ns.FLAG_READY, ns.FLAG_BOUND, ns.FLAG_FOCUS = 1, 2, 4, 8
+ns.FLAG_OPEN, ns.FLAG_READY, ns.FLAG_BOUND, ns.FLAG_FOCUS, ns.FLAG_ATTENTION = 1, 2, 4, 8, 16
 
 local frame, cells, perRow = nil, {}, 0
 

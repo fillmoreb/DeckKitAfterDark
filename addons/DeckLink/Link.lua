@@ -22,6 +22,9 @@
 --   DeckLink.On(channel, fn(payload, seq))   frames from the host on a channel (1-255), with the frame's seq
 --   DeckLink.Send(channel, payload)     queue a frame for the host; false if it's too long
 --   DeckLink.IsOpen()                   is a host listening?
+--   DeckLink.SetAttention(name, on)     an addon has something waiting for the host (or not any more):
+--                                       while any name is on, the strip shows (with its attention flag)
+--                                       even when the link is closed, for a host that only glances
 local ADDON, ns = ...
 
 DeckKit.NewModule(ns, ADDON, "|cff9b59d6DeckLink|r")
@@ -43,18 +46,25 @@ local rxSeq, rxCount, bad, heartbeat = 0, 0, 0, 0
 local queue, txSeq = {}, 0
 local lastError
 local bound = false
+local attention = {} -- name -> true: addons with something waiting for the host
 
 ------------------------------------------------------------------------
 -- The strip
 ------------------------------------------------------------------------
 
 local dirty = false
+local function Attention() return next(attention) ~= nil end
+
 local function Render()
     dirty = false
-    if not open then return ns.HideStrip() end
+    local waiting = Attention()
+    if not open then
+        if waiting then return ns.ShowStrip(ns.FLAG_ATTENTION, heartbeat, rxSeq, rxCount, bad, nil) end
+        return ns.HideStrip()
+    end
     local focus = GetCurrentKeyBoardFocus() ~= nil
     local flags = ns.FLAG_OPEN + (bound and ns.FLAG_BOUND or 0) + (focus and ns.FLAG_FOCUS or 0)
-        + ((bound and not focus) and ns.FLAG_READY or 0)
+        + ((bound and not focus) and ns.FLAG_READY or 0) + (waiting and ns.FLAG_ATTENTION or 0)
     ns.ShowStrip(flags, heartbeat, rxSeq, rxCount, bad, queue[1] and queue[1].frame)
 end
 local function Changed() dirty = true end
@@ -279,6 +289,13 @@ end
 
 function api.IsOpen() return open end
 
+function api.SetAttention(name, on)
+    on = on and true or nil
+    if attention[name] == on then return end
+    attention[name] = on
+    Changed()
+end
+
 -- The longest payload Send takes (it's what fits on the strip).
 function api.MaxPayload() return ns.StripCapacity() - Codec.OVERHEAD end
 
@@ -294,7 +311,7 @@ ticker:SetScript("OnUpdate", function()
     if pasteUntil and now > pasteUntil then EndPaste() end
     local focus = GetCurrentKeyBoardFocus() ~= nil
     if focus ~= wasFocus then wasFocus = focus; dirty = true end
-    if open and now >= nextBeat then
+    if (open or next(attention)) and now >= nextBeat then
         nextBeat = now + 0.25
         heartbeat = heartbeat + 1
         dirty = true

@@ -126,10 +126,11 @@ it into numbered steps above once DeckAgent settles. "Done by the installer" mea
   hotwords above only help the Whisper models (base, small ~465 MB, medium).
 - In DeckKit's menu: put **DeckKit Assistant** (`DECKKIT_ASSISTANT`) on the L5+R5 grip chord, so the
   dictation box says "Starting" and game sound fades while you ask. Tools › DeckAgent has the model
-  pick, Quiet, and chat preview.
+  pick, Quiet, chat preview, and "Clear Decky's checklist" (also offered to the grip chords, so
+  her checklist can be taken down with the controller alone).
 - First use: tell Decky who your friends are; she writes them under People in
-  `~/.deckagent/CLAUDE.md`. Her facts go in `~/.deckagent/memory.db`. Both are personal and stay
-  out of the repo.
+  `~/.deckagent/CLAUDE.md`. Her facts go in `~/.deckagent/memory.db`, her hooks' notes and timers in
+  `~/.deckagent/hooks.json`. All personal; they stay out of the repo.
 
 **Requirements already on SteamOS** (checked 2026-11-14): Python 3.13, GStreamer with PyGObject,
 PipeWire tools (`pw-dump`, `pw-play`), `xdotool`. The paste route needs `xclip`, which SteamOS
