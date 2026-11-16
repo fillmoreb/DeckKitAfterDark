@@ -215,5 +215,6 @@ so it costs next to nothing.
 
 ## License
 
-MIT, see [`LICENSE`](LICENSE). The logo in `media/` is AI-generated and not covered by the MIT License.
+GNU General Public License, version 3 or later: see [`LICENSE`](LICENSE) (versions before 2026-11-15 were MIT).
+The logo in `media/` is AI-generated and not covered by the license.
 DeckKitAfterDark is an unofficial fan project, not affiliated with Blizzard Entertainment.
