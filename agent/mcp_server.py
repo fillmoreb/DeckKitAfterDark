@@ -109,9 +109,11 @@ TOOLS = [
                     "Waypoints route themselves (DeckKit with ForeverNav): for a place across the world the "
                     "result has `route`, the steps his compass will now take him through one at a time (walk to "
                     "the zeppelin tower, take the zeppelin, walk to the border...) and `seconds` for the whole "
-                    "trip. Don't list the steps: he gets them on the compass. Name the big part in a few words "
-                    "when there is one (\"Waypoint set: Sentinel Hill. Zeppelin from Orgrimmar, about 17 "
-                    "minutes.\"). No `route`: it's a straight walk, so give the distance as usual.",
+                    "trip. `measured` false means its walks are still straight-line estimates (they're measured "
+                    "a few seconds after the waypoint is set), so the real trip is longer: say \"at least\" the time. "
+                    "Don't list the steps: he gets them on the compass. Name the big part in a few words "
+                    "when there is one (\"Waypoint set: Sentinel Hill. Zeppelin from Orgrimmar, at least 12 "
+                    "minutes.\" while estimated; \"about 17 minutes\" once measured). No `route`: it's a straight walk, so give the distance as usual.",
      "inputSchema": {"type": "object", "properties": {
          "map_id": {"type": "integer"}, "x": {"type": "number", "minimum": 0, "maximum": 100},
          "y": {"type": "number", "minimum": 0, "maximum": 100}},

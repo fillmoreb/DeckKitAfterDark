@@ -36,8 +36,9 @@
 --               waypoint, uint16 (stable, for later requests about it; 0 for the map pin), then its route
 --               (DeckKit.Route, with ForeverNav): step count uint8 (0: none, a straight walk), and when
 --               there are steps the whole trip's seconds uint16, then each step's seconds uint16 and text
---               (length uint8, UTF-8; "Take the zeppelin to Grom'gol Zeppelin Tower"). Steps that don't fit
---               the reply are left off (the count says how many came).
+--               (length uint8, UTF-8; "Take the zeppelin to Grom'gol Zeppelin Tower"), then a flags byte (1: its
+--               walks were measured; 0: the walks are straight-line estimates, so the trip is at least that long).
+--               Steps that don't fit the reply are left off (the count says how many came).
 --               WAYPOINTS: byte 3 how many were removed, then the list as it is now: count uint8,
 --               active id uint16 (0 none), then each: id uint16, map uint16, x uint16, y uint16
 --               (no labels: names come from the assistant's own database)
@@ -173,14 +174,14 @@ local ROUTE_TEXT = 100      -- a step's text is cut at this many bytes
 local function RouteBytes(point, room)
     local summary = DeckKit.Route and DeckKit.Route.Summary and DeckKit.Route.Summary(point)
     if not (summary and summary.steps and #summary.steps > 0) then return U8(0) end
-    local parts, used = {}, 3
+    local parts, used = {}, 4
     for _, step in ipairs(summary.steps) do
         local bytes = U16(math.min(65535, step.seconds or 0)) .. Str((step.text or ""):sub(1, ROUTE_TEXT))
         if used + #bytes > room or #parts == 255 then break end
         parts[#parts + 1] = bytes
         used = used + #bytes
     end
-    return U8(#parts) .. U16(math.min(65535, summary.seconds or 0)) .. table.concat(parts)
+    return U8(#parts) .. U16(math.min(65535, summary.seconds or 0)) .. table.concat(parts) .. U8(summary.measured and 1 or 0)
 end
 
 local function Way(p)

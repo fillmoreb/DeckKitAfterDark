@@ -402,7 +402,8 @@ def parse_reply(p, asked=FIELDS):
     elif out["op"] == OP_WAY:
         (via, wid), i = _unpack(">BH", p, i)
         out["via"], out["waypoint"] = VIA.get(via, via), wid
-        # The route DeckKit planned to it (MapzerothLib): left out by a game from before routes, 0 steps for none.
+        # The route DeckKit planned to it (ForeverNav): left out by a game from before routes, 0 steps for none; its
+        # flags byte (1: walks measured) left out by a game from before it.
         if i < len(p):
             (count,), i = _unpack(">B", p, i)
             if count:
@@ -413,6 +414,9 @@ def parse_reply(p, asked=FIELDS):
                     text, i = _string(p, i)
                     steps.append({"text": text, "seconds": seconds})
                 out["route"] = {"seconds": total, "steps": steps}
+                if i < len(p):
+                    (flags,), i = _unpack(">B", p, i)
+                    out["route"]["measured"] = bool(flags & 1)
     elif out["op"] == OP_CHAT:
         (result,), i = _unpack(">B", p, i)
         out["result"] = CHAT_RESULT.get(result, result)

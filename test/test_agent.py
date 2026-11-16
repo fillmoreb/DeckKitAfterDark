@@ -75,9 +75,16 @@ class GameSide(unittest.TestCase):
                  '{ text = "Walk to Orgrimmar Zeppelin Tower (Grom\'gol)", seconds = 324 },'
                  '{ text = "Take the zeppelin to Grom\'gol Zeppelin Tower (Orgrimmar)", seconds = 250 } } } end }')
         data, _ = ask(host.build_way(1436, 56, 47), setup)
-        self.assertEqual(host.parse_reply(data)["route"], {"seconds": 1049, "steps": [
+        self.assertEqual(host.parse_reply(data)["route"], {"seconds": 1049, "measured": False, "steps": [
             {"text": "Walk to Orgrimmar Zeppelin Tower (Grom'gol)", "seconds": 324},
             {"text": "Take the zeppelin to Grom'gol Zeppelin Tower (Orgrimmar)", "seconds": 250}]})
+
+    def test_a_measured_route_says_so(self):
+        setup = ('WayPad_Add = function() return { id = 7 } end '
+                 'DeckKit.Route = { Summary = function() return { seconds = 1001, measured = true, steps = {'
+                 '{ text = "Walk to the zeppelin at Orgrimmar", seconds = 411 } } } end }')
+        data, _ = ask(host.build_way(1436, 56, 47), setup)
+        self.assertTrue(host.parse_reply(data)["route"]["measured"])
 
     def test_a_long_route_keeps_to_the_reply(self):
         setup = ('WayPad_Add = function() return { id = 9 } end local steps = {} '
