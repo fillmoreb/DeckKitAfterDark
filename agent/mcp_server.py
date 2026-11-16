@@ -106,7 +106,7 @@ TOOLS = [
      "description": "Put a waypoint in the game (WayPad) and make it the active one. x and y are 0-100 on "
                     "map_id, like /way. Do it straight away when the player asked for it. Returns the "
                     "waypoint's id. The waypoint has no name in the game, so say in your answer what it is. "
-                    "Waypoints route themselves (DeckKit with MapzerothLib): for a place across the world the "
+                    "Waypoints route themselves (DeckKit with ForeverNav): for a place across the world the "
                     "result has `route`, the steps his compass will now take him through one at a time (walk to "
                     "the zeppelin tower, take the zeppelin, walk to the border...) and `seconds` for the whole "
                     "trip. Don't list the steps: he gets them on the compass. Name the big part in a few words "

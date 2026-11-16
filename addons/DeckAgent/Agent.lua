@@ -34,7 +34,7 @@
 --               zeroed, and its bit is cleared in the echoed mask at byte 3)
 --               WAY: byte 3 how it was set (1 WayPad, 2 map pin), bytes 4-5 WayPad's id for the
 --               waypoint, uint16 (stable, for later requests about it; 0 for the map pin), then its route
---               (DeckKit.Route, with MapzerothLib): step count uint8 (0: none, a straight walk), and when
+--               (DeckKit.Route, with ForeverNav): step count uint8 (0: none, a straight walk), and when
 --               there are steps the whole trip's seconds uint16, then each step's seconds uint16 and text
 --               (length uint8, UTF-8; "Take the zeppelin to Grom'gol Zeppelin Tower"). Steps that don't fit
 --               the reply are left off (the count says how many came).
