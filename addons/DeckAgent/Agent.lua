@@ -33,7 +33,11 @@
 --   then        STATE: the asked-for fields, in mask-bit order (a field the game can't give is sent
 --               zeroed, and its bit is cleared in the echoed mask at byte 3)
 --               WAY: byte 3 how it was set (1 WayPad, 2 map pin), bytes 4-5 WayPad's id for the
---               waypoint, uint16 (stable, for later requests about it; 0 for the map pin)
+--               waypoint, uint16 (stable, for later requests about it; 0 for the map pin), then its route
+--               (DeckKit.Route, with MapzerothLib): step count uint8 (0: none, a straight walk), and when
+--               there are steps the whole trip's seconds uint16, then each step's seconds uint16 and text
+--               (length uint8, UTF-8; "Take the zeppelin to Grom'gol Zeppelin Tower"). Steps that don't fit
+--               the reply are left off (the count says how many came).
 --               WAYPOINTS: byte 3 how many were removed, then the list as it is now: count uint8,
 --               active id uint16 (0 none), then each: id uint16, map uint16, x uint16, y uint16
 --               (no labels: names come from the assistant's own database)
@@ -164,13 +168,28 @@ local function State(p)
     return OK, U8(sent) .. table.concat(parts)
 end
 
+-- The route DeckKit planned to waypoint `point` (WAY's reply, above): the steps that fit in `room` bytes.
+local ROUTE_TEXT = 100      -- a step's text is cut at this many bytes
+local function RouteBytes(point, room)
+    local summary = DeckKit.Route and DeckKit.Route.Summary and DeckKit.Route.Summary(point)
+    if not (summary and summary.steps and #summary.steps > 0) then return U8(0) end
+    local parts, used = {}, 3
+    for _, step in ipairs(summary.steps) do
+        local bytes = U16(math.min(65535, step.seconds or 0)) .. Str((step.text or ""):sub(1, ROUTE_TEXT))
+        if used + #bytes > room or #parts == 255 then break end
+        parts[#parts + 1] = bytes
+        used = used + #bytes
+    end
+    return U8(#parts) .. U16(math.min(65535, summary.seconds or 0)) .. table.concat(parts)
+end
+
 local function Way(p)
     if #p < 7 then return BAD_ARGS, Str("WAY needs map, x and y") end
     local map, x, y = ReadU16(p, 2), ReadU16(p, 4) / 65535, ReadU16(p, 6) / 65535
     if WayPad_Add then
         local point, why = WayPad_Add(map, x, y)
         if not point then return REFUSED, Str(why or "WayPad refused it") end
-        return OK, U8(VIA_WAYPAD) .. U16(point.id or 0)
+        return OK, U8(VIA_WAYPAD) .. U16(point.id or 0) .. RouteBytes(point, 400)
     end
     if not (C_Map.CanSetUserWaypointOnMap and C_Map.CanSetUserWaypointOnMap(map)) then
         return REFUSED, Str("can't put a map pin on map " .. map)

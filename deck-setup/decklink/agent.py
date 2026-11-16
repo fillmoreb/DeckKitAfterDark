@@ -402,6 +402,17 @@ def parse_reply(p, asked=FIELDS):
     elif out["op"] == OP_WAY:
         (via, wid), i = _unpack(">BH", p, i)
         out["via"], out["waypoint"] = VIA.get(via, via), wid
+        # The route DeckKit planned to it (MapzerothLib): left out by a game from before routes, 0 steps for none.
+        if i < len(p):
+            (count,), i = _unpack(">B", p, i)
+            if count:
+                (total,), i = _unpack(">H", p, i)
+                steps = []
+                for _ in range(count):
+                    (seconds,), i = _unpack(">H", p, i)
+                    text, i = _string(p, i)
+                    steps.append({"text": text, "seconds": seconds})
+                out["route"] = {"seconds": total, "steps": steps}
     elif out["op"] == OP_CHAT:
         (result,), i = _unpack(">B", p, i)
         out["result"] = CHAT_RESULT.get(result, result)

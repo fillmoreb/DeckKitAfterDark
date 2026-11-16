@@ -105,7 +105,13 @@ TOOLS = [
     {"name": "set_waypoint",
      "description": "Put a waypoint in the game (WayPad) and make it the active one. x and y are 0-100 on "
                     "map_id, like /way. Do it straight away when the player asked for it. Returns the "
-                    "waypoint's id. The waypoint has no name in the game, so say in your answer what it is.",
+                    "waypoint's id. The waypoint has no name in the game, so say in your answer what it is. "
+                    "Waypoints route themselves (DeckKit with MapzerothLib): for a place across the world the "
+                    "result has `route`, the steps his compass will now take him through one at a time (walk to "
+                    "the zeppelin tower, take the zeppelin, walk to the border...) and `seconds` for the whole "
+                    "trip. Don't list the steps: he gets them on the compass. Name the big part in a few words "
+                    "when there is one (\"Waypoint set: Sentinel Hill. Zeppelin from Orgrimmar, about 17 "
+                    "minutes.\"). No `route`: it's a straight walk, so give the distance as usual.",
      "inputSchema": {"type": "object", "properties": {
          "map_id": {"type": "integer"}, "x": {"type": "number", "minimum": 0, "maximum": 100},
          "y": {"type": "number", "minimum": 0, "maximum": 100}},
@@ -695,7 +701,10 @@ def tool_set_waypoint(args):
     reply = common.game("way", int(args["map_id"]), "%.2f" % float(args["x"]), "%.2f" % float(args["y"]))
     if not reply.get("ok"):
         raise common.GameError(reply.get("reason") or reply.get("status") or "the game refused the waypoint")
-    return {"done": True, "waypoint_id": reply.get("waypoint"), "via": reply.get("via")}
+    out = {"done": True, "waypoint_id": reply.get("waypoint"), "via": reply.get("via")}
+    if reply.get("route"):
+        out["route"] = reply["route"]
+    return out
 
 
 def _waypoint_list(points, state=None):

@@ -144,6 +144,10 @@ means `install-on-deck.sh` (or `install.sh`) already does it (step 2); "by hand"
   and the checklist's and hooks' game conditions. An older DeckKit loads DeckAgent with errors.
 - Layouts are 1-4 KB of JSON, so they need the paste route (a clipboard tool on the Deck, which the
   installer sets up for the link): by keys alone a frame over 500 bytes is refused, not shown.
+- Routes (optional): with a DeckKit that has `DeckKit/Route.lua` and **MapzerothLib** installed (the library
+  half of Mapzeroth, from Ben's fork until upstream takes it), a waypoint Decky sets comes back with its
+  route (zeppelin, boat, borders...), and she can say how the trip goes. Without them, waypoints work as
+  before and her `set_waypoint` result just has no `route`.
 
 **Done by the installer**
 - `~/.local/lib/deckagent` (launcher, MCP server, database tools), `~/.local/bin/deckagent`,

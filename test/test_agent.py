@@ -69,6 +69,26 @@ class GameSide(unittest.TestCase):
                                                   "via": "waypad", "waypoint": 513})
         self.assertIn("WAYPAD\t1454\t0.3600\t0.8770\tnil", lines)
 
+    def test_way_reply_carries_the_route(self):
+        setup = ('WayPad_Add = function() return { id = 513 } end '
+                 'DeckKit.Route = { Summary = function(p) if p.id ~= 513 then return nil end return { seconds = 1049, steps = {'
+                 '{ text = "Walk to Orgrimmar Zeppelin Tower (Grom\'gol)", seconds = 324 },'
+                 '{ text = "Take the zeppelin to Grom\'gol Zeppelin Tower (Orgrimmar)", seconds = 250 } } } end }')
+        data, _ = ask(host.build_way(1436, 56, 47), setup)
+        self.assertEqual(host.parse_reply(data)["route"], {"seconds": 1049, "steps": [
+            {"text": "Walk to Orgrimmar Zeppelin Tower (Grom'gol)", "seconds": 324},
+            {"text": "Take the zeppelin to Grom'gol Zeppelin Tower (Orgrimmar)", "seconds": 250}]})
+
+    def test_a_long_route_keeps_to_the_reply(self):
+        setup = ('WayPad_Add = function() return { id = 9 } end local steps = {} '
+                 'for i = 1, 30 do steps[i] = { text = string.rep("x", 150), seconds = i } end '
+                 'DeckKit.Route = { Summary = function() return { seconds = 900, steps = steps } end }')
+        data, _ = ask(host.build_way(1436, 56, 47), setup)
+        route = host.parse_reply(data)["route"]
+        self.assertLess(len(data), 545)
+        self.assertTrue(0 < len(route["steps"]) < 30)  # as many as fit
+        self.assertEqual(route["steps"][0], {"text": "x" * 100, "seconds": 1})  # each cut to 100 bytes
+
     def test_waypad_refusal_comes_back(self):
         data, _ = ask(host.build_way(9999, 50, 50), "WayPad_Add = function() return nil, 'unknown map 9999' end")
         self.assertEqual(host.parse_reply(data), {"op": 2, "seq": 7, "ok": False, "status": "refused",
@@ -95,6 +115,12 @@ class HostSide(unittest.TestCase):
         self.assertEqual(host.fraction(100), 65535)
         with self.assertRaises(ValueError):
             host.build_way(1, 101, 5)
+
+    def test_way_replies_from_before_routes_still_parse(self):
+        self.assertNotIn("route", host.parse_reply(b"\x42\x01\x00\x01\x00\x03"))
+        self.assertNotIn("route", host.parse_reply(b"\x42\x01\x00\x01\x00\x03\x00"))  # no route: a straight walk
+        with self.assertRaises(host.Malformed):
+            host.parse_reply(b"\x42\x01\x00\x01\x00\x03\x02\x04\x19\x01\x44\x03abc")  # two steps said, one sent
 
     def test_truncated_replies_are_malformed(self):
         for p in (b"\x41\x01", b"\x41\x01\x00\x01\x05", b"\x42\x01\x00\x01", b"\x41\x01\x03\x09ab"):
@@ -277,6 +303,15 @@ class MCPServer(unittest.TestCase):
         out, err = self.call("set_waypoint", {"map_id": 1454, "x": 36, "y": 87.7})
         self.assertEqual(out, {"done": True, "waypoint_id": 3, "via": "waypad"})
         self.assertEqual(self.calls[-1], ("way", 1454, "36.00", "87.70"))
+
+    def test_set_waypoint_returns_the_route(self):
+        route = b"\x02\x04\x19" + b"\x01\x44\x0bWalk to Org" + b"\x00\xfa\x0cTake the zep"
+        with mock.patch.object(self, "fake_game", lambda *a, **k: (self.calls.append(a), host.parse_reply(
+                b"\x42\x01\x00\x01\x00\x03" + route))[1]):
+            out, err = self.call("set_waypoint", {"map_id": 1436, "x": 56, "y": 47})
+        self.assertFalse(err)
+        self.assertEqual(out["route"], {"seconds": 1049, "steps": [{"text": "Walk to Org", "seconds": 324},
+                                                                  {"text": "Take the zep", "seconds": 250}]})
 
     def test_send_chat(self):
         out, err = self.call("send_chat", {"channel": "whisper", "to": "Ednalyn", "text": "SFK?"})
