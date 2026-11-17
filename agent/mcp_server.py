@@ -16,6 +16,16 @@ Tools:
                                       to a character or a Battle.net friend
   get_online(lists)                   (game) who's online: Battle.net friends (and their character),
                                       character friends, guild
+  get_people(kinds, minutes)          (game) everyone who matters right now, each with why: recent whispers,
+                                      chat, trades (what they gave), party invites, group, target, and
+                                      friends and guild online; for turning a misheard name into a real one
+  invite_to_group(name)               (game) a party invite to a character
+  show_widget(name, layout, save, ...) (game) a live display (DeckKit widgets: stat pieces follow live numbers),
+                                      saved as an action for his grip slots and touch grids when asked
+  delete_widget(name)                 (game) forget a saved widget
+  list_displays() / hide_display(kind, name) / clear_screen()   (game) what of hers is on screen; take it down
+  read_numbers(measures)              (game) live numbers now: looted since a mark, per hour, value, XP, rep...
+  get_ledger(kind, minutes)           (game + database) what he's gained, by item / faction / skill
   ask_player(question, options, ...)  (game) ask Ben with a prompt (yes/no dialog or a list) and wait
                                       for his answer
   remember(section, note)             (its notes) one line under People or Ben's rules in CLAUDE.md
@@ -54,7 +64,7 @@ PROTOCOL = "2025-06-18"
 # A layout node (addons/DeckKit/Layout.lua's header has the full vocabulary), nested a few levels deep
 # explicitly rather than by $ref.
 LAYOUT_TYPES = ["list", "section", "row", "pages", "text", "heading", "item", "quest", "spell", "npc", "money",
-                "check", "progress", "waypoint", "icon", "button", "space"]
+                "check", "progress", "waypoint", "icon", "button", "space", "stat"]
 
 
 def _layout_node(depth):
@@ -156,6 +166,31 @@ TOOLS = [
          "lists": {"type": "array", "items": {"type": "string", "enum": ["bnet", "friends", "guild"]},
                    "uniqueItems": True}},
          "additionalProperties": False}},
+    {"name": "get_people",
+     "description": "Everyone who matters to Ben right now, one entry per person with every reason they're on "
+                    "the list, newest first. Use it to turn who he means into a real character name: speech-to-"
+                    "text mangles names ('Jesse James' may be Jessejames), and he refers to people by what "
+                    "they did ('the guy who just gave me a linen bag', 'whoever whispered me about a group'). "
+                    "Reasons: whisper (direction from_them or from_you, the latest text), bnet_whisper (a "
+                    "Battle.net friend: battletag, the character they're on), chat (channel and latest text, "
+                    "last 2 minutes), trade (a finished trade: they_gave / you_gave, items and copper), invite "
+                    "(they invited him to a group), group (in his group; leader), target (his target), "
+                    "friend_online, guild_online, bnet_friend_online. seconds_ago says how recent. kinds "
+                    "limits it (default all); minutes overrides the time windows (whispers and trades 30 min, "
+                    "chat 2, invites 10). 'more' true: the list was cut short, ask for fewer kinds. Then "
+                    "send_chat (whisper) or invite_to_group with the name exactly as given here.",
+     "inputSchema": {"type": "object", "properties": {
+         "kinds": {"type": "array", "uniqueItems": True, "items": {"type": "string", "enum": [
+             "whispers", "chat", "trades", "invites", "group", "target", "friends", "guild", "bnet"]}},
+         "minutes": {"type": "integer", "minimum": 1, "maximum": 255}},
+         "additionalProperties": False}},
+    {"name": "invite_to_group",
+     "description": "Invite a character to Ben's group (a party invite). `name` exactly as get_people or "
+                    "get_online gives it (Name, or Name-Realm). Do it when he asks, without asking back. "
+                    "Refused if he's in a group he doesn't lead, or it's full.",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string", "minLength": 2, "maxLength": 64}},
+         "required": ["name"], "additionalProperties": False}},
     {"name": "ask_player",
      "description": "Ask Ben something in the game and wait for his answer (he answers with the pad: no need "
                     "for him to speak again). Two options make a dialog: A picks the first, B the second "
@@ -342,6 +377,85 @@ TOOLS = [
          "layout": LAYOUT_NODE,
          "wait": {"type": "integer", "minimum": 0, "maximum": 240, "default": 0}},
          "required": ["layout"], "additionalProperties": False}},
+    {"name": "show_widget",
+     "description": "Put a LIVE display on Ben's screen: a tracker at the top left (stacked under any others) "
+                    "whose numbers keep updating as he plays, with no more questions to you. For 'track how "
+                    "much/how fast I'm getting X', 'XP per hour', 'how much rep am I getting', 'what's this haul "
+                    "worth'. Never use a checklist with made-up targets for those. `layout` is a DeckKit layout "
+                    "(as show_layout) whose `stat` pieces show live numbers: {type: stat, text: the label, "
+                    "bind: a measure, format: count (default; a measure with per shows 36/h) | money | "
+                    "time}. A stat without text is a bare number, for columns in a row (e.g. a row of [item "
+                    "(id), stat looted, stat per hour, stat value]). Give the layout a short `title`. "
+                    "`mark`: a start the numbers count from, set when it opens (use since: that mark in the "
+                    "measures), so it measures this session of farming; `save`: true keeps it as an action "
+                    "he can put on a grip slot or touch grid cell (it then reopens with its count starting "
+                    "over), only when he asks to keep it or you offer and he agrees; scope account: for all "
+                    "his characters. " + "A measure (DeckKit.Measures) is an object: {measure, ...fields, since, scope, per}. measure: looted (item: an "
+                    "item ID; none: every item; drops, gathering and quest rewards), created (crafted), coin (looted "
+                    "copper), money (net change in copper, spending too), xp, rep (faction: its name; none: all), "
+                    "skill (skill: e.g. Mining; points gained), quests (turned in), elapsed (seconds), carried "
+                    "(item: in his bags now), value (of: an item measure: its worth in copper at auction price, "
+                    "else vendor), sum (of: a list). since: a mark name (a widget's mark, set afresh each time "
+                    "it opens), {minutes: N}, or left out (since he logged in). per: hour or minute for a rate. "
+                    "scope: account for every character's totals.",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string", "minLength": 1, "maxLength": 40},
+         "layout": LAYOUT_NODE,
+         "mark": {"type": "string", "maxLength": 40},
+         "save": {"type": "boolean", "default": False},
+         "scope": {"type": "string", "enum": ["character", "account"], "default": "character"}},
+         "required": ["name", "layout"], "additionalProperties": False}},
+    {"name": "delete_widget",
+     "description": "Forget a saved widget (and take it off his grip slots' list). scope only when one of each "
+                    "exists.",
+     "inputSchema": {"type": "object", "properties": {
+         "name": {"type": "string", "minLength": 1, "maxLength": 40},
+         "scope": {"type": "string", "enum": ["character", "account"]}},
+         "required": ["name"], "additionalProperties": False}},
+    {"name": "list_displays",
+     "description": "Everything of yours on Ben's screen, and your saved widgets: kind (widget, checklist, card, "
+                    "reading, window), name (a widget's name, else the title shown), on_screen, and for widgets "
+                    "saved and scope. Check it before saying what's up or when he asks you to take something "
+                    "down: it's the game's own answer, so it includes things you don't remember making.",
+     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "hide_display",
+     "description": "Take one of your displays off the screen: kind as list_displays gives it, and name for a "
+                    "widget. A saved widget stays saved (delete_widget forgets it).",
+     "inputSchema": {"type": "object", "properties": {
+         "kind": {"type": "string", "enum": ["widget", "checklist", "card", "reading", "window"]},
+         "name": {"type": "string", "maxLength": 60}},
+         "required": ["kind"], "additionalProperties": False}},
+    {"name": "clear_screen",
+     "description": "Take down everything of yours on screen (widgets, checklist, card, reading view, window) when "
+                    "he asks you to clear your stuff. Saved widgets stay saved. Returns how many went.",
+     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
+    {"name": "read_numbers",
+     "description": "Live numbers right now, for a question rather than a display ('how much XP have I made "
+                    "this hour', 'what's my haul worth'). Up to 20 measures; each value is a number or null "
+                    "(unknown: an unset mark, or no rate in its first minute). " + "A measure (DeckKit.Measures) is an object: {measure, ...fields, since, scope, per}. measure: looted (item: an "
+                    "item ID; none: every item; drops, gathering and quest rewards), created (crafted), coin (looted "
+                    "copper), money (net change in copper, spending too), xp, rep (faction: its name; none: all), "
+                    "skill (skill: e.g. Mining; points gained), quests (turned in), elapsed (seconds), carried "
+                    "(item: in his bags now), value (of: an item measure: its worth in copper at auction price, "
+                    "else vendor), sum (of: a list). since: a mark name (a widget's mark, set afresh each time "
+                    "it opens), {minutes: N}, or left out (since he logged in). per: hour or minute for a rate. "
+                    "scope: account for every character's totals.",
+     "inputSchema": {"type": "object", "properties": {
+         "measures": {"type": "array", "minItems": 1, "maxItems": 20, "items": {
+             "type": "object", "properties": {"measure": {"type": "string", "enum": [
+                 "looted", "created", "coin", "money", "xp", "rep", "skill", "quests", "elapsed", "carried",
+                 "value", "sum"]}}, "required": ["measure"]}}},
+         "required": ["measures"], "additionalProperties": False}},
+    {"name": "get_ledger",
+     "description": "What he's gained, broken down: kind loot or created (by item, with names), rep (by "
+                    "faction), skill (by skill), or coin / money / xp / quest (one total), over the last "
+                    "`minutes` (none: since he logged in; kept up to 4 days), biggest first. scope account: "
+                    "all his characters. Money and coin are copper.",
+     "inputSchema": {"type": "object", "properties": {
+         "kind": {"type": "string", "enum": ["loot", "created", "coin", "money", "xp", "rep", "skill", "quest"]},
+         "minutes": {"type": "integer", "minimum": 1, "maximum": 5760},
+         "scope": {"type": "string", "enum": ["character", "account"]}},
+         "required": ["kind"], "additionalProperties": False}},
     {"name": "clear_checklist",
      "description": "Take down the checklist you put up with track_checklist (when he's done with it or "
                     "asks).",
@@ -789,6 +903,77 @@ def tool_get_online(args):
     return {"people": people, "more": reply.get("more", False)}
 
 
+PEOPLE_KINDS = ["whispers", "chat", "trades", "invites", "group", "target"]  # the game's PEOPLE request
+ONLINE_LISTS = ["friends", "guild", "bnet"]  # get_online's
+
+
+def people_view(recent, online):
+    """PEOPLE entries and FRIENDS entries -> one entry per person (by name, any case) with all their reasons,
+    the most recent first. A Battle.net friend counts by the character they're on (else their BattleTag)."""
+    people = {}
+
+    def add(name, reason, **extra):
+        p = people.setdefault(name.lower(), {"name": name, "reasons": []})
+        p.update(extra)
+        p["reasons"].append(reason)
+    for e in recent:
+        reason = {k: v for k, v in e.items() if k != "name"}
+        if e["kind"] == "bnet_whisper":
+            reason.pop("character", None)
+            add(e.get("character") or e["name"], reason, battletag=e["name"])
+        else:
+            add(e["name"], reason)
+    for o in online:
+        if o["list"] == "bnet":
+            reason = {"kind": "bnet_friend_online", "in_wow": o.get("in_wow", False)}
+            if o.get("in_wow"):
+                reason.update({k: o.get(k) for k in ("level", "class", "zone")})
+                add(o["character"], reason, battletag=o["battletag"])
+            else:
+                add(o["battletag"], reason, battletag=o["battletag"])
+        else:
+            reason = {"kind": o["list"] + "_online", "level": o.get("level"), "class": o.get("class"),
+                      "zone": o.get("zone")}
+            add(o["name"], reason)
+
+    def newest(p):
+        ages = [r["seconds_ago"] for r in p["reasons"] if "seconds_ago" in r]
+        return min(ages) if ages else float("inf")
+    return sorted(people.values(), key=lambda p: (newest(p), p["name"].lower()))
+
+
+def tool_get_people(args):
+    kinds = args.get("kinds") or PEOPLE_KINDS + ONLINE_LISTS
+    recent, online, more = [], [], False
+    asked = [k for k in kinds if k in PEOPLE_KINDS]
+    if asked:
+        minutes = ["--minutes", str(args["minutes"])] if args.get("minutes") else []
+        reply = common.game("people", *(minutes + asked))
+        if not reply.get("ok"):
+            raise common.GameError(reply.get("reason") or reply.get("error") or "the game said no")
+        recent, more = reply.get("people", []), reply.get("more", False)
+    lists = [k for k in kinds if k in ONLINE_LISTS]
+    if lists:
+        reply = common.game("friends", *lists)
+        if not reply.get("ok"):
+            raise common.GameError(reply.get("reason") or reply.get("error") or "the game said no")
+        online, more = reply.get("people", []), more or reply.get("more", False)
+        try:  # who plays which character, as get_online does
+            with memory.connect() as db:
+                memory.record_online(db, online)
+        except Exception as e:
+            print("memory: couldn't record characters: %s" % e, file=sys.stderr)
+    return {"people": people_view(recent, online), "more": more}
+
+
+def tool_invite_to_group(args):
+    name = args["name"].strip()
+    reply = common.game("invite", name)
+    if not reply.get("ok"):
+        raise common.GameError(reply.get("reason") or reply.get("error") or "not invited")
+    return {"invited": name}
+
+
 def tool_ask_player(args):
     seconds = int(args.get("seconds") or 45)
     cmd = ["prompt"] + (["--list"] if args.get("list") else []) + ["--seconds", str(seconds), args["question"]]
@@ -984,6 +1169,73 @@ def tool_clear_checklist(args):
     return {"cleared": True}
 
 
+def _game_ok(reply, fallback):
+    if not reply.get("ok"):
+        raise common.GameError(reply.get("reason") or reply.get("error") or reply.get("status") or fallback)
+    return reply
+
+
+def tool_show_widget(args):
+    flags = []
+    if args.get("save"):
+        flags.append("--save")
+    if args.get("scope") == "account":
+        flags.append("--account")
+    if args.get("mark"):
+        flags += ["--mark", args["mark"]]
+    _game_ok(common.game("widget", "show", *flags, args["name"], json.dumps(args["layout"], separators=(",", ":"))),
+             "couldn't show it")
+    return {"shown": args["name"], "saved": bool(args.get("save")),
+            "scope": args.get("scope", "character") if args.get("save") else None}
+
+
+def tool_list_displays(args):
+    return {"displays": _game_ok(common.game("displays"), "couldn't list them").get("displays", [])}
+
+
+def tool_hide_display(args):
+    if args["kind"] == "widget" and not (args.get("name") or "").strip():
+        raise common.GameError("a widget needs its name")
+    reply = _game_ok(common.game("displays", "hide", args["kind"], *([args["name"]] if args.get("name") else [])),
+                     "couldn't hide it")
+    return {"hidden": reply.get("hidden", 0) == 1, "kind": args["kind"], "name": args.get("name")}
+
+
+def tool_clear_screen(args):
+    return {"hidden": _game_ok(common.game("displays", "hide-all"), "couldn't clear it").get("hidden", 0)}
+
+
+def tool_delete_widget(args):
+    scope = ["--" + args["scope"]] if args.get("scope") else []
+    _game_ok(common.game("widget", "delete", *scope, args["name"]), "couldn't delete it")
+    return {"deleted": args["name"]}
+
+
+def tool_read_numbers(args):
+    reply = _game_ok(common.game("ledger", "values", json.dumps(args["measures"], separators=(",", ":"))),
+                     "couldn't read them")
+    return {"values": reply.get("values", [])}
+
+
+def tool_get_ledger(args):
+    kind = args["kind"]
+    extra = [str(args["minutes"])] if args.get("minutes") else []
+    if args.get("scope") == "account":
+        extra.append("--account")
+    reply = _game_ok(common.game("ledger", "totals", kind, *extra), "couldn't read it")
+    totals = reply.get("totals", [])
+    if kind in ("loot", "created"):
+        ids = [int(t["key"]) for t in totals if t["key"].isdigit()]
+        names = _names(ids) if ids else {}
+        totals = [{"item_id": int(t["key"]), "name": names.get(int(t["key"])), "count": t["amount"]}
+                  for t in totals if t["key"].isdigit()]
+    elif kind in ("rep", "skill"):
+        totals = [{("faction" if kind == "rep" else "skill"): t["key"], "amount": t["amount"]} for t in totals]
+    else:
+        totals = {"total": totals[0]["amount"] if totals else 0}
+    return {"kind": kind, "minutes": args.get("minutes"), "totals": totals, "more": reply.get("more", False)}
+
+
 def tool_respond(args):
     """Shows the display (the spoken part is the launcher's: it reads `say` from this call)."""
     say, display = " ".join(args["say"].split()), args["display"]
@@ -1056,7 +1308,11 @@ def tool_forget_fact(args):
 
 
 HANDLERS = {"get_player_state": tool_get_player_state, "find_npc": tool_find_npc, "set_waypoint": tool_set_waypoint,
-            "send_chat": tool_send_chat, "get_online": tool_get_online, "ask_player": tool_ask_player,
+            "send_chat": tool_send_chat, "get_online": tool_get_online,
+            "get_people": tool_get_people, "invite_to_group": tool_invite_to_group,
+            "show_widget": tool_show_widget, "delete_widget": tool_delete_widget, "list_displays": tool_list_displays,
+            "hide_display": tool_hide_display, "clear_screen": tool_clear_screen, "read_numbers": tool_read_numbers,
+            "get_ledger": tool_get_ledger, "ask_player": tool_ask_player,
             "remember": tool_remember, "remember_fact": tool_remember_fact, "recall": tool_recall,
             "forget_fact": tool_forget_fact, "get_quests": tool_get_quests, "find_quests": tool_find_quests,
             "respond": tool_respond, "track_checklist": tool_track_checklist, "show_layout": tool_show_layout,

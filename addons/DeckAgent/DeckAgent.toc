@@ -11,6 +11,8 @@ Bytes.lua
 Agent.lua
 Prompt.lua
 Chat.lua
+People.lua
+Widgets.lua
 Ask.lua
 Show.lua
 Quests.lua

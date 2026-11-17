@@ -178,9 +178,17 @@ local function CardSpec(title, text, itemID)
     return { type = "list", title = title, width = 400, items = items }
 end
 
+-- What of hers is up, for DISPLAYS (Widgets.lua): ns.Mine.card / reader / window return its title while it's up
+-- (nil when it isn't), ns.Mine.Hide(kind) takes it down.
+local cardUp -- the card's title while hers is up (a card from someone else replaces it, and its onHide clears this)
+ns.Mine = {}
+
 local function ShowCard(title, text, seconds, itemID)
-    DeckKit.UI.ShowCard(CardSpec(Clean(title), Clean(text, true), itemID), { seconds = seconds })
+    DeckKit.UI.ShowCard(CardSpec(Clean(title), Clean(text, true), itemID),
+        { seconds = seconds, onHide = function() cardUp = nil end })
+    cardUp = title ~= "" and title or text:match("^[^\n]*"):sub(1, 60)
 end
+function ns.Mine.card() return cardUp end
 ns.CardSpec = CardSpec -- (for the tests)
 
 ------------------------------------------------------------------------
@@ -298,8 +306,12 @@ local function TicksFor(spec)
     return all[key]
 end
 
+local windowUp -- her layout window's title while it's up
+
 local function OpenLayout(q)
     local answered = false
+    windowUp = type(q.spec.title) == "string" and q.spec.title or "Decky"
+    local function Gone() windowUp = nil end
     local function Answer(choice)
         if answered then return end
         answered = true
@@ -310,8 +322,10 @@ local function OpenLayout(q)
         onReply = function(v)
             Answer(tonumber(v) or 0)
             DeckKit.UI.HideLayout()
+            Gone()
         end,
         onClose = function(why)
+            Gone()
             if why == "closed" and (InCombatLockdown() or UnitAffectingCombat("player")) then
                 layoutQueued = q -- a fight took it down: back after the fight, still waiting
                 return
@@ -332,6 +346,19 @@ local function ShowLayout(spec, seq, waits)
     end
     OpenLayout(q)
     return SHOWN
+end
+
+function ns.Mine.window() return windowUp or (layoutQueued and "(after the fight)") or nil end
+function ns.Mine.reader() return reader and reader:IsShown() and (reader.title:GetText() or "") or (readQueued and "(after the fight)") or nil end
+function ns.Mine.Hide(kind)
+    if kind == "card" and cardUp then DeckKit.UI.HideCard()
+    elseif kind == "reader" then HideReader()
+    elseif kind == "window" then
+        local old = layoutQueued
+        layoutQueued = nil
+        if old and old.waits then ns.SendAnswer(old.seq, 255) end
+        if windowUp then DeckKit.UI.HideLayout() end
+    end
 end
 
 ns.On("PLAYER_REGEN_ENABLED", function()

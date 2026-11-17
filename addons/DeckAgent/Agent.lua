@@ -45,11 +45,13 @@
 --               CHAT, FRIENDS: see Chat.lua
 --               any failure: length uint8, a short reason (UTF-8)
 --
--- CHAT (op 3) and FRIENDS (op 4) are in Chat.lua, ASK (op 5) and DISMISS (19) in Ask.lua, SHOW (op 7) in Show.lua,
--- QUESTS (op 8) in Quests.lua, CHECKLIST (op 11) in Checklist.lua, HOOKS (op 12) and EVENTS (op 13)
--- in Hooks.lua, CHARACTER (14), BAGS (15), ITEM_INFO (16), PRICES (17) and MARKS (18) in Inventory.lua;
--- each file's header documents its ops' layout. They pack and read with Bytes.lua (ns.Bytes, loaded
--- first) and register in ns.OPS. Ops get (payload, seq).
+-- CHAT (op 3) and FRIENDS (op 4) are in Chat.lua, PEOPLE (20) and INVITE (21) in People.lua, WIDGET (22),
+-- LEDGER (23) and DISPLAYS (24) in Widgets.lua, ASK (op 5)
+-- and DISMISS (19) in Ask.lua, SHOW (op 7) in Show.lua, QUESTS (op 8) in Quests.lua, CHECKLIST (op 11)
+-- in Checklist.lua, HOOKS (op 12) and EVENTS (op 13) in Hooks.lua, CHARACTER (14), BAGS (15),
+-- ITEM_INFO (16), PRICES (17) and MARKS (18) in Inventory.lua; each file's header documents its ops'
+-- layout. They pack and read with Bytes.lua (ns.Bytes, loaded first) and register in ns.OPS. Ops get
+-- (payload, seq).
 --
 -- Replies need the link open (the host says hello first): DeckLink.Send refuses otherwise.
 local ADDON, ns = ...

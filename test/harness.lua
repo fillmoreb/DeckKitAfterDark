@@ -95,13 +95,23 @@ local function fire(event, ...) for _, fn in ipairs(events[event] or {}) do fn(.
 -- DeckKit's own Conditions and JSON, the real files (DeckAgent's conditions and layouts are DeckKit's):
 -- from the DeckKit repo beside this one, or DECKKIT_DIR.
 local DECKKIT = os.getenv("DECKKIT_DIR") or (DIR .. "/../../DeckKit/addons/DeckKit/")
-local coreNS = { On = function(event, fn) events[event] = events[event] or {}; table.insert(events[event], fn) end }
-for _, file in ipairs({ "Conditions.lua", "JSON.lua" }) do
+-- DeckKit's UI as DeckAgent sees it (below) and its actions: what a saved widget offers lands in OFFERS.
+OFFERS = {}
+local coreNS = { On = function(event, fn) events[event] = events[event] or {}; table.insert(events[event], fn) end,
+    Readable = function(v) return v ~= nil and not (issecretvalue and issecretvalue(v)) end,
+    UI = setmetatable({}, { __index = function(_, k) return DeckKit.UI[k] end }),
+    Actions = { OfferNow = function(id, opts) OFFERS[id] = opts end, Withdraw = function(id) OFFERS[id] = nil end } }
+-- Ledger, Measures, People, Widgets: what the PEOPLE, INVITE, WIDGET and LEDGER ops answer from (DeckAgent only
+-- packs them).
+for _, file in ipairs({ "Conditions.lua", "JSON.lua", "Ledger.lua", "Measures.lua", "People.lua", "Widgets.lua" }) do
     assert(loadfile(DECKKIT .. file), "DeckKit's " .. file .. " (set DECKKIT_DIR to the DeckKit addon folder)")("DeckKit", coreNS)
 end
-DeckKit.Conditions, DeckKit.JSON = coreNS.Conditions, coreNS.JSON
+DeckKit.Conditions, DeckKit.JSON, DeckKit.Ledger, DeckKit.People = coreNS.Conditions, coreNS.JSON, coreNS.Ledger,
+    coreNS.People
+DeckKit.Measures, DeckKit.Widgets = coreNS.Measures, coreNS.Widgets
 -- DeckKit's layout window, as far as DeckAgent sees it: LAYOUT is the one up (scenarios call its
 -- opts.onReply(n) for a reply button, DeckKit.UI.HideLayout() for B).
+TRACKERS = {}
 DeckKit.UI = {
     ShowLayout = function(spec, opts)
         local old = LAYOUT
@@ -110,11 +120,21 @@ DeckKit.UI = {
         print("LAYOUT " .. tostring(spec.type) .. " " .. tostring(opts.title))
         return true
     end,
-    ShowTracker = function(spec) TRACKER = { spec = spec, shown = true } end,
+    -- The default tracker is TRACKER; named ones (saved widgets) are TRACKERS[name].
+    ShowTracker = function(spec, opts)
+        if opts and opts.name then TRACKERS[opts.name] = { spec = spec, shown = true }
+        else TRACKER = { spec = spec, shown = true } end
+    end,
     ShowCard = function(spec, opts) CARD = { spec = spec, opts = opts, shown = true } end,
     HideCard = function() if CARD then CARD.shown = false end end,
-    HideTracker = function() if TRACKER then TRACKER.shown = false end end,
-    TrackerShown = function() return TRACKER ~= nil and TRACKER.shown end,
+    HideTracker = function(name)
+        local t = name and TRACKERS[name] or (not name and TRACKER)
+        if t then t.shown = false end
+    end,
+    TrackerShown = function(name)
+        local t = name and TRACKERS[name] or (not name and TRACKER)
+        return t ~= nil and t ~= false and t.shown
+    end,
     HideLayout = function()
         if LAYOUT and LAYOUT.shown then
             LAYOUT.shown = false
@@ -262,7 +282,7 @@ end
 function taps(bits)
     for c in bits:gmatch("[01]") do key(c == "0" and "F9" or "F10") end
 end
-function later(s) now = now + s end
+function later(s) now = now + s; SERVERTIME = SERVERTIME + s end
 function frame() for _, f in ipairs(frames) do if rawget(f, "OnUpdate") then f.OnUpdate(f, 0.016) end end end
 function focus(on) focused = on and {} or nil end
 function errorsSeen() return #errors end

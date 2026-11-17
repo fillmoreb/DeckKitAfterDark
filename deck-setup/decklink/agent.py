@@ -1,6 +1,6 @@
 """The game side of DeckAgent, asked from the Deck: one binary request on channel 3, one reply.
 addons/DeckAgent answers: Agent.lua's header documents the framing and its ops, each other op file
-(Chat, Ask, Show, Quests, Checklist, Hooks, Inventory) its own; keep them in step (test/test_agent.py
+(Chat, People, Ask, Show, Quests, Checklist, Hooks, Inventory) its own; keep them in step (test/test_agent.py
 checks the bytes both ways). Every request is checked and built here (prepare), for the CLI and the
 link keeper alike. agent/mcp_server.py is the usual caller.
 
@@ -20,6 +20,15 @@ link keeper alike. agent/mcp_server.py is the usual caller.
     decklink agent chat CHANNEL TARGET TEXT   send chat for you (CHANNEL: say yell party raid guild
                                          whisper bnet instance; TARGET "" unless whisper/bnet)
     decklink agent friends [LIST ...]    who's online; LISTs: bnet friends guild (default: all)
+    decklink agent people [--minutes N] [KIND ...]   who's been around lately: KINDs whispers chat
+                                         trades invites group target (default: all); chat last
+    decklink agent invite NAME           invite a character to your group
+    decklink agent widget show [--save] [--account] [--mark MARK] NAME JSON | hide NAME | list |
+                         delete [--account | --character] NAME   live displays (DeckKit.Widgets, Widgets.lua)
+    decklink agent displays [hide KIND [NAME] | hide-all]   what of the assistant's is on screen (KIND: widget
+                                         checklist card reading window), or take it down
+    decklink agent ledger values JSON | totals KIND [MINUTES] [--account] | hidden   what you've gained, live
+                                         numbers (DeckKit.Measures) and what the game hid from the ledger
     decklink agent prompt [--list] [--seconds N] QUESTION OPTION OPTION [...]   ask Ben with a prompt in
                                          the game and wait for his answer (2 options: a dialog)
     decklink agent show KIND [--seconds N] [--item ID] TITLE TEXT   show something: KIND echo (TITLE
@@ -39,12 +48,22 @@ CHANNEL = 3
 VERSION = 1
 OP_STATE, OP_WAY, OP_CHAT, OP_FRIENDS, OP_ASK, OP_ANSWER, OP_SHOW, OP_QUESTS, OP_QUEST_STATUS, OP_WAYPOINTS, OP_CHECKLIST, OP_HOOKS, OP_EVENTS, OP_CHARACTER, OP_BAGS, OP_ITEM_INFO, OP_PRICES, OP_MARKS, OP_DISMISS = (
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)
+OP_PEOPLE, OP_INVITE = 20, 21
+OP_WIDGET, OP_LEDGER, OP_DISPLAYS = 22, 23, 24
+DISPLAY_KINDS = ["widget", "checklist", "card", "reading", "window"]  # DISPLAYS kind byte = index + 1
+WIDGET_ACTIONS = {"show": 1, "hide": 2, "list": 3, "delete": 4}
+LEDGER_KINDS = ["loot", "created", "coin", "money", "xp", "rep", "skill", "quest"]  # LEDGER totals byte 2 = index + 1
+MAX_MEASURES = 20
 ASK_RESULT = {1: "shown", 2: "queued"}
 NO_ANSWER = 255
 KEEPALIVE_S = 10  # the game closes the link after 30 s without a frame
 CHANNELS = ["say", "yell", "party", "raid", "guild", "whisper", "bnet", "instance"]  # CHAT byte 1 = index + 1
 CHAT_RESULT = {1: "sent", 2: "previewed", 3: "previewed after combat"}
 LISTS = ["bnet", "friends", "guild"]  # FRIENDS byte 1 bits
+PEOPLE_KINDS = ["whispers", "chat", "trades", "invites", "group", "target"]  # PEOPLE byte 1 bits
+# PEOPLE's entry kinds (People.lua) -> what the reply calls them.
+PERSON_KIND = {1: "whisper", 2: "bnet_whisper", 3: "chat", 4: "trade", 5: "invite", 6: "group", 7: "target"}
+DIRECTION = {1: "from_them", 2: "from_you"}
 FIELDS = ["pos", "world", "zone", "who", "combat", "brain", "voice", "target"]  # mask bit 0, 1, 2, ...
 BRAIN = {1: "haiku", 2: "sonnet", 3: "opus"}  # 0: the default
 # Inventory.lua's stat codes (keep in step).
@@ -132,6 +151,181 @@ def build_friends(lists=LISTS):
             raise ValueError("unknown list %r (lists: %s)" % (name, " ".join(LISTS)))
         mask |= 1 << LISTS.index(name)
     return bytes([op_byte(OP_FRIENDS), mask])
+
+
+def build_people(kinds=None, minutes=0):
+    mask = 0
+    for name in kinds or []:
+        if name not in PEOPLE_KINDS:
+            raise ValueError("unknown kind %r (kinds: %s)" % (name, " ".join(PEOPLE_KINDS)))
+        mask |= 1 << PEOPLE_KINDS.index(name)
+    if not 0 <= int(minutes) <= 255:
+        raise ValueError("minutes is 0-255")
+    return bytes([op_byte(OP_PEOPLE), mask, int(minutes)])
+
+
+def build_invite(name):
+    name = (name or "").strip()
+    if not name or any(c in name for c in "|\n\r\t"):
+        raise ValueError("invite needs a character name")
+    return bytes([op_byte(OP_INVITE)]) + _pstr(name, 64)
+
+
+def _json_field(value, limit=3500):
+    data = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    if len(data) > limit:
+        raise ValueError("over %d bytes of JSON (%d)" % (limit, len(data)))
+    return struct.pack(">H", len(data)) + data
+
+
+def build_widget(action, name="", spec=None, save=False, account=False, mark="", scope=None):
+    """WIDGET: show (a layout as a live tracker; saved as an action with save), hide, list or delete."""
+    if action not in WIDGET_ACTIONS:
+        raise ValueError("action is one of: " + " ".join(WIDGET_ACTIONS))
+    head = bytes([op_byte(OP_WIDGET), WIDGET_ACTIONS[action]])
+    if action == "list":
+        return head
+    name = (name or "").strip()
+    if not name or any(c in name for c in "|\n\r\t") or len(name.encode("utf-8")) > 40:
+        raise ValueError("a widget needs a name of 1-40 bytes")
+    if action == "hide":
+        return head + _pstr(name)
+    if action == "delete":
+        return head + bytes([{None: 0, "character": 1, "account": 2}[scope]]) + _pstr(name)
+    if not isinstance(spec, dict) or not isinstance(spec.get("type"), str):
+        raise ValueError("a widget is a DeckKit layout: an object with a type")
+    flags = (1 if save else 0) | (2 if account else 0)
+    return head + bytes([flags]) + _pstr(name) + _pstr(mark or "", 40) + _json_field(spec)
+
+
+def build_ledger(action, measures=None, kind=None, minutes=0, account=False):
+    """LEDGER: values (live numbers for DeckKit.Measures tables), totals (of a kind, by item / faction / skill) or
+    hidden (what the game withheld from the ledger this session)."""
+    if action == "values":
+        if not isinstance(measures, list) or not 1 <= len(measures) <= MAX_MEASURES:
+            raise ValueError("values needs 1-%d measures" % MAX_MEASURES)
+        if not all(isinstance(m, dict) and isinstance(m.get("measure"), str) for m in measures):
+            raise ValueError("each measure is an object with a measure name")
+        return bytes([op_byte(OP_LEDGER), 1]) + _json_field(measures)
+    if action == "totals":
+        if kind not in LEDGER_KINDS:
+            raise ValueError("kind is one of: " + " ".join(LEDGER_KINDS))
+        if not 0 <= int(minutes) <= 65535:
+            raise ValueError("minutes is 0-65535")
+        return struct.pack(">BBBHB", op_byte(OP_LEDGER), 2, LEDGER_KINDS.index(kind) + 1, int(minutes),
+                           1 if account else 0)
+    if action == "hidden":
+        return bytes([op_byte(OP_LEDGER), 3])
+    raise ValueError("action is one of: values totals hidden")
+
+
+def build_displays(action="list", kind=None, name=""):
+    """DISPLAYS: list what of hers is up (and her saved widgets), hide one, or hide all."""
+    if action == "list":
+        return bytes([op_byte(OP_DISPLAYS), 1])
+    if action == "hide-all":
+        return bytes([op_byte(OP_DISPLAYS), 3])
+    if action == "hide":
+        if kind not in DISPLAY_KINDS:
+            raise ValueError("kind is one of: " + " ".join(DISPLAY_KINDS))
+        if kind == "widget" and not (name or "").strip():
+            raise ValueError("hiding a widget needs its name")
+        return bytes([op_byte(OP_DISPLAYS), 2, DISPLAY_KINDS.index(kind) + 1]) + _pstr((name or "").strip(), 60)
+    raise ValueError("action is one of: list hide hide-all")
+
+
+def parse_displays(p, action):
+    reply = parse_reply(p)
+    if not reply.get("ok"):
+        return reply
+    i = 3
+    if action == "list":
+        (count,), i = _unpack(">B", p, i)
+        shown = []
+        for _ in range(count):
+            (kind,), i = _unpack(">B", p, i)
+            name, i = _string(p, i)
+            (flags,), i = _unpack(">B", p, i)
+            d = {"kind": DISPLAY_KINDS[kind - 1] if 1 <= kind <= len(DISPLAY_KINDS) else kind, "name": name,
+                 "on_screen": bool(flags & 4)}
+            if d["kind"] == "widget":
+                d["saved"] = bool(flags & 1)
+                if d["saved"]:
+                    d["scope"] = "account" if flags & 2 else "character"
+            shown.append(d)
+        reply["displays"] = shown
+    else:
+        (n,), i = _unpack(">B", p, i)
+        reply["hidden"] = n
+    return reply
+
+
+def _number(text):
+    if text == "":
+        return None
+    v = float(text)
+    return int(v) if v == int(v) else v
+
+
+def parse_widget(p, action):
+    reply = parse_reply(p)
+    if not reply.get("ok"):
+        return reply
+    i = 3
+    if action == "list":
+        (count,), i = _unpack(">B", p, i)
+        widgets = []
+        for _ in range(count):
+            name, i = _string(p, i)
+            (flags,), i = _unpack(">B", p, i)
+            widgets.append({"name": name, "scope": "account" if flags & 1 else "character", "shown": bool(flags & 2)})
+        reply["widgets"] = widgets
+    else:
+        (done,), i = _unpack(">B", p, i)
+        reply["done"] = done == 1
+    return reply
+
+
+def parse_ledger(p, action, keys=None):
+    reply = parse_reply(p)
+    if not reply.get("ok"):
+        return reply
+    i = 3
+    if action == "values":
+        (count,), i = _unpack(">B", p, i)
+        values = []
+        for _ in range(count):
+            text, i = _string(p, i)
+            values.append(_number(text))
+        reply["values"] = values
+    elif action == "totals":
+        (flags, count), i = _unpack(">BB", p, i)
+        totals = []
+        for _ in range(count):
+            key, i = _string(p, i)
+            amount, i = _string(p, i)
+            totals.append({"key": key, "amount": _number(amount)})
+        reply["totals"], reply["more"] = totals, bool(flags & 1)
+    else:
+        (count,), i = _unpack(">B", p, i)
+        rows = []
+        for _ in range(count):
+            kind, i = _string(p, i)
+            context, i = _string(p, i)
+            (seen, hidden), i = _unpack(">HH", p, i)
+            rows.append({"kind": kind, "context": context, "seen": seen, "hidden": hidden})
+        reply["hidden"] = rows
+    return reply
+
+
+def _trade_side(p, i):
+    (money, n), i = _unpack(">IB", p, i)
+    items = []
+    for _ in range(n):
+        name, i = _string(p, i)
+        (count,), i = _unpack(">H", p, i)
+        items.append({"name": name, "count": count})
+    return {"money": money, "items": items}, i
 
 
 def build_ask(question, options, as_list=False, seconds=30):
@@ -558,6 +752,36 @@ def parse_reply(p, asked=FIELDS):
                 raise Malformed("unknown entry kind %d" % kind)
             people.append(person)
         out["people"], out["more"] = people, bool(flags & 1)
+    elif out["op"] == OP_PEOPLE:
+        (flags, count), i = _unpack(">BB", p, i)
+        people = []
+        for _ in range(count):
+            (kind,), i = _unpack(">B", p, i)
+            if kind not in PERSON_KIND:
+                raise Malformed("unknown person kind %d" % kind)
+            name, i = _string(p, i)
+            (age,), i = _unpack(">H", p, i)
+            e = {"kind": PERSON_KIND[kind], "name": name, "seconds_ago": age}
+            if kind in (1, 2):
+                (direction,), i = _unpack(">B", p, i)
+                e["direction"] = DIRECTION.get(direction, direction)
+                if kind == 2:
+                    e["character"], i = _string(p, i)
+                e["text"], i = _string(p, i)
+            elif kind == 3:
+                e["channel"], i = _string(p, i)
+                e["text"], i = _string(p, i)
+            elif kind == 4:
+                e["they_gave"], i = _trade_side(p, i)
+                e["you_gave"], i = _trade_side(p, i)
+            elif kind == 6:
+                (gflags,), i = _unpack(">B", p, i)
+                e["leader"] = bool(gflags & 1)
+            people.append(e)
+        out["people"], out["more"] = people, bool(flags & 1)
+    elif out["op"] == OP_INVITE:
+        (sent,), i = _unpack(">B", p, i)
+        out["invited"] = sent == 1
     return out
 
 
@@ -666,6 +890,8 @@ BUILDERS = {
     "way": lambda r: build_way(r["map"], r["x"], r["y"]),
     "chat": lambda r: build_chat(r["channel"], r.get("target", ""), r["text"]),
     "friends": lambda r: build_friends(r.get("lists") or LISTS),
+    "people": lambda r: build_people(r.get("kinds"), r.get("minutes", 0)),
+    "invite": lambda r: build_invite(r["name"]),
     "character": lambda r: build_character(),
     "bags": lambda r: build_bags(r.get("bank", False)),
     "item-info": lambda r: build_item_info(r["items"]),
@@ -677,7 +903,7 @@ BUILDERS = {
     "show": lambda r: build_show(r["kind"], r.get("title", ""), r.get("text", ""), r.get("seconds"),
                                  r.get("item", 0)),
 }
-COMMANDS = set(BUILDERS) | {"state", "quest-status", "prompt", "layout"}
+COMMANDS = set(BUILDERS) | {"state", "quest-status", "prompt", "layout", "widget", "ledger", "displays"}
 
 
 def prepare(req):
@@ -689,6 +915,20 @@ def prepare(req):
         if bad:
             raise ValueError("unknown field %s (fields: %s)" % (", ".join(bad), " ".join(FIELDS)))
         return Prepared(cmd, build_state(fields), lambda p: parse_reply(p, fields))
+    if cmd == "widget":
+        action = req.get("action", "list")
+        packet = build_widget(action, req.get("name", ""), req.get("spec"), req.get("save", False),
+                              req.get("account", False), req.get("mark", ""), req.get("scope"))
+        return Prepared(cmd, packet, lambda p: parse_widget(p, action))
+    if cmd == "displays":
+        action = req.get("action", "list")
+        return Prepared(cmd, build_displays(action, req.get("kind"), req.get("name", "")),
+                        lambda p: parse_displays(p, action))
+    if cmd == "ledger":
+        action = req.get("action", "hidden")
+        packet = build_ledger(action, req.get("measures"), req.get("kind"), req.get("minutes", 0),
+                              req.get("account", False))
+        return Prepared(cmd, packet, lambda p: parse_ledger(p, action))
     if cmd == "quest-status":
         ids = [int(i) for i in req["ids"]]
 
@@ -758,6 +998,56 @@ def _request_for(argv):
         return {"cmd": "chat", "channel": argv[1], "target": argv[2], "text": argv[3]}
     if argv[0] == "friends":
         return {"cmd": "friends", "lists": argv[1:] or LISTS}
+    if argv[0] == "people":
+        rest, minutes = list(argv[1:]), 0
+        if rest[:1] == ["--minutes"] and len(rest) > 1:
+            rest.pop(0)
+            minutes = int(rest.pop(0))
+        return {"cmd": "people", "kinds": rest, "minutes": minutes}
+    if argv[0] == "invite" and len(argv) == 2:
+        return {"cmd": "invite", "name": argv[1]}
+    if argv[0] == "widget" and len(argv) >= 2:
+        action, rest = argv[1], list(argv[2:])
+        req = {"cmd": "widget", "action": action}
+        while rest and rest[0].startswith("--"):
+            flag = rest.pop(0)
+            if flag == "--save":
+                req["save"] = True
+            elif flag == "--account":
+                req["account"], req["scope"] = True, "account"
+            elif flag == "--character":
+                req["scope"] = "character"
+            elif flag == "--mark" and rest:
+                req["mark"] = rest.pop(0)
+            else:
+                return None
+        if action == "list" and not rest:
+            return req
+        if action in ("hide", "delete") and len(rest) == 1:
+            req["name"] = rest[0]
+            return req
+        if action == "show" and len(rest) == 2:
+            req["name"], req["spec"] = rest[0], json.loads(rest[1])
+            return req
+        return None
+    if argv[0] == "displays":
+        if len(argv) == 1:
+            return {"cmd": "displays", "action": "list"}
+        if argv[1] == "hide-all" and len(argv) == 2:
+            return {"cmd": "displays", "action": "hide-all"}
+        if argv[1] == "hide" and len(argv) in (3, 4):
+            return {"cmd": "displays", "action": "hide", "kind": argv[2], "name": argv[3] if len(argv) == 4 else ""}
+        return None
+    if argv[0] == "ledger" and len(argv) >= 2:
+        if argv[1] == "values" and len(argv) == 3:
+            return {"cmd": "ledger", "action": "values", "measures": json.loads(argv[2])}
+        if argv[1] == "totals" and len(argv) >= 3:
+            rest = [a for a in argv[3:] if a != "--account"]
+            return {"cmd": "ledger", "action": "totals", "kind": argv[2], "minutes": int(rest[0]) if rest else 0,
+                    "account": "--account" in argv}
+        if argv[1] == "hidden" and len(argv) == 2:
+            return {"cmd": "ledger", "action": "hidden"}
+        return None
     if argv[0] == "prompt":
         rest, as_list, seconds = list(argv[1:]), False, 30
         while rest and rest[0].startswith("--"):

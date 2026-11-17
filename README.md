@@ -16,7 +16,7 @@ Every addon here needs the DeckKit core (`## Dependencies: DeckKit`).
 | **DeckLink** | A two-way data link between a program on the Deck and addons: key taps in, colored cells on screen out. `/deckkit link` shows how it's going. |
 | **DeckDictation** | Decktation's exact state (recording, transcribing, done, error) for DeckKit's dictation indicator, from Decktation's status hook (`deck-setup/decktation-hook.sh`, installed as `decklink-decktation-hook`). |
 | **DeckTelemetry** | The Deck's battery, charging, power, temperatures, fan and CPU/GPU/memory load, for other addons to show (it draws nothing itself). `/deckkit telemetry` prints the latest. |
-| **DeckAgent** | The game side of DeckAgent, a gaming assistant you ask things by voice ("give me a waypoint to the nearest priest trainer"). Through a fixed list of requests it reads where you are, your target, quest log, character, bags and prices and who's online; sets and removes waypoints (through WayPad); sends chat for you (or previews it for your A press); asks you with a prompt; shows its answers on a card, a reading view or a self-ticking checklist; flags items in your bags (PackPad); and keeps hooks that tell it when something happens. `/deckkit agent`. See [DeckAgent](#deckagent). |
+| **DeckAgent** | The game side of DeckAgent, a gaming assistant you ask things by voice ("give me a waypoint to the nearest priest trainer"). Through a fixed list of requests it reads where you are, your target, quest log, character, bags and prices, who's online and who you've just been dealing with (whispers, chat, trades, invites); sets and removes waypoints (through WayPad); sends chat for you (or previews it for your A press) and party invites; asks you with a prompt; shows its answers on a card, a reading view or a self-ticking checklist; flags items in your bags (PackPad); and keeps hooks that tell it when something happens. `/deckkit agent`. See [DeckAgent](#deckagent). |
 
 ## DeckLink
 
@@ -139,6 +139,8 @@ deckagent "give me a waypoint to the nearest priest trainer"
   |---|---|
   | the packet and reply framing, STATE (1), WAY (2), WAYPOINTS (10) | `addons/DeckAgent/Agent.lua` |
   | CHAT (3), FRIENDS (4) | `addons/DeckAgent/Chat.lua` |
+  | PEOPLE (20), INVITE (21) | `addons/DeckAgent/People.lua` |
+  | WIDGET (22), LEDGER (23), DISPLAYS (24) | `addons/DeckAgent/Widgets.lua` |
   | ASK (5), ANSWER (6), DISMISS (19) | `addons/DeckAgent/Ask.lua` |
   | SHOW (7: echo, card, reading view) | `addons/DeckAgent/Show.lua` |
   | QUESTS (8), QUEST_STATUS (9) | `addons/DeckAgent/Quests.lua` |
@@ -181,7 +183,8 @@ Every key the setup binds, across DeckKit, DeckKitAfterDark, Decktation and the 
 | F1 / F2 / F3 / F4 | the Steam layout, while grip L4 / R4 / L5 / R5 is held | DeckKit grip chords |
 | F5 / F6 / F7 / F8 | the Steam layout, once L4 / R4 / L5 / R5 has been held 0.4 s | DeckKit grip chord holds |
 | F9 / F10 | a DeckLink program (ydotool or xdotool) | DeckLink bits 0 / 1 (free without DeckLink) |
-| F11, F12 | | spare |
+| F11 | the Steam layout, a trackpad click | DeckKit's PadTouchGrid: fires the lit cell (bound only while the grids are open) |
+| F12 | | spare |
 | Ctrl+Shift+F1-F5, F11, F12 | `deckctl` (AddonTools, dev only, while DeckDev is installed) | receive, commit, cancel, export, load inbox slot, strip on, reload |
 
 Reload UI has no key: it's on a grip slot. Decktation reads the controller directly and types its text

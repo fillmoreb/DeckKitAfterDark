@@ -252,6 +252,28 @@ class MCPServer(unittest.TestCase):
             return host.parse_reply(b"\x43\x01\x00\x01")
         if args[0] == "friends":
             return host.parse_reply(b"\x44\x01\x00\x00\x01\x02\x05Grunt\x14\x07Warrior\x07Durotar")
+        if args[0] == "people":
+            return {"ok": True, "more": False, "people": [
+                {"kind": "trade", "name": "Thrallbro", "seconds_ago": 40,
+                 "they_gave": {"money": 0, "items": [{"name": "Linen Bag", "count": 1}]},
+                 "you_gave": {"money": 0, "items": []}},
+                {"kind": "whisper", "name": "Grunt", "seconds_ago": 90, "direction": "from_them", "text": "group?"},
+                {"kind": "bnet_whisper", "name": "Edna#1234", "seconds_ago": 300, "direction": "from_them",
+                 "character": "Ednalyn", "text": "SFK?"}]}
+        if args[0] == "invite":
+            return host.parse_reply(b"\x55\x01\x00\x01")
+        if args[0] == "widget":
+            if args[1] == "list":
+                return host.parse_widget(b"\x56\x01\x00\x01\x04Haul\x02", "list")
+            return host.parse_widget(b"\x56\x01\x00\x01", args[1])
+        if args[0] == "displays":
+            if len(args) == 1:
+                return host.parse_displays(b"\x58\x01\x00\x02\x01\x04Haul\x05\x02\x0bMining haul\x04", "list")
+            return host.parse_displays(b"\x58\x01\x00\x01", "hide")
+        if args[0] == "ledger":
+            if args[1] == "values":
+                return host.parse_ledger(b"\x57\x01\x00\x02\x0214\x05" + b"90.50", "values")
+            return host.parse_ledger(b"\x57\x01\x00\x00\x02\x042318\x0214\x042770\x013", "totals")
         return host.parse_reply(b"\x42\x01\x00\x01\x00\x03")
 
     def call(self, name, args):
@@ -269,7 +291,7 @@ class MCPServer(unittest.TestCase):
         names = [t["name"] for t in mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]]
         self.assertEqual(names, ["get_player_state", "find_npc", "set_waypoint", "get_waypoints",
                                  "remove_waypoints", "send_chat", "get_online",
-                                 "ask_player", "get_quests", "find_quests", "get_character", "get_bags", "find_items", "flag_items", "clear_flags", "get_prices", "get_item_info", "set_hook", "list_hooks", "remove_hook", "track_checklist", "show_layout", "clear_checklist", "respond", "remember", "remember_fact",
+                                 "get_people", "invite_to_group", "ask_player", "get_quests", "find_quests", "get_character", "get_bags", "find_items", "flag_items", "clear_flags", "get_prices", "get_item_info", "set_hook", "list_hooks", "remove_hook", "track_checklist", "show_layout", "show_widget", "delete_widget", "list_displays", "hide_display", "clear_screen", "read_numbers", "get_ledger", "clear_checklist", "respond", "remember", "remember_fact",
                                  "recall", "forget_fact"])
         self.assertEqual(mcp_server.handle({"jsonrpc": "2.0", "id": 3, "method": "nope"})["error"]["code"], -32601)
 
@@ -353,6 +375,63 @@ class MCPServer(unittest.TestCase):
         self.assertEqual(out["people"], [{"list": "friends", "name": "Grunt", "level": 20, "class": "Warrior",
                                           "zone": "Durotar"}])
         self.assertEqual(self.calls[-1], ("friends", "friends"))
+
+    def test_get_people_merges_recent_and_online_by_person(self):
+        out, err = self.call("get_people", {})
+        self.assertFalse(err)
+        self.assertEqual([p["name"] for p in out["people"]], ["Thrallbro", "Grunt", "Ednalyn"])
+        grunt = out["people"][1]
+        self.assertEqual([r["kind"] for r in grunt["reasons"]], ["whisper", "friends_online"])
+        self.assertEqual(out["people"][2]["battletag"], "Edna#1234")  # named by the character she's on
+        self.assertEqual(out["people"][0]["reasons"][0]["they_gave"]["items"][0]["name"], "Linen Bag")
+        self.assertEqual(self.calls[-2], ("people", "whispers", "chat", "trades", "invites", "group", "target"))
+        self.assertEqual(self.calls[-1], ("friends", "friends", "guild", "bnet"))
+
+    def test_get_people_asks_only_for_what_it_needs(self):
+        self.call("get_people", {"kinds": ["trades"], "minutes": 5})
+        self.assertEqual(self.calls, [("people", "--minutes", "5", "trades")])
+        self.calls.clear()
+        self.call("get_people", {"kinds": ["guild"]})
+        self.assertEqual(self.calls, [("friends", "guild")])
+
+    def test_invite_to_group(self):
+        out, err = self.call("invite_to_group", {"name": " Jessejames "})
+        self.assertEqual((err, out), (False, {"invited": "Jessejames"}))
+        self.assertEqual(self.calls[-1], ("invite", "Jessejames"))
+
+    def test_widget_tools(self):
+        layout = {"type": "list", "title": "Haul", "items": [
+            {"type": "stat", "text": "Light Leather", "bind": {"measure": "looted", "item": 2318, "since": "haul"}}]}
+        out, err = self.call("show_widget", {"name": "Haul", "layout": layout, "mark": "haul", "save": True})
+        self.assertEqual((err, out["saved"], out["scope"]), (False, True, "character"))
+        self.assertEqual(self.calls[-1][:6], ("widget", "show", "--save", "--mark", "haul", "Haul"))
+        self.assertEqual(json.loads(self.calls[-1][6]), layout)
+        self.call("show_widget", {"name": "XP", "layout": layout, "scope": "account"})
+        self.assertEqual(self.calls[-1][:3], ("widget", "show", "--account"))  # account only matters when saved
+        out, _ = self.call("list_displays", {})
+        self.assertEqual(out["displays"], [{"kind": "widget", "name": "Haul", "on_screen": True, "saved": True,
+                                            "scope": "character"},
+                                           {"kind": "checklist", "name": "Mining haul", "on_screen": True}])
+        self.call("delete_widget", {"name": "Haul", "scope": "account"})
+        self.assertEqual(self.calls[-1], ("widget", "delete", "--account", "Haul"))
+        out, _ = self.call("hide_display", {"kind": "widget", "name": "Haul"})
+        self.assertEqual((out["hidden"], self.calls[-1]), (True, ("displays", "hide", "widget", "Haul")))
+        out, err = self.call("hide_display", {"kind": "widget"})
+        self.assertTrue(err)  # a widget needs its name
+        self.call("hide_display", {"kind": "checklist"})
+        self.assertEqual(self.calls[-1], ("displays", "hide", "checklist"))
+        out, _ = self.call("clear_screen", {})
+        self.assertEqual((out["hidden"], self.calls[-1]), (1, ("displays", "hide-all")))
+
+    def test_read_numbers_and_ledger(self):
+        out, err = self.call("read_numbers", {"measures": [{"measure": "looted", "item": 2318},
+                                                           {"measure": "looted", "item": 2318, "per": "hour"}]})
+        self.assertEqual((err, out["values"]), (False, [14, 90.5]))
+        with mock.patch.object(mcp_server, "_names", lambda ids: {2318: "Light Leather", 2770: "Copper Ore"}):
+            out, _ = self.call("get_ledger", {"kind": "loot", "minutes": 60})
+        self.assertEqual(out["totals"], [{"item_id": 2318, "name": "Light Leather", "count": 14},
+                                         {"item_id": 2770, "name": "Copper Ore", "count": 3}])
+        self.assertEqual(self.calls[-1], ("ledger", "totals", "loot", "60"))
 
     def test_game_errors_are_tool_errors(self):
         def broken(*a, **k):
@@ -873,6 +952,222 @@ class ChatOps(unittest.TestCase):
         reply, _ = self.send(host.build_friends(["guild"]), setup)
         self.assertTrue(reply["more"])
         self.assertLess(len(reply["people"]), 60)
+
+
+class PeopleOps(unittest.TestCase):
+    """PEOPLE and INVITE (addons/DeckAgent/People.lua <-> decklink/agent.py)."""
+    # The game as these scenarios need it: names with your realm shortened, a secret stand-in, a trade partner,
+    # a party, a player target.
+    WORLD = ('Ambiguate = function(n) return (n:gsub("%-Realm$", "")) end'
+             ' SECRET = newproxy() issecretvalue = function(v) return v == SECRET end'
+             ' ERR_TRADE_COMPLETE = "Trade complete."'
+             ' NAMES = {player = "Lucien", NPC = "Thrallbro", party1 = "Grunt", party2 = "Zug", target = "Jessejames"}'
+             ' UnitName = function(u) return NAMES[u] end'
+             ' UnitIsGroupLeader = function(u) return u == "party2" end'
+             ' GetNumGroupMembers = function() return 3 end'
+             ' INVITED = {} C_PartyInfo = {InviteUnit = function(n) print("INVITE", n) end}')
+
+    def send(self, packet, setup="", after=""):
+        frame = codec.build(host.CHANNEL, 7, packet)
+        lines, s = Game.run("login() " + self.WORLD + " " + setup + " " + hello()
+                            + ' taps("%s") frame() ' % bitstr(frame) + after)
+        reply = host.parse_reply(codec.parse(s.out)[2]) if s and s.out else None
+        return reply, lines
+
+    def test_packets(self):
+        self.assertEqual(host.build_people(), b"\x54\x00\x00")
+        self.assertEqual(host.build_people(["whispers", "trades"], 5), b"\x54\x05\x05")
+        self.assertEqual(host.build_invite(" Jessejames "), b"\x55\x0aJessejames")
+        for bad in (lambda: host.build_people(["buffs"]), lambda: host.build_people(minutes=300),
+                    lambda: host.build_invite(""), lambda: host.build_invite("a|cff")):
+            with self.assertRaises(ValueError):
+                bad()
+
+    def test_whispers_both_ways_newest_first(self):
+        setup = ('fireEvent("CHAT_MSG_WHISPER", "want to group for RFC?", "Jessejames-Realm")'
+                 ' later(30) fireEvent("CHAT_MSG_WHISPER_INFORM", "sure, inv in a sec", "Grunt-Other")')
+        reply, _ = self.send(host.build_people(["whispers"]), setup)
+        self.assertEqual(reply["people"], [
+            {"kind": "whisper", "name": "Grunt-Other", "seconds_ago": 0, "direction": "from_you",
+             "text": "sure, inv in a sec"},
+            {"kind": "whisper", "name": "Jessejames", "seconds_ago": 30, "direction": "from_them",
+             "text": "want to group for RFC?"}])
+
+    def test_chat_is_cleaned_named_by_channel_and_kept_two_minutes(self):
+        link = "|cff1eff00|Hitem:4245::::::::13:::::::|h[Small Silk Pack]|h|r"
+        setup = ('fireEvent("CHAT_MSG_CHANNEL", "WTS %s cheap", "Seller-Realm", "", "2. Trade - City", "", "", 0, 2,'
+                 ' "Trade") fireEvent("CHAT_MSG_SAY", "hi", "Lucien-Realm")'
+                 ' later(100) fireEvent("CHAT_MSG_SAY", "anyone for RFC", "Healer-Realm")' % link)
+        reply, _ = self.send(host.build_people(["chat"]), setup)
+        self.assertEqual(reply["people"], [
+            {"kind": "chat", "name": "Healer", "seconds_ago": 0, "channel": "Say", "text": "anyone for RFC"},
+            {"kind": "chat", "name": "Seller", "seconds_ago": 100, "channel": "Trade",
+             "text": "WTS [Small Silk Pack] cheap"}])  # your own line isn't listed
+        reply, _ = self.send(host.build_people(["chat"]), setup + ' later(30)')
+        self.assertEqual([p["name"] for p in reply["people"]], ["Healer"])  # Seller is 130 s old: gone
+        reply, _ = self.send(host.build_people(["chat"], minutes=1), setup + ' later(30)')
+        self.assertEqual([p["name"] for p in reply["people"]], ["Healer"])
+
+    def test_a_finished_trade_says_what_each_side_gave(self):
+        setup = ('THEIRS = {{"Linen Bag", 1}} MINE = {{"Linen Cloth", 20}}'
+                 ' GetTradeTargetItemInfo = function(i) local t = THEIRS[i]; if t then return t[1], 1, t[2] end end'
+                 ' GetTradePlayerItemInfo = function(i) local t = MINE[i]; if t then return t[1], 1, t[2] end end'
+                 ' GetTargetTradeMoney = function() return "0" end GetPlayerTradeMoney = function() return "500" end'
+                 ' fireEvent("TRADE_SHOW") fireEvent("TRADE_TARGET_ITEM_CHANGED", 1) fireEvent("TRADE_ACCEPT_UPDATE", 1, 1)')
+        reply, _ = self.send(host.build_people(["trades"]), setup)
+        self.assertEqual(reply["people"], [])  # not finished yet
+        reply, _ = self.send(host.build_people(["trades"]), setup + ' fireEvent("UI_INFO_MESSAGE", 0, "Trade cancelled.")')
+        self.assertEqual(reply["people"], [])  # another message isn't the end of a trade
+        reply, _ = self.send(host.build_people(["trades"]), setup + ' fireEvent("UI_INFO_MESSAGE", 0, "Trade complete.")')
+        self.assertEqual(reply["people"], [{"kind": "trade", "name": "Thrallbro", "seconds_ago": 0,
+            "they_gave": {"money": 0, "items": [{"name": "Linen Bag", "count": 1}]},
+            "you_gave": {"money": 500, "items": [{"name": "Linen Cloth", "count": 20}]}}])
+
+    def test_invites_group_and_target(self):
+        setup = ('fireEvent("PARTY_INVITE_REQUEST", "Jessejames-Realm") GROUP = true'
+                 ' TARGET = {guid = "Player-1-2", player = true}')
+        reply, _ = self.send(host.build_people(), setup)
+        kinds = {(p["kind"], p["name"]) for p in reply["people"]}
+        self.assertEqual(kinds, {("invite", "Jessejames"), ("group", "Grunt"), ("group", "Zug"),
+                                 ("target", "Jessejames")})
+        self.assertEqual([p["leader"] for p in reply["people"] if p["kind"] == "group"], [False, True])
+
+    def test_battle_net_whispers_by_battletag_never_real_name(self):
+        setup = ('C_BattleNet.GetAccountInfoByID = function(id) if id == 77 then return {battleTag = "Edna#1234",'
+                 ' gameAccountInfo = {clientProgram = "WoW", characterName = "Ednalyn"}} end end'
+                 ' fireEvent("CHAT_MSG_BN_WHISPER", "SFK?", "Edna Realname", "", "", "", "", 0, 0, "", 0, 1, "", 77)')
+        reply, _ = self.send(host.build_people(["whispers"]), setup)
+        self.assertEqual(reply["people"], [{"kind": "bnet_whisper", "name": "Edna#1234", "seconds_ago": 0,
+                                            "direction": "from_them", "character": "Ednalyn", "text": "SFK?"}])
+
+    def test_hidden_values_are_skipped(self):
+        setup = ('fireEvent("CHAT_MSG_WHISPER", "hi", SECRET) fireEvent("CHAT_MSG_SAY", SECRET, "Talker-Realm")')
+        reply, lines = self.send(host.build_people(), setup, 'print("ERRORS", errorsSeen())')
+        self.assertEqual(reply["people"], [{"kind": "chat", "name": "Talker", "seconds_ago": 0, "channel": "Say",
+                                            "text": ""}])
+        self.assertIn("ERRORS\t0", lines)
+
+    def test_too_many_says_more_and_chat_goes_last(self):
+        setup = ('fireEvent("CHAT_MSG_WHISPER", "group?", "Jessejames-Realm") later(60)'
+                 ' for i = 1, 40 do fireEvent("CHAT_MSG_SAY", string.rep("blah ", 20), "Talker" .. i .. "-Realm") end')
+        reply, _ = self.send(host.build_people(), setup)
+        self.assertTrue(reply["more"])
+        self.assertLess(len(reply["people"]), 41)
+        self.assertEqual(reply["people"][0]["name"], "Jessejames")  # an older whisper isn't crowded out by chat
+
+    def test_invite(self):
+        reply, lines = self.send(host.build_invite("Jessejames"))
+        self.assertEqual((reply["ok"], reply["invited"]), (True, True))
+        self.assertIn("INVITE\tJessejames", lines)
+        reply, lines = self.send(host.build_invite("Jessejames"), 'GROUP = true')
+        self.assertEqual(reply["reason"], "you're not the group leader")
+        self.assertNotIn("INVITE\tJessejames", lines)
+        reply, _ = self.send(host.build_invite("Jessejames"), 'GROUP = true UnitIsGroupLeader = function() return true end'
+                             ' GetNumGroupMembers = function() return 5 end')
+        self.assertEqual(reply["reason"], "your group is full")
+
+
+class WidgetOps(unittest.TestCase):
+    """WIDGET and LEDGER (addons/DeckAgent/Widgets.lua <-> decklink/agent.py), over DeckKit's real Ledger, Measures
+    and Widgets."""
+    WORLD = ('LOOT_ITEM_SELF = "You receive loot: %s." LOOT_ITEM_SELF_MULTIPLE = "You receive loot: %sx%d."'
+             ' function LOOT(id, n) fireEvent("CHAT_MSG_LOOT", LOOT_ITEM_SELF_MULTIPLE:format('
+             '"|cffffffff|Hitem:" .. id .. "::::::::|h[Item]|h|r", n)) end')
+
+    def send(self, packet, setup="", after=""):
+        frame = codec.build(host.CHANNEL, 7, packet)
+        lines, s = Game.run(self.WORLD + " login() " + setup + " " + hello()
+                            + ' taps("%s") frame() ' % bitstr(frame) + after)
+        return (codec.parse(s.out)[2] if s and s.out else None), lines
+
+    LAYOUT = {"type": "list", "title": "Haul", "items": [
+        {"type": "stat", "text": "Light Leather", "bind": {"measure": "looted", "item": 2318, "since": "haul"}}]}
+
+    def test_packets(self):
+        p = host.build_widget("show", "Haul", self.LAYOUT, save=True, mark="haul")
+        self.assertEqual(p[:3], bytes([0x56, 1, 1]))
+        self.assertEqual(p[3:13], b"\x04Haul\x04haul")
+        self.assertEqual(json.loads(p[15:]), self.LAYOUT)
+        self.assertEqual(struct.unpack(">H", p[13:15])[0], len(p) - 15)
+        self.assertEqual(host.build_widget("list"), b"\x56\x03")
+        self.assertEqual(host.build_widget("delete", "Haul", scope="account"), b"\x56\x04\x02\x04Haul")
+        self.assertEqual(host.build_ledger("totals", kind="loot", minutes=60, account=True), b"\x57\x02\x01\x00\x3c\x01")
+        self.assertEqual(host.build_ledger("hidden"), b"\x57\x03")
+        for bad in (lambda: host.build_widget("show", "", self.LAYOUT), lambda: host.build_widget("show", "X", ["nope"]),
+                    lambda: host.build_widget("show", "X" * 41, self.LAYOUT),
+                    lambda: host.build_ledger("values", []), lambda: host.build_ledger("totals", kind="kills"),
+                    lambda: host.build_ledger("values", [{"no": "measure"}])):
+            with self.assertRaises(ValueError):
+                bad()
+
+    def test_show_saved_widget_offers_an_action_and_counts_from_its_mark(self):
+        packet = host.build_widget("show", "Haul", self.LAYOUT, save=True, mark="haul")
+        reply, lines = self.send(packet, 'LOOT(2318, 5) later(1)', 'print("SHOWN", tostring(DeckKit.Widgets.Shown("Haul")))'
+                                 ' print("OFFER", tostring(OFFERS["WIDGET:Haul"] ~= nil)) LOOT(2318, 3)'
+                                 ' print("COUNT", DeckKit.Measures.Value({ measure = "looted", item = 2318, since = "haul" }))'
+                                 ' print("SAVED", tostring(DeckKitCharDB.widgets.Haul ~= nil))')
+        self.assertTrue(host.parse_widget(reply, "show")["done"])
+        for line in ("SHOWN\ttrue", "OFFER\ttrue", "COUNT\t3", "SAVED\ttrue"):
+            self.assertIn(line, lines)
+
+    def test_unsaved_widget_isnt_kept(self):
+        reply, lines = self.send(host.build_widget("show", "Peek", self.LAYOUT), "",
+                                 'print("SHOWN", tostring(DeckKit.Widgets.Shown("Peek")))'
+                                 ' print("SAVED", tostring(next(DeckKitCharDB.widgets) ~= nil))'
+                                 ' print("OFFERS", tostring(next(OFFERS) ~= nil))')
+        self.assertTrue(host.parse_widget(reply, "show")["done"])
+        for line in ("SHOWN\ttrue", "SAVED\tfalse", "OFFERS\tfalse"):
+            self.assertIn(line, lines)
+
+    def test_list_and_delete(self):
+        setup = ('DeckKit.Widgets.Save("Haul", { type = "list", items = {} })'
+                 ' DeckKit.Widgets.Save("XP", { type = "list", items = {} }, { scope = "account" })')
+        reply, _ = self.send(host.build_widget("list"), setup)
+        self.assertEqual(host.parse_widget(reply, "list")["widgets"], [
+            {"name": "Haul", "scope": "character", "shown": False}, {"name": "XP", "scope": "account", "shown": False}])
+        reply, lines = self.send(host.build_widget("delete", "Haul"), setup, 'print("LEFT", #DeckKit.Widgets.List())')
+        self.assertTrue(host.parse_widget(reply, "delete")["done"])
+        self.assertIn("LEFT\t1", lines)
+        reply, _ = self.send(host.build_widget("delete", "Nope"), setup)
+        self.assertEqual(host.parse_widget(reply, "delete")["reason"], "no widget Nope")
+
+    def test_displays_lists_everything_of_hers_and_takes_it_down(self):
+        setup = ('DeckKit.Widgets.Save("Haul", { type = "list", items = {} })'
+                 ' DeckKit.Widgets.ShowSpec("Test haul", { type = "list", items = {} })'
+                 ' DeckAgentDB.checklist = { title = "Mining haul", items = {} } DeckKit.UI.ShowTracker({ type = "list" })')
+        reply, _ = self.send(host.build_displays(), setup)
+        self.assertEqual(host.parse_displays(reply, "list")["displays"], [
+            {"kind": "widget", "name": "Haul", "on_screen": False, "saved": True, "scope": "character"},
+            {"kind": "widget", "name": "Test haul", "on_screen": True, "saved": False},  # one she doesn't remember
+            {"kind": "checklist", "name": "Mining haul", "on_screen": True}])
+        reply, lines = self.send(host.build_displays("hide", "widget", "Test haul"), setup,
+                                 'print("UP", tostring(DeckKit.Widgets.Shown("Test haul")))')
+        self.assertEqual(host.parse_displays(reply, "hide")["hidden"], 1)
+        self.assertIn("UP\tfalse", lines)
+        reply, _ = self.send(host.build_displays("hide", "widget", "Haul"), setup)
+        self.assertEqual(host.parse_displays(reply, "hide")["hidden"], 0)  # saved but not up: nothing to hide
+        reply, lines = self.send(host.build_displays("hide-all"), setup,
+                                 'print("LEFT", #DeckKit.Widgets.List(), tostring(DeckAgentDB.checklist))')
+        self.assertEqual(host.parse_displays(reply, "hide-all")["hidden"], 2)  # the unsaved widget and the checklist
+        self.assertIn("LEFT\t1\tnil", lines)  # the saved widget is still saved
+        self.assertEqual(host.build_displays("hide", "card"), b"\x58\x02\x03\x00")
+        with self.assertRaises(ValueError):
+            host.build_displays("hide", "widget", "")
+
+    def test_values_totals_and_hidden(self):
+        setup = 'DeckKit.Ledger.Mark("haul") LOOT(2318, 4) LOOT(2770, 2) LOOT(2318, 1)'
+        reply, _ = self.send(host.build_ledger("values", [{"measure": "looted", "item": 2318, "since": "haul"},
+                                                          {"measure": "looted", "since": "nope"}]), setup)
+        self.assertEqual(host.parse_ledger(reply, "values")["values"], [5, None])
+        reply, _ = self.send(host.build_ledger("totals", kind="loot"), setup)
+        self.assertEqual(host.parse_ledger(reply, "totals")["totals"], [{"key": "2318", "amount": 5},
+                                                                        {"key": "2770", "amount": 2}])
+        hidden = ('SECRET = newproxy() issecretvalue = function(v) return v == SECRET end combat(true)'
+                  ' fireEvent("CHAT_MSG_LOOT", SECRET) combat(false) issecretvalue = nil')
+        reply, _ = self.send(host.build_ledger("hidden"), setup + " " + hidden)
+        rows = {(r["kind"], r["context"]): (r["seen"], r["hidden"]) for r in host.parse_ledger(reply, "hidden")["hidden"]}
+        self.assertEqual(rows[("loot", "combat/world")], (1, 1))
+        self.assertEqual(rows[("loot", "calm/world")], (3, 0))
 
 
 class Conversation(unittest.TestCase):

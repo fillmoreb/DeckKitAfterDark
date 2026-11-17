@@ -21,7 +21,10 @@ from agent import common, memory  # noqa: E402
 
 TOOLS = ["mcp__deckagent__get_player_state", "mcp__deckagent__find_npc", "mcp__deckagent__set_waypoint", "mcp__deckagent__get_waypoints",
          "mcp__deckagent__remove_waypoints",
-         "mcp__deckagent__send_chat", "mcp__deckagent__get_online", "mcp__deckagent__ask_player",
+         "mcp__deckagent__send_chat", "mcp__deckagent__get_online", "mcp__deckagent__get_people",
+         "mcp__deckagent__invite_to_group", "mcp__deckagent__ask_player",
+         "mcp__deckagent__show_widget", "mcp__deckagent__delete_widget", "mcp__deckagent__list_displays",
+         "mcp__deckagent__hide_display", "mcp__deckagent__clear_screen", "mcp__deckagent__read_numbers", "mcp__deckagent__get_ledger",
          "mcp__deckagent__remember", "mcp__deckagent__remember_fact", "mcp__deckagent__recall",
          "mcp__deckagent__forget_fact", "mcp__deckagent__get_quests", "mcp__deckagent__find_quests", "mcp__deckagent__respond",
          "mcp__deckagent__track_checklist", "mcp__deckagent__clear_checklist", "mcp__deckagent__show_layout",
@@ -30,7 +33,7 @@ TOOLS = ["mcp__deckagent__get_player_state", "mcp__deckagent__find_npc", "mcp__d
          "mcp__deckagent__flag_items", "mcp__deckagent__clear_flags", "mcp__deckagent__set_hook", "mcp__deckagent__list_hooks", "mcp__deckagent__remove_hook"]
 # Built-in tools: the web, and its own notes. Read/Edit/Write are allowed only inside its folder (the
 # working directory, ~/.deckagent): anything elsewhere would need an approval -p can't give, so it's denied.
-BUILTIN = "WebSearch,WebFetch,Read,Edit,Write"
+BUILTIN = "WebSearch,WebFetch,Read,Edit,Write,Skill"  # Skill: her own skills (.claude/skills in her folder)
 OWN_FILES = ["Read(./**)", "Edit(./**)", "Write(./**)"]
 
 
@@ -237,7 +240,7 @@ def run_claude(question, mcp, model, verbose, resume=None):
     claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")  # services' PATH lacks ~/.local/bin
     cmd = [claude, "-p", question, "--output-format", "stream-json", "--verbose",
            "--strict-mcp-config", "--mcp-config", mcp, "--tools", BUILTIN,
-           "--allowedTools", ",".join(TOOLS + ["WebSearch", "WebFetch"] + OWN_FILES),
+           "--allowedTools", ",".join(TOOLS + ["WebSearch", "WebFetch", "Skill"] + OWN_FILES),
            "--setting-sources", "project",
            "--append-system-prompt-file", os.path.join(HERE, "SYSTEM.md")]
     if model:
