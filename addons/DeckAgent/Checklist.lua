@@ -12,7 +12,7 @@
 -- It shows in DeckKit's tracker (UI.ShowTracker: top left, the quest tracker's marks; DeckAgent's card
 -- moves to its right while it's up). It takes no buttons. A newly done item ticks with the quest-complete sound; once
 -- all are done it fades out after a minute. It survives a reload (DeckAgentDB.checklist). Cleared by
--- the assistant, the DeckKit menu (Tools > DeckAgent) or a grip chord ("Clear Decky's checklist").
+-- the assistant, the DeckKit menu (Chat > Decky) or a grip chord ("Clear Decky's checklist").
 local _, ns = ...
 
 local B, S = ns.Bytes, ns.Status
@@ -143,7 +143,7 @@ if ns.Chords and ns.Chords.OfferPress then
 end
 
 ns.AddSettings({
-    { type = "section", tab = "Tools", label = "DeckAgent" },
+    { type = "section", tab = "Chat", label = "Decky", order = 5 },
     { type = "action", label = "Clear Decky's checklist", verb = "Clear",
       hint = "Takes down the checklist she put up (it also goes by itself a minute after it's all done).",
       run = function() Checklist.Clear() end },

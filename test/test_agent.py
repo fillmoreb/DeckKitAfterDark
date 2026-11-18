@@ -157,6 +157,8 @@ NPC_LUA = """QuestieDB.npcData = [[return {
 [3] = {'Alliance Priest',100,100,30,30,0,{[1497]={{49,18}}},nil,1497,nil,nil,12,"A","Priest Trainer",19},
 [4] = {'Dungeon Priest',100,100,30,30,0,{[1497]={{-1,-1}},[717]={{50,50}}},nil,717,nil,nil,68,"AH","Priest Trainer",19},
 [5] = {'Kalimdor Priest',100,100,30,30,0,{[1637]={{36,87.7}}},nil,1637,nil,nil,68,"H","Priest Trainer",19},
+[6] = {'Mendalass Tattermend',100,100,30,30,0,{[1497]={{50,19}}},nil,1497,nil,nil,68,"AH","Skinner",19},
+[7] = {'Kagil',100,100,30,30,0,{[1637]={{40.8,67.9}}},nil,1637,nil,nil,68,"H","Junior Skinning Trainer",19},
 }]]"""
 ZONES_LUA = """ZoneDB.private.areaIdToUiMapIdOverride = [[return { [717] = 225 }]]
 ZoneDB.private.areaIdToUiMapId = [[return { [1497] = 1458, [1637] = 1454, [717] = 1 }]]"""
@@ -214,6 +216,15 @@ class GameDB(unittest.TestCase):
         found = gamedb.find_npc(self.db, "priest", org, None, limit=1)
         self.assertEqual(found[0]["name"], "Kalimdor Priest")
         self.assertIn("Alliance Priest", [f["name"] for f in gamedb.find_npc(self.db, "priest", None, None, 10)])
+
+    def test_trade_titled_trainer_found_by_profession(self):
+        here = {"map": 1458, "x": 0.49, "y": 0.18}
+        for query in ("skinning trainer", "skinning"):
+            found = gamedb.find_npc(self.db, query, here, "H")
+            self.assertEqual(found[0]["name"], "Mendalass Tattermend", query)  # "Skinner", nearby
+            self.assertIsNotNone(found[0]["distance_yards"])
+        found = gamedb.find_npc(self.db, "skinning trainer", here, "H", role="trainer")
+        self.assertEqual([f["name"] for f in found], ["Mendalass Tattermend", "Kagil"])
 
     def test_no_words_no_results(self):
         self.assertEqual(gamedb.find_npc(self.db, "  ", None), [])

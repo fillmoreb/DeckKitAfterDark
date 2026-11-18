@@ -13,7 +13,7 @@
 --                    bit 2 ZONE    length uint8, zone name (UTF-8)
 --                    bit 3 WHO     faction uint8 (0 none, 1 Alliance, 2 Horde), level uint8, class ID uint8
 --                    bit 4 COMBAT  uint8 (1 in combat)
---                    bit 5 BRAIN   uint8, the model picked in the DeckKit menu (Tools > DeckAgent):
+--                    bit 5 BRAIN   uint8, the model picked in the DeckKit menu (Chat > Decky):
 --                                  0 the default, 1 Haiku, 2 Sonnet, 3 Opus
 --                    bit 6 VOICE   uint8, answers: 0 spoken, 1 quiet (shown only; DeckKit menu)
 --                    bit 7 TARGET  NPC ID uint32 (0: none, or not an NPC), level uint8 (255: ??), flags

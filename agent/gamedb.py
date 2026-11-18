@@ -280,13 +280,32 @@ FILLER = {"nearest", "closest", "near", "nearby", "the", "a", "an", "me", "my", 
           "any", "some", "local"}
 
 
+# Forever's own trainers are titled by their trade ("Skinner", "Herbalist"), not "Skinning Trainer": a profession
+# word also matches its trade's title. (Seen 2026-11-17: "skinning trainer" on Zephras Isle missed both of its
+# trainers and offered one in Durotar.)
+TRADE_TITLES = {
+    "skinning": ["skinner"], "herbalism": ["herbalist"], "mining": ["miner"], "alchemy": ["alchemist"],
+    "enchanting": ["enchanter"], "tailoring": ["tailor"], "leatherworking": ["leatherworker"],
+    "blacksmithing": ["blacksmith"], "engineering": ["engineer"], "cooking": ["cook", "chef"],
+    "fishing": ["fisherman", "angler"],
+}
+
+
 def find_npc(db, query="", state=None, faction=None, limit=5, role=None):
-    """NPCs matching `query` (words in the name or title) and/or `role` (a ROLES key), nearest first."""
+    """NPCs matching `query` (words in the name or title) and/or `role` (a ROLES key), nearest first. The word
+    "trainer" also matches the game's trainer flag, so a trainer whose title doesn't say so is found."""
     words = [w for w in (query or "").lower().split() if w not in FILLER]
     where, args = [], []
     for w in words:
-        where.append("(lower(n.name) LIKE ? OR lower(coalesce(n.title,'')) LIKE ?)")
+        alts = ["lower(n.name) LIKE ?", "lower(coalesce(n.title,'')) LIKE ?"]
         args += ["%" + w + "%"] * 2
+        for t in TRADE_TITLES.get(w, []):
+            alts.append("lower(coalesce(n.title,'')) LIKE ?")
+            args.append("%" + t + "%")
+        if w in ("trainer", "trainers"):
+            alts.append("(coalesce(n.flags,0) & ?) != 0")
+            args.append(ROLES["trainer"][0])
+        where.append("(" + " OR ".join(alts) + ")")
     if role:
         if role not in ROLES:
             raise ValueError("unknown role %r (roles: %s)" % (role, ", ".join(ROLES)))

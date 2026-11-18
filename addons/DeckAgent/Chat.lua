@@ -10,7 +10,7 @@
 --               combat (it shows when the fight ends)
 --   Never a public channel (Trade, General...): they aren't on the list.
 --
--- "Preview agent chat" (DeckKit menu, Tools > DeckAgent): the message waits in a prompt (Prompt.lua)
+-- "Preview agent chat" (DeckKit menu, Chat > Decky): the message waits in a prompt (Prompt.lua)
 -- with {A} Send / {B} Cancel instead of going straight out. The send then runs inside your own A
 -- press, a real hardware event. Untouched, it cancels after 30 s; a new prompt replaces it.
 --
@@ -186,7 +186,7 @@ end
 ------------------------------------------------------------------------
 
 ns.AddSettings({
-    { type = "section", tab = "Tools", label = "DeckAgent" },
+    { type = "section", tab = "Chat", label = "Decky", order = 5 },
     { type = "toggle", label = "Preview agent chat before sending",
       hint = "Messages the assistant sends for you wait in a small window: {A} Send, {B} Cancel. "
           .. "Off: they go straight out.",
